@@ -40,12 +40,16 @@ PKG_CONFIG_DEPENDS:= \
 	CONFIG_PACKAGE_MAC80211_NSS_REDIRECT \
 	CONFIG_PACKAGE_IWLWIFI_DEBUG \
 	CONFIG_PACKAGE_IWLWIFI_DEBUGFS \
-	CONFIG_PACKAGE_RTLWIFI_DEBUG \
+	CONFIG_PACKAGE_RTLWIFI_DEBUG
 
 include $(INCLUDE_DIR)/package.mk
 
 WMENU:=Wireless Drivers
+
 NSS_PATCH:= subsys ath10k ath11k
+IPQ_BRANCH:=$(shell git -C $(TOPDIR) rev-parse --abbrev-ref HEAD)
+IPQ_DATE:=$(shell git -C $(TOPDIR) log -1 --format=%cd --date=format:%Y-%m-%d)
+IPQ_COMMIT:=$(shell git -C $(TOPDIR) log -1 --format=%h)
 
 define KernelPackage/mac80211/Default
   SUBMENU:=$(WMENU)
@@ -442,6 +446,9 @@ define KernelPackage/ath11k/install
 	$(INSTALL_DATA) ./files/pbuf.uci $(1)/etc/config/pbuf
 	$(INSTALL_BIN) ./files/nss_diag.sh $(1)/usr/bin/nss_diag
 	$(INSTALL_DATA) ./files/disable_mesh_chksum_ath11k.hotplug $(1)/etc/hotplug.d/net/99-disable_mesh_chksum_ath11k
+	echo "IPQ_BRANCH=$(IPQ_BRANCH)" > $(1)/etc/ipq_release
+	echo "IPQ_DATE=$(IPQ_DATE)" >> $(1)/etc/ipq_release
+	echo "IPQ_COMMIT=$(IPQ_COMMIT)" >> $(1)/etc/ipq_release
 endef
 endif
 

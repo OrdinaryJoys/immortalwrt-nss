@@ -933,7 +933,7 @@ Signed-off-by: Ramya Gnanasekar <rgnanase@codeaurora.org>
  extern const struct ath11k_hw_ops ipq8074_ops;
 --- a/drivers/net/wireless/ath/ath11k/mac.c
 +++ b/drivers/net/wireless/ath/ath11k/mac.c
-@@ -6671,6 +6671,7 @@ static int ath11k_mac_config_mon_status_
+@@ -6668,6 +6668,7 @@ static int ath11k_mac_config_mon_status_
  			tlv_filter.rx_filter = ath11k_debugfs_rx_filter(ar);
  	}
  
@@ -962,7 +962,7 @@ Signed-off-by: Ramya Gnanasekar <rgnanase@codeaurora.org>
  #endif /* ATH11K_RX_DESC_H */
 --- a/drivers/net/wireless/ath/ath11k/nss.c
 +++ b/drivers/net/wireless/ath/ath11k/nss.c
-@@ -4366,7 +4366,7 @@ static int ath11k_nss_init(struct ath11k
+@@ -4363,7 +4363,7 @@ static int ath11k_nss_init(struct ath11k
  
  	/* fill rx parameters to initialize rx context */
  	wim->wrip.tlv_size = ab->hw_params.hal_desc_sz;
