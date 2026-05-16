@@ -55,7 +55,23 @@ Signed-off-by: Qi Liu <liuqi_colin@msn.com>
  static int config_load(char *cfg)
  {
  	struct uci_context *ctx = uci_alloc_context();
-@@ -1714,6 +1729,46 @@ static int main_extroot(int argc, char *
+@@ -445,11 +460,13 @@ static int config_load(char *cfg)
+ 
+ 	if (cfg) {
+ 		snprintf(path, sizeof(path), "%s/upper/etc/config/fstab", cfg);
+-		pkg = config_try_load(ctx, path);
++		if (!access(path, R_OK))
++			pkg = config_try_load(ctx, path);
+ 
+ 		if (!pkg) {
+ 			snprintf(path, sizeof(path), "%s/etc/config/fstab", cfg);
+-			pkg = config_try_load(ctx, path);
++			if (!access(path, R_OK))
++				pkg = config_try_load(ctx, path);
+ 		}
+ 	}
+ 
+@@ -1714,6 +1731,46 @@ static int main_extroot(int argc, char *
         }
  #endif
  
