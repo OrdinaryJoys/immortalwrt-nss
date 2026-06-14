@@ -49,19 +49,19 @@
 	leds {
 		compatible = "gpio-leds";
 
-		led_status_red: status-red {
+		led_status_red: red {
 			color = <LED_COLOR_ID_RED>;
 			function = LED_FUNCTION_STATUS;
 			gpios = <&tlmm 71 GPIO_ACTIVE_HIGH>;
 		};
 
-		led_status_orange: status-orange {
+		led_status_orange: orange {
 			color = <LED_COLOR_ID_ORANGE>;
 			function = LED_FUNCTION_STATUS;
 			gpios = <&tlmm 72 GPIO_ACTIVE_HIGH>;
 		};
 
-		led_status_green: status-green {
+		led_status_green: green {
 			color = <LED_COLOR_ID_GREEN>;
 			function = LED_FUNCTION_STATUS;
 			gpios = <&tlmm 73 GPIO_ACTIVE_HIGH>;
@@ -94,6 +94,7 @@
 
 	ethernet-phy-package@0 {
 		compatible = "qcom,qca8075-package";
+		qcom,package-mode = "psgmii";
 		#address-cells = <1>;
 		#size-cells = <0>;
 		reg = <0>;

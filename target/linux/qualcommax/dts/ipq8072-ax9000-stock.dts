@@ -7,7 +7,6 @@
 	compatible = "xiaomi,ax9000-stock", "qcom,ipq8074";
 
 	aliases {
-		/* Aliases as required by u-boot to patch MAC addresses */
 		ethernet1 = &dp1;
 		ethernet2 = &dp2;
 		ethernet3 = &dp3;

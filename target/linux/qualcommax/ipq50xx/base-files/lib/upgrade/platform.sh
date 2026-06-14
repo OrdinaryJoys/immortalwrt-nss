@@ -44,6 +44,7 @@ platform_do_upgrade() {
 	cmcc,mr3000d-ci|\
 	cmcc,pz-l8|\
 	elecom,wrc-x3000gs2|\
+	elecom,wrc-x3000gst2|\
 	iodata,wn-dax3000gr)
 		local delay
 
@@ -74,7 +75,8 @@ platform_do_upgrade() {
 		remove_oem_ubi_volume ubi_rootfs
 		nand_do_upgrade "$1"
 		;;
-	xiaomi,ax6000)
+	xiaomi,ax6000|\
+	xiaomi,redmi-ax5400)
 		# Make sure that UART is enabled
 		fw_setenv boot_wait on
 		fw_setenv uart_en 1

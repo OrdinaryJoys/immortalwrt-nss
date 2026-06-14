@@ -16,6 +16,11 @@
 	compatible = "anysafe,e1", "qcom,ipq6018";
 
 	aliases {
+		ethernet1 = &dp2;
+		ethernet2 = &dp3;
+		ethernet3 = &dp4;
+		ethernet4 = &dp5;
+
 		serial0 = &blsp1_uart3;
 		serial1 = &blsp1_uart2;
 
@@ -23,11 +28,6 @@
 		led-failsafe = &led_system_red;
 		led-running = &led_system_blue;
 		led-upgrade = &led_system_red;
-
-		ethernet1 = &dp2;
-		ethernet2 = &dp3;
-		ethernet3 = &dp4;
-		ethernet4 = &dp5;
 	};
 
 	chosen {
@@ -412,6 +412,7 @@
 
 	ethernet-phy-package@0 {
 		compatible = "qcom,qca8075-package";
+		qcom,package-mode = "psgmii";
 		#address-cells = <1>;
 		#size-cells = <0>;
 		reg = <0>;
@@ -504,6 +505,7 @@
 
 &dp5 {
 	status = "okay";
+	phy-mode = "sgmii";
 	phy-handle = <&qca8081>;
 	label = "wan";
 };

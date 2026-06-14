@@ -6,9 +6,9 @@ PKG_RELEASE:=1
 
 PKG_SOURCE_PROTO:=git
 PKG_SOURCE_URL=$(PROJECT_GIT)/project/firmware/qca-wireless.git
-PKG_SOURCE_DATE:=2026-03-07
-PKG_SOURCE_VERSION:=beaf4667b9be6413c6d30994ba38475d77a5ae06
-PKG_MIRROR_HASH:=b3b3732aeca7ea587b259953909674bd6cff9ce659b94f140fa3186854c4b521
+PKG_SOURCE_DATE:=2026-05-18
+PKG_SOURCE_VERSION:=e20f4c6ff197823762319e4b7e31af01816503cf
+PKG_MIRROR_HASH:=a0109d830c474aeca2716496cb2eab05319c4d6671ae2d02c43449a94da183fa
 PKG_FLAGS:=nonshared
 
 include $(INCLUDE_DIR)/package.mk
@@ -56,6 +56,7 @@ ALLWIFIBOARDS:= \
 	linksys_mr6350 \
 	linksys_mr7350 \
 	linksys_mr7500 \
+	linksys_mr9000 \
 	linksys_mx2000 \
 	linksys_mx4200 \
 	linksys_mx5300 \
@@ -105,6 +106,7 @@ ALLWIFIBOARDS:= \
 	xiaomi_ax3600 \
 	xiaomi_ax6000 \
 	xiaomi_ax9000 \
+	xiaomi_redmi-ax5400 \
 	yuncore_ax830 \
 	yuncore_ax850 \
 	yuncore_ax880 \
@@ -122,6 +124,7 @@ ALLWIFIBOARDS:= \
 	zyxel_scr50axe \
 	anysafe_e1 \
 	cmiot_ax18 \
+	dptech_ap3000-2c \
 	jdcloud_re-cs-03 \
 	philips_ly1800 \
 	redmi_ax5 \
@@ -261,6 +264,7 @@ $(eval $(call generate-ipq-wifi-package,linksys_mr5500,Linksys MR5500))
 $(eval $(call generate-ipq-wifi-package,linksys_mr6350,Linksys MR6350))
 $(eval $(call generate-ipq-wifi-package,linksys_mr7350,Linksys MR7350))
 $(eval $(call generate-ipq-wifi-package,linksys_mr7500,Linksys MR7500))
+$(eval $(call generate-ipq-wifi-package,linksys_mr9000,Linksys MR9000))
 $(eval $(call generate-ipq-wifi-package,linksys_mx2000,Linksys MX2000))
 $(eval $(call generate-ipq-wifi-package,linksys_mx4200,Linksys MX4200))
 $(eval $(call generate-ipq-wifi-package,linksys_mx5300,Linksys MX5300))
@@ -310,6 +314,7 @@ $(eval $(call generate-ipq-wifi-package,xiaomi_aiot-ac2350,Xiaomi AIoT AC2350))
 $(eval $(call generate-ipq-wifi-package,xiaomi_ax3600,Xiaomi AX3600))
 $(eval $(call generate-ipq-wifi-package,xiaomi_ax6000,Xiaomi AX6000))
 $(eval $(call generate-ipq-wifi-package,xiaomi_ax9000,Xiaomi AX9000))
+$(eval $(call generate-ipq-wifi-package,xiaomi_redmi-ax5400,Xiaomi Redmi AX5400))
 $(eval $(call generate-ipq-wifi-package,yuncore_ax830,Yuncore AX830))
 $(eval $(call generate-ipq-wifi-package,yuncore_ax850,Yuncore AX850))
 $(eval $(call generate-ipq-wifi-package,yuncore_ax880,Yuncore AX880))
@@ -327,6 +332,7 @@ $(eval $(call generate-ipq-wifi-package,zyxel_nwa210ax,Zyxel NWA210AX))
 $(eval $(call generate-ipq-wifi-package,zyxel_scr50axe,Zyxel SCR50AXE))
 $(eval $(call generate-ipq-wifi-package,anysafe_e1,AnySafe E1))
 $(eval $(call generate-ipq-wifi-package,cmiot_ax18,CMIOT AX18))
+$(eval $(call generate-ipq-wifi-package,dptech_ap3000-2c,DPtech AP3000-2C))
 $(eval $(call generate-ipq-wifi-package,jdcloud_re-cs-03,JDCloud RE-CS-03))
 $(eval $(call generate-ipq-wifi-package,philips_ly1800,Philips LY1800))
 $(eval $(call generate-ipq-wifi-package,redmi_ax5,Redmi AX5))

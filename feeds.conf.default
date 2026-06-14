@@ -1,4 +1,4 @@
-src-git nss_packages https://github.com/VIKINGYFY/nss-packages-618.git^1306d122aec63abd997e626f8cd52b3a78267499
+src-git nss_packages https://github.com/VIKINGYFY/nss-packages-618.git^2d826ed6e20185820a00bf674cff911bb27fe48e
 src-git packages https://github.com/immortalwrt/packages.git
 src-git luci https://github.com/immortalwrt/luci.git
 src-git routing https://github.com/openwrt/routing.git
