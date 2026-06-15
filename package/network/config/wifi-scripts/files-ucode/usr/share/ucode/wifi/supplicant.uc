@@ -155,6 +155,10 @@ function setup_sta(data, config) {
 		if (config.ca_cert_usesystem && fs.stat('/etc/ssl/certs/ca-certificates.crt'))
 			config.ca_cert = '/etc/ssl/certs/ca-certificates.crt';
 
+		const eap_method_map = { fast: 'FAST', peap: 'PEAP', ttls: 'TTLS', tls: 'TLS' };
+		if (eap_method_map[config.eap_type])
+			config.eap = eap_method_map[config.eap_type];
+
 		switch(config.eap_type) {
 		case 'fast':
 		case 'peap':
@@ -173,7 +177,6 @@ function setup_sta(data, config) {
 					phase2proto = 'autheap=';
 			}
 			config.phase2 = `"${phase2proto}${auth}"`;
-
 			if (config.auth == 'EAP-TLS') {
 				if (config.ca_cert2_usesystem && fs.stat('/etc/ssl/certs/ca-certificates.crt'))
 					config.ca_cert2 = '/etc/ssl/certs/ca-certificates.crt';
