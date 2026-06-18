@@ -345,12 +345,7 @@ define KernelPackage/ath11k
   URL:=https://wireless.wiki.kernel.org/en/users/drivers/ath11k
   DEPENDS+= +kmod-ath +@DRIVER_11AC_SUPPORT +@DRIVER_11AX_SUPPORT \
   +kmod-crypto-michael-mic +ATH11K_THERMAL:kmod-hwmon-core \
-  +ATH11K_THERMAL:kmod-thermal +kmod-qcom-qmi-helpers \
-  +ATH11K_NSS_SUPPORT:kmod-qca-nss-drv \
-  +ATH11K_NSS_MESH_SUPPORT:kmod-qca-nss-drv-wifi-meshmgr \
-  +@(ATH11K_NSS_SUPPORT):NSS_DRV_WIFIOFFLOAD_ENABLE \
-  +@(ATH11K_NSS_SUPPORT):NSS_DRV_WIFI_EXT_VDEV_ENABLE \
-  +@(ATH11K_NSS_MESH_SUPPORT):NSS_DRV_WIFI_MESH_ENABLE
+  +ATH11K_THERMAL:kmod-thermal +kmod-qcom-qmi-helpers
   FILES:=$(PKG_BUILD_DIR)/drivers/net/wireless/ath/ath11k/ath11k.ko
 ifdef CONFIG_ATH11K_NSS_SUPPORT
   AUTOLOAD:=$(call AutoProbe,ath11k)
@@ -396,6 +391,9 @@ define KernelPackage/ath11k/config
                depends on TARGET_qualcommax
                depends on PACKAGE_kmod-ath11k
                select ATH11K_MEM_PROFILE_512M
+               select NSS_DRV_WIFIOFFLOAD_ENABLE
+               select NSS_DRV_WIFI_EXT_VDEV_ENABLE
+               select PACKAGE_kmod-qca-nss-drv
                select PACKAGE_kmod-qca-nss-ecm
                default y
                help
@@ -404,8 +402,10 @@ define KernelPackage/ath11k/config
        config ATH11K_NSS_MESH_SUPPORT
                bool "Enable NSS WiFi Mesh offload"
                depends on ATH11K_NSS_SUPPORT
+               select NSS_DRV_WIFI_MESH_ENABLE
                select PACKAGE_MAC80211_MESH
-               default n
+               select PACKAGE_kmod-qca-nss-drv-wifi-meshmgr
+               default y
 
        config ATH11K_MEM_PROFILE_512M
                bool "Use 512MB memory profile"
