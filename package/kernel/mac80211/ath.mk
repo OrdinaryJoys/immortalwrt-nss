@@ -75,9 +75,8 @@ config-$(CONFIG_ATH10K_LEDS) += ATH10K_LEDS
 config-$(CONFIG_ATH10K_THERMAL) += ATH10K_THERMAL
 config-$(CONFIG_ATH11K_DEBUGFS_HTT_STATS) += ATH11K_DEBUGFS_HTT_STATS
 config-$(CONFIG_ATH11K_DEBUGFS_STA) += ATH11K_DEBUGFS_STA
-config-$(CONFIG_ATH11K_MEM_PROFILE_512M) += ATH11K_MEM_PROFILE_512M
 config-$(CONFIG_ATH11K_NSS_MESH_SUPPORT) += ATH11K_NSS_MESH_SUPPORT
-config-$(CONFIG_ATH11K_NSS_SUPPORT) += ATH11K_NSS_SUPPORT
+config-$(CONFIG_ATH11K_NSS_SUPPORT) += ATH11K_NSS_SUPPORT ATH11K_MEM_PROFILE_512M
 config-$(CONFIG_ATH11K_THERMAL) += ATH11K_THERMAL
 config-$(CONFIG_ATH12K_THERMAL) += ATH12K_THERMAL
 config-$(CONFIG_PACKAGE_ATH_DEBUG) += ATH_DEBUG ATH10K_DEBUG ATH11K_DEBUG ATH12K_DEBUG ATH9K_STATION_STATISTICS
@@ -350,6 +349,7 @@ define KernelPackage/ath11k
   +ATH11K_NSS_MESH_SUPPORT:kmod-qca-nss-drv-wifi-meshmgr \
   +@(ATH11K_NSS_SUPPORT):NSS_DRV_WIFIOFFLOAD_ENABLE \
   +@(ATH11K_NSS_SUPPORT):NSS_DRV_WIFI_EXT_VDEV_ENABLE
+  +ATH11K_THERMAL:kmod-thermal +kmod-qcom-qmi-helpers
   FILES:=$(PKG_BUILD_DIR)/drivers/net/wireless/ath/ath11k/ath11k.ko
 ifdef CONFIG_ATH11K_NSS_SUPPORT
   AUTOLOAD:=$(call AutoProbe,ath11k)
@@ -394,6 +394,7 @@ define KernelPackage/ath11k/config
                bool "Enable NSS WiFi offload"
                depends on TARGET_qualcommax
                select ATH11K_MEM_PROFILE_512M
+               depends on PACKAGE_kmod-ath11k
                select NSS_DRV_WIFIOFFLOAD_ENABLE
                select NSS_DRV_WIFI_EXT_VDEV_ENABLE
                select PACKAGE_kmod-qca-nss-drv
