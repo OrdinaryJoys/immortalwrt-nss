@@ -1,0 +1,280 @@
+--- a/src/hsl/mht/mht_interface_ctrl.c
++++ b/src/hsl/mht/mht_interface_ctrl.c
+@@ -24,6 +24,7 @@
+ #include "ssdk_mht_clk.h"
+ #include "ssdk_clk.h"
+ 
++#include "phylib.h"
+ static a_uint16_t
+ mht_uniphy_xpcs_mmd_read(a_uint32_t dev_id, a_uint16_t mmd_num,
+ 	a_uint16_t mmd_reg)
+@@ -827,13 +828,12 @@ mht_interface_ops_init(a_uint32_t dev_id
+ 		return SW_BAD_PTR;
+ 	}
+ 
+-	if (!phydev->shared->priv) {
+-		SSDK_ERROR("phydev->shared->priv is null\n");
++	shared_priv = phy_package_get_priv(phydev);
++	if (!shared_priv) {
++		SSDK_ERROR("phy package private data is null\n");
+ 		return SW_BAD_PTR;
+ 	}
+ 
+-	shared_priv = phydev->shared->priv;
+-
+ 	shared_priv->phy_clk_init = ssdk_mht_gcc_clock_init;
+ 	shared_priv->phy_qusgmii_mode_set = mht_interface_uqxgmii_mode_set;
+ 	shared_priv->phy_clk_en_set = ssdk_mht_port_clk_en_set;
+--- a/src/init/ssdk_dts.c
++++ b/src/init/ssdk_dts.c
+@@ -26,6 +26,7 @@
+ #endif
+ #include <linux/etherdevice.h>
+ #include <linux/clk.h>
++#include <linux/platform_device.h>
+ 
+ #include "ssdk_init.h"
+ #include "ssdk_dts.h"
+--- a/src/init/ssdk_init.c
++++ b/src/init/ssdk_init.c
+@@ -62,6 +62,10 @@
+ #include <linux/of_net.h>
+ #include <linux/of_address.h>
+ #include <linux/reset.h>
++#ifndef SWITCH_TYPE_EXT
++#define SWITCH_TYPE_EXT SWITCH_TYPE_STRING
++#endif
++
+ #include "ssdk_plat.h"
+ /*qca808x_end*/
+ #include "ssdk_clk.h"
+@@ -1269,54 +1273,6 @@ static int qca_switchdev_register(struct
+ }
+ #endif
+ 
+-#if IS_ENABLED(CONFIG_NET_DSA)
+-static int ssdk_dsa_event_link_change(struct net_device *dev, bool link)
+-{
+-	struct dsa_port *dp = NULL;
+-	ssdk_netdev_switch_t *netdev_switch = NULL;
+-	struct qca_phy_priv* priv = NULL;
+-
+-	if (!dsa_slave_dev_check(dev))
+-		return NOTIFY_DONE;
+-
+-	/* find dp,master by dsa helper and get net_switch */
+-	dp = dsa_port_from_netdev(dev);
+-	netdev_switch = ssdk_dts_netdev_switch_find_by_netdev(dp->cpu_dp->master);
+-	if (!netdev_switch)
+-		return NOTIFY_DONE;
+-
+-	priv = ssdk_phy_priv_data_get(netdev_switch->switch_dev_id);
+-	if (!priv)
+-		return NOTIFY_DONE;
+-
+-	priv->polling_once = A_TRUE;
+-	mod_delayed_work(system_wq, &priv->qm_dwork_polling, 0);
+-
+-	return NOTIFY_OK;
+-}
+-
+-static int ssdk_dsa_event_nb(struct notifier_block *unused,
+-		unsigned long event, void *ptr)
+-{
+-	switch (event) {
+-		case DSA_NOTIFIER_PORT_LINK:
+-			struct dsa_notifier_link *info = (struct dsa_notifier_link *)ptr;
+-
+-			SSDK_DEBUG("%s, link: %d.\n", info->info.dev->name, info->link);
+-			return ssdk_dsa_event_link_change(info->info.dev, info->link);
+-
+-		default:
+-			SSDK_INFO("DSA event %lu is not supported\n", event);
+-	}
+-
+-	return NOTIFY_DONE;
+-}
+-
+-static struct notifier_block ssdk_dsa_notifier_nb = {
+-	.notifier_call = ssdk_dsa_event_nb,
+-};
+-#endif
+-
+ #if defined(DESS) || defined(HPPE) || defined (ISISC) || defined (ISIS) || defined(MP) || defined(MHT)
+ static int ssdk_switch_register(a_uint32_t dev_id, ssdk_chip_type  chip_type)
+ {
+@@ -1436,13 +1392,6 @@ static int ssdk_switch_register(a_uint32
+ 		}
+ 	}
+ 
+-#if IS_ENABLED(CONFIG_NET_DSA)
+-	if (priv->version == QCA_VER_MHT ||
+-		priv->version == QCA_VER_AR8337 ||
+-		priv->version == QCA_VER_AR8327)
+-		register_dsa_blocking_notifier(&ssdk_dsa_notifier_nb);
+-#endif
+-
+ 	return 0;
+ }
+ 
+@@ -1466,13 +1415,6 @@ static int ssdk_switch_unregister(a_uint
+ 	unregister_switch(&qca_phy_priv_global[dev_id]->sw_dev);
+ #endif
+ 
+-#if IS_ENABLED(CONFIG_NET_DSA)
+-	if (priv->version == QCA_VER_MHT ||
+-		priv->version == QCA_VER_AR8337 ||
+-		priv->version == QCA_VER_AR8327)
+-		unregister_dsa_blocking_notifier(&ssdk_dsa_notifier_nb);
+-#endif
+-
+ 	return 0;
+ }
+ #endif
+@@ -1706,6 +1648,43 @@ static void ssdk_cfg_default_init(ssdk_i
+ }
+ /*qca808x_end*/
+ 
++#if IS_ENABLED(CONFIG_NET_DSA)
++static void ssdk_dsa_refresh_link_polling(struct net_device *dev)
++{
++	struct dsa_port *dp = NULL;
++	struct net_device *conduit = NULL;
++	ssdk_netdev_switch_t *netdev_switch = NULL;
++	struct qca_phy_priv *priv = NULL;
++
++	if (!dsa_user_dev_check(dev))
++		return;
++
++	dp = dsa_port_from_netdev(dev);
++	if (!dp)
++		return;
++
++	conduit = dsa_port_to_conduit(dp);
++	if (!conduit)
++		return;
++
++	netdev_switch = ssdk_dts_netdev_switch_find_by_netdev(conduit);
++	if (!netdev_switch)
++		return;
++
++	priv = ssdk_phy_priv_data_get(netdev_switch->switch_dev_id);
++	if (!priv)
++		return;
++
++	if (priv->version != QCA_VER_MHT &&
++	    priv->version != QCA_VER_AR8337 &&
++	    priv->version != QCA_VER_AR8327)
++		return;
++
++	priv->polling_once = A_TRUE;
++	mod_delayed_work(system_wq, &priv->qm_dwork_polling, 0);
++}
++#endif
++
+ //#if (LINUX_VERSION_CODE >= KERNEL_VERSION(3,14,0))
+ static int ssdk_dev_event(struct notifier_block *this, unsigned long event, void *ptr)
+ {
+@@ -1751,8 +1730,11 @@ static int ssdk_dev_event(struct notifie
+ 				}
+ 			}
+ 			break;
+-#ifdef MP
+ 		case NETDEV_CHANGE:
++#if IS_ENABLED(CONFIG_NET_DSA)
++			ssdk_dsa_refresh_link_polling(dev);
++#endif
++#ifdef MP
+ 			if ((cfg.chip_type == CHIP_SCOMPHY) &&
+ 				(cfg.phy_id == MP_GEPHY)) {
+ 				if ((p_api == NULL) || (p_api->adpt_port_netdev_notify_set == NULL)
+@@ -1770,8 +1752,8 @@ static int ssdk_dev_event(struct notifie
+ 					}
+ 				}
+ 			}
+-			break;
+ #endif
++			break;
+ 		case NETDEV_REGISTER:
+ 			if (strstr(dev->name, "eth") && !(dev->priv_flags & IFF_802_1Q_VLAN))
+ 				ssdk_netdev_switch_init(dev);
+@@ -2071,5 +2053,6 @@ module_init(regi_init);
+ module_exit(regi_exit);
+ 
+ MODULE_DESCRIPTION("QCA SSDK Driver");
++MODULE_INFO(description, "QCA SSDK Driver");
+ MODULE_LICENSE("Dual BSD/GPL");
+ /*qca808x_end*/
+--- a/src/init/ssdk_mht_clk.c
++++ b/src/init/ssdk_mht_clk.c
+@@ -746,16 +746,16 @@ sw_error_t ssdk_mht_clk_rate_get(a_uint3
+ 	char clk_id[64] = {0};
+ 	a_bool_t bypass_en = A_FALSE;
+ 
+-	strlcpy(clk_id, clock_id, sizeof(clk_id));
++	strscpy(clk_id, clock_id, sizeof(clk_id));
+ 
+ 	ssdk_mht_port5_uniphy0_clk_src_get(dev_id, &bypass_en);
+ 	if (bypass_en == A_TRUE) {
+ 		if (strncasecmp(clock_id, MHT_MAC5_TX_UNIPHY0_CLK,
+ 					strlen(MHT_MAC5_TX_UNIPHY0_CLK)) == 0)
+-			strlcpy(clk_id, MHT_MAC4_RX_CLK, sizeof(clk_id));
++			strscpy(clk_id, MHT_MAC4_RX_CLK, sizeof(clk_id));
+ 		else if (strncasecmp(clock_id, MHT_MAC5_RX_UNIPHY0_CLK,
+ 					strlen(MHT_MAC5_RX_UNIPHY0_CLK)) == 0)
+-			strlcpy(clk_id, MHT_MAC4_TX_CLK, sizeof(clk_id));
++			strscpy(clk_id, MHT_MAC4_TX_CLK, sizeof(clk_id));
+ 	}
+ 
+ 	clk = ssdk_mht_clk_find(clk_id);
+--- a/src/init/ssdk_mht_pinctrl.c
++++ b/src/init/ssdk_mht_pinctrl.c
+@@ -287,7 +287,7 @@ static sw_error_t mht_gpio_pin_cfg_set(a
+                 rv = mht_gpio_pin_cfg_set_drvs(dev_id, pin, arg);
+                 break;
+ 
+-            case PIN_CONFIG_OUTPUT:
++            case PIN_CONFIG_LEVEL:
+                 rv = mht_gpio_pin_cfg_set_oe(dev_id, pin, A_TRUE);
+                 rv = mht_gpio_set_bit(dev_id, pin, arg);
+                 break;
+--- a/src/init/ssdk_plat.c
++++ b/src/init/ssdk_plat.c
+@@ -307,8 +307,8 @@ sw_error_t qca_bitbang_mii_raw_read_try(
+ 	if (strncmp(bus->id, "gpio", strlen("gpio")))
+ 		return SW_NOT_FOUND;
+ 
+-	if (gpio_priv && gpio_priv->sw_read) {
+-		*val = gpio_priv->sw_read(bus, reg);
++	if (gpio_priv) {
++		*val = mdiobb_read_c22(bus, reg >> 5, reg & 0x1f);
+ 		return SW_OK;
+ 	}
+ 
+@@ -323,8 +323,7 @@ sw_error_t qca_bitbang_mii_raw_write_try
+ 	if (strncmp(bus->id, "gpio", strlen("gpio")))
+ 		return SW_NOT_FOUND;
+ 
+-	if (gpio_priv && gpio_priv->sw_write) {
+-		gpio_priv->sw_write(bus, reg, val);
++	if (gpio_priv && !mdiobb_write_c22(bus, reg >> 5, reg & 0x1f, val)) {
+ 		return SW_OK;
+ 	}
+ 
+@@ -339,13 +338,13 @@ sw_error_t qca_bitbang_mii_raw_update_tr
+ 	if (strncmp(bus->id, "gpio", strlen("gpio")))
+ 		return SW_NOT_FOUND;
+ 
+-	if (gpio_priv && gpio_priv->sw_read && gpio_priv->sw_write) {
++	if (gpio_priv) {
+ 		a_uint32_t val;
+ 
+-		val = gpio_priv->sw_read(bus, reg);
++		val = mdiobb_read_c22(bus, reg >> 5, reg & 0x1f);
+ 		val &= ~clear;
+ 		val |= set;
+-		gpio_priv->sw_write(bus, reg, val);
++		mdiobb_write_c22(bus, reg >> 5, reg & 0x1f, val);
+ 
+ 		return SW_OK;
+ 	}
