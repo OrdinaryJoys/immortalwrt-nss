@@ -393,13 +393,12 @@ define KernelPackage/ath11k/config
        config ATH11K_NSS_SUPPORT
                bool "Enable NSS WiFi offload"
                depends on TARGET_qualcommax
-               depends on PACKAGE_kmod-ath11k
                select ATH11K_MEM_PROFILE_512M
                select NSS_DRV_WIFIOFFLOAD_ENABLE
                select NSS_DRV_WIFI_EXT_VDEV_ENABLE
                select PACKAGE_kmod-qca-nss-drv
                select PACKAGE_kmod-qca-nss-ecm
-               default y
+               default n
                help
                   Say Y to enable NSS WiFi offload support
 
@@ -409,12 +408,11 @@ define KernelPackage/ath11k/config
                select NSS_DRV_WIFI_MESH_ENABLE
                select PACKAGE_MAC80211_MESH
                select PACKAGE_kmod-qca-nss-drv-wifi-meshmgr
-               default y
+               default n
 
        config ATH11K_MEM_PROFILE_512M
                bool "Use 512MB memory profile"
-               depends on PACKAGE_kmod-ath11k
-               default y
+               default n
                help
                   This allows configuring ath11k for boards with 512M memory.
 
