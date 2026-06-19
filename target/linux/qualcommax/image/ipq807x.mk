@@ -426,6 +426,8 @@ define Device/redmi_ax6-stock
 	DEVICE_ALT0_VENDOR := Redmi
 	DEVICE_ALT0_MODEL := AX6
 	DEVICE_ALT0_VARIANT := (custom U-Boot layout)
+	IMAGE_SIZE := 36608k
+	NAND_SIZE := 128m
 	KERNEL_SIZE :=
 	ARTIFACTS :=
 endef
@@ -530,6 +532,8 @@ define Device/xiaomi_ax3600-stock
 	DEVICE_ALT0_VENDOR := Xiaomi
 	DEVICE_ALT0_MODEL := AX3600
 	DEVICE_ALT0_VARIANT := (custom U-Boot layout)
+	IMAGE_SIZE := 36608k
+	NAND_SIZE := 128m
 	KERNEL_SIZE :=
 	ARTIFACTS :=
 endef
