@@ -27,8 +27,127 @@ remove_oem_ubi_volume() {
 	fi
 }
 
+xiaomi_stock_get_upgrade_part() {
+	local rootfs_mtdnum
+	local rootfs1_mtdnum
+	local part_num
+
+	rootfs_mtdnum="$(find_mtd_index rootfs)"
+	rootfs1_mtdnum="$(find_mtd_index rootfs_1)"
+
+	if [ -n "$rootfs_mtdnum" ] && [ -z "$rootfs1_mtdnum" ]; then
+		echo rootfs
+		return 0
+	fi
+
+	if [ -z "$rootfs_mtdnum" ] && [ -n "$rootfs1_mtdnum" ]; then
+		echo rootfs_1
+		return 0
+	fi
+
+	if [ -n "$rootfs_mtdnum" ] && [ -n "$rootfs1_mtdnum" ]; then
+		part_num="$(fw_printenv -n flag_boot_rootfs 2>/dev/null)"
+		[ "$part_num" = "1" ] && echo rootfs_1 || echo rootfs
+		return 0
+	fi
+
+	echo "unable to find rootfs or rootfs_1 MTD partition" >&2
+	return 1
+}
+
+xiaomi_stock_check_image_size() {
+	local file="$1"
+	local cmd
+	local board_dir
+	local kernel_length
+	local rootfs_length
+	local upgrade_part
+	local mtdnum
+	local mtd_sysfs
+	local erasesize
+	local writesize
+	local mtdsize
+	local bad_blocks
+	local lebsize
+	local total_pebs
+	local nand_size
+	local nand_pebs
+	local size_file
+	local reserve_pebs
+	local available_pebs
+	local required_pebs
+
+	cmd="$(identify_if_gzip "$file")cat"
+	board_dir="$($cmd < "$file" | tar tf - | grep -m 1 '^sysupgrade-.*/$')"
+	board_dir="${board_dir%/}"
+	[ -n "$board_dir" ] || {
+		echo "stock-layout upgrade requires a sysupgrade tar image"
+		return 1
+	}
+
+	kernel_length="$($cmd < "$file" | tar xOf - "$board_dir/kernel" | wc -c)"
+	rootfs_length="$($cmd < "$file" | tar xOf - "$board_dir/root" | wc -c)"
+	[ "$kernel_length" -gt 0 ] && [ "$rootfs_length" -gt 0 ] || {
+		echo "sysupgrade image is missing kernel or rootfs"
+		return 1
+	}
+
+	upgrade_part="$(xiaomi_stock_get_upgrade_part)" || return 1
+	mtdnum="$(find_mtd_index "$upgrade_part")"
+	mtd_sysfs="${MTD_SYSFS:-/sys/class/mtd}/mtd$mtdnum"
+
+	erasesize="$(cat "$mtd_sysfs/erasesize" 2>/dev/null)"
+	writesize="$(cat "$mtd_sysfs/writesize" 2>/dev/null)"
+	mtdsize="$(cat "$mtd_sysfs/size" 2>/dev/null)"
+	bad_blocks="$(cat "$mtd_sysfs/bad_blocks" 2>/dev/null)"
+	bad_blocks="${bad_blocks:-0}"
+
+	[ "${erasesize:-0}" -gt 0 ] &&
+		[ "${writesize:-0}" -gt 0 ] &&
+		[ "${mtdsize:-0}" -gt 0 ] || {
+		echo "unable to read geometry for MTD partition $upgrade_part"
+		return 1
+	}
+
+	lebsize=$((erasesize - 2 * writesize))
+	total_pebs=$((mtdsize / erasesize))
+	nand_size=0
+	for size_file in "${MTD_SYSFS:-/sys/class/mtd}"/mtd*/size; do
+		[ -r "$size_file" ] || continue
+		nand_size=$((nand_size + $(cat "$size_file")))
+	done
+	nand_pebs=$((nand_size / erasesize))
+	# Match OpenWrt's whole-NAND bad-block reserve model. Keep at least the
+	# 128 MiB NAND allowance even if sysfs exposes only the target partition.
+	reserve_pebs=$(((nand_pebs * 20 + 1023) / 1024 + 4))
+	[ "$reserve_pebs" -ge 24 ] || reserve_pebs=24
+	available_pebs=$((total_pebs - bad_blocks - reserve_pebs - 2))
+	required_pebs=$((
+		(kernel_length + lebsize - 1) / lebsize +
+		(rootfs_length + lebsize - 1) / lebsize +
+		1
+	))
+
+	if [ "$required_pebs" -gt "$available_pebs" ]; then
+		echo "image requires $required_pebs UBI PEBs but $upgrade_part has only $available_pebs usable PEBs"
+		return 1
+	fi
+
+	return 0
+}
+
 platform_check_image() {
-	return 0;
+	case "$(board_name)" in
+	redmi,ax6-stock|\
+	xiaomi,ax3600-stock|\
+	xiaomi,ax9000-stock)
+		nand_do_platform_check "$(board_name)" "$1" || return $?
+		xiaomi_stock_check_image_size "$1" || return 74
+		;;
+	*)
+		return 0
+		;;
+	esac
 }
 
 platform_pre_upgrade() {
@@ -140,28 +259,22 @@ platform_do_upgrade() {
 	redmi,ax6-stock|\
 	xiaomi,ax3600-stock|\
 	xiaomi,ax9000-stock)
-		part_num="$(fw_printenv -n flag_boot_rootfs)"
-		if [ "$part_num" -eq "1" ]; then
-			CI_UBIPART="rootfs_1"
+		CI_UBIPART="$(xiaomi_stock_get_upgrade_part)" ||
+			nand_do_upgrade_failed
+		if [ "$CI_UBIPART" = "rootfs_1" ]; then
 			target_num=1
-			# Reset fail flag for the current partition
-			# With both partition set to fail, the partition 2 (bit 1)
-			# is loaded
-			fw_setenv flag_try_sys2_failed 0
+			try_flag=flag_try_sys2_failed
 		else
-			CI_UBIPART="rootfs"
 			target_num=0
-			# Reset fail flag for the current partition
-			# or uboot will skip the loading of this partition
-			fw_setenv flag_try_sys1_failed 0
+			try_flag=flag_try_sys1_failed
 		fi
 
-		# Tell uboot to switch partition
-		fw_setenv flag_boot_rootfs "$target_num"
-		fw_setenv flag_last_success "$target_num"
-
-		# Reset success flag
-		fw_setenv flag_boot_success 0
+		fw_setenv -s - <<-EOF || nand_do_upgrade_failed
+			$try_flag 0
+			flag_boot_rootfs $target_num
+			flag_last_success $target_num
+			flag_boot_success 0
+		EOF
 
 		nand_do_upgrade "$1"
 		;;
