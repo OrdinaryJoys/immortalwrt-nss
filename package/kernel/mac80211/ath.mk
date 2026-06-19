@@ -345,7 +345,11 @@ define KernelPackage/ath11k
   URL:=https://wireless.wiki.kernel.org/en/users/drivers/ath11k
   DEPENDS+= +kmod-ath +@DRIVER_11AC_SUPPORT +@DRIVER_11AX_SUPPORT \
   +kmod-crypto-michael-mic +ATH11K_THERMAL:kmod-hwmon-core \
-  +ATH11K_THERMAL:kmod-thermal +kmod-qcom-qmi-helpers
+  +ATH11K_THERMAL:kmod-thermal +kmod-qcom-qmi-helpers \
+  +ATH11K_NSS_SUPPORT:kmod-qca-nss-drv \
+  +ATH11K_NSS_MESH_SUPPORT:kmod-qca-nss-drv-wifi-meshmgr \
+  +@(ATH11K_NSS_SUPPORT):NSS_DRV_WIFIOFFLOAD_ENABLE \
+  +@(ATH11K_NSS_SUPPORT):NSS_DRV_WIFI_EXT_VDEV_ENABLE
   FILES:=$(PKG_BUILD_DIR)/drivers/net/wireless/ath/ath11k/ath11k.ko
 ifdef CONFIG_ATH11K_NSS_SUPPORT
   AUTOLOAD:=$(call AutoProbe,ath11k)
