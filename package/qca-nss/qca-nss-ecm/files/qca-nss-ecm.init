@@ -77,8 +77,10 @@ get_front_end_mode() {
 }
 
 disable_packet_steering() {
-	uci -q set network.globals.packet_steering=0 && uci commit network.globals.packet_steering
-	uci -q del network.globals.steering_flows		&& uci commit network.globals.steering_flows
+	changed=0
+	uci -q set network.globals.packet_steering='0' && changed=1
+	uci -q delete network.globals.steering_flows && changed=1
+	[ "$changed" -eq 0 ] || uci -q commit network
 
 	if [ -e "/usr/libexec/platform/packet-steering.sh" ]; then
 		/usr/libexec/platform/packet-steering.sh 0
