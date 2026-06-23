@@ -123,7 +123,10 @@
 +
 +	ppp = netdev_priv(dev);
 +
-+	tstats = this_cpu_ptr(dev->tstats);
++	tstats = dev->tstats;
++	if (!tstats)
++		return;
++	tstats = this_cpu_ptr(tstats);
 +	u64_stats_update_begin(&tstats->syncp);
 +	u64_stats_add(&tstats->tx_bytes, tx_bytes);
 +	u64_stats_add(&tstats->tx_packets, tx_packets);

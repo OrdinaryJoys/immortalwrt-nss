@@ -64,9 +64,6 @@ get_front_end_mode() {
 		nss)
 			echo '1'
 			;;
-		sfe)
-			echo '2'
-			;;
 		both)
 			echo '4'
 			;;
