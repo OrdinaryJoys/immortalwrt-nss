@@ -101,7 +101,7 @@
  		/* remove it from the ppp unit's list */
  		ppp_lock(ppp);
  		list_del_rcu(&pch->clist);
-@@ -3656,6 +3714,229 @@ static void *unit_find(struct idr *p, in
+@@ -3656,6 +3714,227 @@ static void *unit_find(struct idr *p, in
  	return idr_find(p, n);
  }
  
@@ -123,10 +123,7 @@
 +
 +	ppp = netdev_priv(dev);
 +
-+	tstats = dev->tstats;
-+	if (!tstats)
-+		return;
-+	tstats = this_cpu_ptr(tstats);
++	tstats = this_cpu_ptr(dev->tstats);
 +	u64_stats_update_begin(&tstats->syncp);
 +	u64_stats_add(&tstats->tx_bytes, tx_bytes);
 +	u64_stats_add(&tstats->tx_packets, tx_packets);
@@ -332,7 +329,7 @@
  /* Module/initialization stuff */
  
  module_init(ppp_init);
-@@ -3672,6 +3953,7 @@ EXPORT_SYMBOL(ppp_input_error);
+@@ -3672,6 +3951,7 @@ EXPORT_SYMBOL(ppp_input_error);
  EXPORT_SYMBOL(ppp_output_wakeup);
  EXPORT_SYMBOL(ppp_register_compressor);
  EXPORT_SYMBOL(ppp_unregister_compressor);
