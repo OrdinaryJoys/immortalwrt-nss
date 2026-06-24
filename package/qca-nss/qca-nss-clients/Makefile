@@ -344,7 +344,7 @@ define KernelPackage/qca-nss-drv-wifi-meshmgr
   DEPENDS:=@TARGET_qualcommax \
 	+kmod-qca-nss-drv
   FILES:=$(PKG_BUILD_DIR)/wifi_meshmgr/qca-nss-wifi-meshmgr.ko
-ifneq ($(CONFIG_ATH11K_NSS_SUPPORT),)
+ifneq ($(CONFIG_ATH11K_NSS_MESH_SUPPORT),)
   AUTOLOAD:=$(call AutoLoad,52,qca-nss-wifi-meshmgr)
 endif
 endef
