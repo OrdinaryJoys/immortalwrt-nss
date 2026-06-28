@@ -14,14 +14,15 @@
 # OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 #
 
-START=27
+# Apply NSS pbuf/N2H settings before netifd creates ath11k AP interfaces.
+START=19
 NAME=qca-nss-pbuf
 pbuf_config_applied=0
 
 ath11k_of_device_available() {
   local compatible node status
 
-  [ -d /proc/device-tree ] || return 0
+  [ -d /proc/device-tree ] || return 1
 
   for node in $(find /proc/device-tree -type d -name 'wifi*' 2> /dev/null); do
     [ -r "$node/compatible" ] || continue
@@ -140,12 +141,7 @@ get_num_cpus() {
 }
 
 apply_sysctl() {
-  local nss_redirect extra_pbuf
-
-  nss_redirect=$(sysctl -n -e dev.nss.general.redirect 2> /dev/null)
-  if [ -n "$nss_redirect" ] && [ "$nss_redirect" -eq 0 ] && [ -x /etc/init.d/qca-nss-ecm ]; then
-    /etc/init.d/qca-nss-ecm start
-  fi
+  local extra_pbuf
 
   # Running this script multiple times is useless, as extra_pbuf_core0
   # can't be changed if it is allocated, assume it's already been run.
@@ -154,7 +150,7 @@ apply_sysctl() {
     logger -t "$NAME" "$board - setting dev.nss.n2hcfg.extra_pbuf_core0=$extra_pbuf_core0"
     sysctl -w dev.nss.n2hcfg.extra_pbuf_core0="$extra_pbuf_core0" > /dev/null 2>&1
   else
-    logger -t "$NAME" "Sysctl key 'extra_pbuf_core0' already set. Skipping extra_pbuf_core0 update"
+    logger -t "$NAME" "Sysctl key 'extra_pbuf_core0' already set to '$extra_pbuf'. Skipping extra_pbuf_core0 update"
   fi
 
   logger -t "$NAME" "$board - setting dev.nss.n2hcfg.n2h_high_water_core0=$n2h_high_water_core0"
@@ -306,12 +302,12 @@ start() {
 
   set_scaling_governor
   set_stats_disable
-  reload_wifi
 
 }
 
 reload() {
   start
+  reload_wifi
 }
 
 restart() {
