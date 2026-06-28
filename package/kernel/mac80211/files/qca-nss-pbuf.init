@@ -57,8 +57,21 @@ ath11k_pci_device_available() {
   return 1
 }
 
+ath11k_sysfs_device_available() {
+  [ -r /sys/module/ath11k/parameters/nss_offload ] && return 0
+
+  for phy in /sys/class/ieee80211/*; do
+    [ -e "$phy" ] || continue
+    case "$(readlink -f "$phy/device" 2> /dev/null)" in
+      *'.wifi'*) return 0 ;;
+    esac
+  done
+
+  return 1
+}
+
 ath11k_device_available() {
-  ath11k_of_device_available || ath11k_pci_device_available || [ -d /sys/kernel/debug/ath11k ]
+  ath11k_of_device_available || ath11k_pci_device_available || ath11k_sysfs_device_available || [ -d /sys/kernel/debug/ath11k ]
 }
 
 ath11k_nss_offload_enabled() {
@@ -84,6 +97,42 @@ reload_wifi() {
   ath11k_nss_offload_enabled && wifi up
 }
 
+wait_for_ath11k_nss_offload() {
+  local timeout="${1:-5}" nss_offload
+
+  ath11k_device_available || return 1
+
+  while [ "$timeout" -gt 0 ]; do
+    if [ -r /sys/module/ath11k/parameters/nss_offload ]; then
+      nss_offload=$(cat /sys/module/ath11k/parameters/nss_offload 2> /dev/null)
+      case "$nss_offload" in
+        1 | Y | y | yes | true | on) return 0 ;;
+      esac
+
+      logger -t "$NAME" -p user.notice "Module parameter 'nss_offload=0'. Skipping applying wifi nss configs"
+      return 1
+    fi
+
+    sleep 1
+    timeout=$((timeout - 1))
+  done
+
+  logger -t "$NAME" -p user.notice "ath11k nss_offload parameter is unavailable. Skipping applying wifi nss configs"
+  return 1
+}
+
+wait_for_nss_sysctls() {
+  local timeout="${1:-5}"
+
+  while [ "$timeout" -gt 0 ]; do
+    [ -d "/proc/sys/dev/nss/rps" ] && [ -d "/proc/sys/dev/nss/n2hcfg" ] && return 0
+    sleep 1
+    timeout=$((timeout - 1))
+  done
+
+  return 1
+}
+
 get_num_cpus() {
   local num_cpus
   num_cpus=$(awk -F': ' '/^processor/ {count++} END {print count}' /proc/cpuinfo)
@@ -105,13 +154,16 @@ apply_sysctl() {
     logger -t "$NAME" "$board - setting dev.nss.n2hcfg.extra_pbuf_core0=$extra_pbuf_core0"
     sysctl -w dev.nss.n2hcfg.extra_pbuf_core0="$extra_pbuf_core0" > /dev/null 2>&1
   else
-    logger -t "$NAME" "Sysctl key 'extra_pbuf_core0' already set to '""$extra_pbuf_core0""'. Skipping applying wifi nss configs"
+    logger -t "$NAME" "Sysctl key 'extra_pbuf_core0' already set. Skipping extra_pbuf_core0 update"
   fi
+
+  logger -t "$NAME" "$board - setting dev.nss.n2hcfg.n2h_high_water_core0=$n2h_high_water_core0"
+  sysctl -w dev.nss.n2hcfg.n2h_high_water_core0="$n2h_high_water_core0" > /dev/null 2>&1
 
   logger -t "$NAME" "$board - setting dev.nss.n2hcfg.n2h_wifi_pool_buf=$n2h_wifi_pool_buf"
   sysctl -w dev.nss.n2hcfg.n2h_wifi_pool_buf="$n2h_wifi_pool_buf" > /dev/null 2>&1
 
-  logger -t "$NAME" "$board - setting dev.nss.n2hcfg.n2h_high_water_core0=$n2h_high_water_core0"
+  logger -t "$NAME" "$board - confirming dev.nss.n2hcfg.n2h_high_water_core0=$n2h_high_water_core0"
   sysctl -w dev.nss.n2hcfg.n2h_high_water_core0="$n2h_high_water_core0" > /dev/null 2>&1
 
 }
@@ -239,16 +291,29 @@ set_scaling_governor() {
 start() {
 
   pbuf_config_applied=0
-  ath11k_nss_offload_enabled || return 0
+  wait_for_ath11k_nss_offload 5 || return 0
+  wait_for_nss_sysctls 5 || {
+    logger -t "$NAME" -p user.notice "NSS RPS/N2H sysctls are unavailable. Skipping applying wifi nss configs"
+    return 0
+  }
 
-  set_scaling_governor
-  set_stats_disable
   apply_nss_config || return 1
   [ "$pbuf_config_applied" -eq 1 ] || return 0
 
   num_cpus=$(get_num_cpus)
   hash_bitmap="$(((1 << num_cpus) - 1))"
   [ -w /proc/sys/dev/nss/rps/hash_bitmap ] && sysctl -w dev.nss.rps.hash_bitmap="$hash_bitmap" > /dev/null 2>&1
+
+  set_scaling_governor
+  set_stats_disable
   reload_wifi
 
+}
+
+reload() {
+  start
+}
+
+restart() {
+  reload
 }
