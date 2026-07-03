@@ -202,7 +202,7 @@ export function wpa_key_mgmt(config, band) {
 			if (config.ieee80211r)
 				append_value(config, 'wpa_key_mgmt', 'FT-SAE');
 
-			if (config.sae_ext_key && config.rsn_override_pairwise_2) {
+			if (config.sae_ext_key) {
 				append_value(config, 'rsn_override_key_mgmt_2', 'SAE-EXT-KEY');
 				if (config.ieee80211r)
 					append_value(config, 'rsn_override_key_mgmt_2', 'FT-SAE-EXT-KEY');
@@ -218,7 +218,7 @@ export function wpa_key_mgmt(config, band) {
 			if (config.ieee80211r)
 				append_value(config, 'rsn_override_key_mgmt', 'FT-SAE');
 
-			if (config.sae_ext_key && config.rsn_override_pairwise_2) {
+			if (config.sae_ext_key) {
 				append_value(config, 'rsn_override_key_mgmt_2', 'SAE-EXT-KEY');
 				if (config.ieee80211r)
 					append_value(config, 'rsn_override_key_mgmt_2', 'FT-SAE-EXT-KEY');
