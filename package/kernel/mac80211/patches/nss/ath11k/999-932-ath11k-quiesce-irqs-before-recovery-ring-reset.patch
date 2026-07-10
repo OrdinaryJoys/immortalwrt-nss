@@ -1,0 +1,95 @@
+From: OrdinaryFun <ordinaryfun@localhost>
+Subject: [PATCH] wifi: ath11k: quiesce AHB IRQ workers before recovery ring reset
+
+The firmware recovery path tears down DP resources and clears the complete
+HAL srng array while extended NAPI and CE tasklets can still be scheduled.
+Changing ab->nss.enabled to false widens the problem because an already
+scheduled NAPI poll can enter non-offloaded ring handlers while those rings
+are being released.
+
+Disable and synchronize extended IRQ/NAPI before changing the NSS state or
+clearing rings.  Disable CE processing once per active IRQ generation as
+well.  Track the AHB CE enable state with the same dev flag used by PCIC so a
+controlled reset, which already disabled CE IRQs before power-down, does not
+disable them a second time during reconfiguration.  During crash flush the
+AHB disable path only synchronizes handlers and kills tasklets; it does not
+touch CE MMIO that may be inaccessible while the Q6 is down.
+
+This keeps the existing per-ring recovery guards as defense in depth while
+making the resource teardown itself ordered against IRQ workers.
+
+--- a/drivers/net/wireless/ath/ath11k/ahb.c
++++ b/drivers/net/wireless/ath/ath11k/ahb.c
+@@ -352,6 +352,9 @@ static void ath11k_ahb_ce_irqs_enable(st
+ {
+ 	int i;
+ 
++	if (test_and_set_bit(ATH11K_FLAG_CE_IRQ_ENABLED, &ab->dev_flags))
++		return;
++
+ 	for (i = 0; i < ab->hw_params.ce_count; i++) {
+ 		if (ath11k_ce_get_attr_flags(ab, i) & CE_ATTR_DIS_INTR)
+ 			continue;
+@@ -373,7 +376,11 @@ static void ath11k_ahb_ce_irqs_disable(s
+ 
+ static void ath11k_ahb_ce_irq_disable_sync(struct ath11k_base *ab)
+ {
+-	ath11k_ahb_ce_irqs_disable(ab);
++	if (!test_and_clear_bit(ATH11K_FLAG_CE_IRQ_ENABLED, &ab->dev_flags))
++		return;
++
++	if (!test_bit(ATH11K_FLAG_CRASH_FLUSH, &ab->dev_flags))
++		ath11k_ahb_ce_irqs_disable(ab);
+ 	ath11k_ahb_sync_ce_irqs(ab);
+ 	ath11k_ahb_kill_tasklets(ab);
+ }
+@@ -416,10 +423,7 @@ static void ath11k_ahb_ext_irq_disable(s
+ 
+ static void ath11k_ahb_stop(struct ath11k_base *ab)
+ {
+-	if (!test_bit(ATH11K_FLAG_CRASH_FLUSH, &ab->dev_flags))
+-		ath11k_ahb_ce_irqs_disable(ab);
+-	ath11k_ahb_sync_ce_irqs(ab);
+-	ath11k_ahb_kill_tasklets(ab);
++	ath11k_ahb_ce_irq_disable_sync(ab);
+ 	timer_delete_sync(&ab->rx_replenish_retry);
+ 	ath11k_ce_cleanup_pipes(ab);
+ }
+@@ -493,10 +497,12 @@ static void ath11k_ahb_ce_tasklet(struct
+ 	struct ath11k_ce_pipe *ce_pipe = from_tasklet(ce_pipe, t, intr_tq);
+ 	struct ath11k_ahb *ab_ahb = ath11k_ahb_priv(ce_pipe->ab);
+ 
+-	if (ab_ahb->tgt_rproc->state != RPROC_RUNNING)
++	if (!test_bit(ATH11K_FLAG_CE_IRQ_ENABLED, &ce_pipe->ab->dev_flags) ||
++	    ab_ahb->tgt_rproc->state != RPROC_RUNNING)
+ 		return;
+ 
+ 	ath11k_ce_per_engine_service(ce_pipe->ab, ce_pipe->pipe_num);
+ 
+-	ath11k_ahb_ce_irq_enable(ce_pipe->ab, ce_pipe->pipe_num);
++	if (test_bit(ATH11K_FLAG_CE_IRQ_ENABLED, &ce_pipe->ab->dev_flags))
++		ath11k_ahb_ce_irq_enable(ce_pipe->ab, ce_pipe->pipe_num);
+ }
+@@ -506,6 +512,9 @@ static irqreturn_t ath11k_ahb_ce_interru
+ 	struct ath11k_ce_pipe *ce_pipe = arg;
+ 	struct ath11k_ahb *ab_ahb = ath11k_ahb_priv(ce_pipe->ab);
+ 
++	if (!test_bit(ATH11K_FLAG_CE_IRQ_ENABLED, &ce_pipe->ab->dev_flags))
++		return IRQ_HANDLED;
++
+ 	/* While the Q6 is stopped or booting, the WLAN CE register space
+ 	 * is not accessible; a read raises a synchronous external abort.
+ 	 * The remoteproc core marks the state before it starts the
+--- a/drivers/net/wireless/ath/ath11k/core.c
++++ b/drivers/net/wireless/ath/ath11k/core.c
+@@ -2415,6 +2415,10 @@ static int ath11k_core_reconfigure_on_cr
+ 
+ 	mutex_lock(&ab->core_lock);
+ 
++	ath11k_hif_irq_disable(ab);
++	if (test_bit(ATH11K_FLAG_CE_IRQ_ENABLED, &ab->dev_flags))
++		ath11k_hif_ce_irq_disable(ab);
++
+ 	ath11k_nss_teardown(ab);
+ 	ab->nss.enabled = false;
+ 
