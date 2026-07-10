@@ -55,8 +55,17 @@
  
  #define NSS_DP_SWITCH_ID		0
  #define NSS_DP_SW_ETHTYPE_PID		0 /* PPE ethtype profile ID for slow protocols */
-@@ -36,6 +41,61 @@
+@@ -36,6 +41,73 @@
  
++static inline bool nss_dp_supports_fal_stp_ops(void)
++{
++#ifdef NSS_DP_IPQ50XX
++	return false;
++#else
++	return true;
++#endif
++}
++
  static int nss_dp_bridge_attr_set(struct net_device *dev,
  				const struct switchdev_attr *attr);
 +static int nss_dp_stp_state_set(struct nss_dp_dev *dp_priv, u8 state);
@@ -105,6 +114,9 @@
 +	if (!dp_priv)
 +		return NOTIFY_DONE;
 +
++	if (!nss_dp_supports_fal_stp_ops())
++		return NOTIFY_DONE;
++
 +	netdev_dbg(dev, "upper removed, restore forwarding STP state\n");
 +	nss_dp_stp_state_set(dp_priv, BR_STATE_FORWARDING);
 +
@@ -117,6 +129,26 @@
  
  static bool switch_init_done;
  
+@@ -53,6 +71,9 @@ static void nss_dp_set_slow_proto_filter
+ 	fal_ctrlpkt_profile_t profile;
+ 	fal_ctrlpkt_action_t action;
+ 
++	if (!nss_dp_supports_fal_stp_ops())
++		return;
++
+ 	memset(&profile, 0, sizeof(profile));
+ 
+ 	/*
+@@ -136,6 +157,9 @@ static int nss_dp_stp_state_set(struct n
+ 	sw_error_t err;
+ 	fal_stp_state_t stp_state;
+ 
++	if (!nss_dp_supports_fal_stp_ops())
++		return 0;
++
+ 	switch (state) {
+ 	case BR_STATE_DISABLED:
+ 		stp_state = FAL_STP_DISABLED;
 @@ -232,6 +292,12 @@ static int nss_dp_attr_set(struct net_de
  		netdev_dbg(dev, "set brport_flags %lu\n", attr->u.brport_flags);
  		return 0;
