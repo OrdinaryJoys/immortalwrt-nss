@@ -1,0 +1,16 @@
+--- a/mk/cflags.mk
++++ b/mk/cflags.mk
+@@ -356,6 +356,13 @@ ifneq (,$(findstring HPPE, $(SUPPORT_CHIP)))
+   MODULE_CFLAG += -DHPPE
+ endif
+ 
++ifneq (,$(filter MP, $(SUPPORT_CHIP)))
++  MODULE_INC   += -I$(PRJ_PATH)/include/hsl/hppe
++  MODULE_INC   += -I$(PRJ_PATH)/include/adpt/mp
++  MODULE_INC   += -I$(PRJ_PATH)/include/hsl/mp
++  MODULE_CFLAG += -DMP
++endif
++
+ ifneq (,$(findstring CPPE, $(SUPPORT_CHIP)))
+   MODULE_INC   += -I$(PRJ_PATH)/include/hsl/cppe
+   MODULE_INC   += -I$(PRJ_PATH)/include/adpt/cppe
