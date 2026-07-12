@@ -1,0 +1,16 @@
+--- a/src/init/ssdk_plat.c
++++ b/src/init/ssdk_plat.c
+@@ -1428,8 +1428,13 @@ static a_uint32_t ssdk_netdev_to_portid(struct net_device *dev)
+ 	a_uint32_t mac_reg = 0, port_id = 0;
+ 
+ 	mac_reg = dev->base_addr & 0xffffff;
++#ifdef MP
++	if (mac_reg < MP_GMAC_BASE_ADDR)
++#else
+ 	if (mac_reg < NSS_MAC_CSR_BASE_ADDR)
++#endif
+ 		return SW_MAX_NR_PORT;
++
+ #ifdef HPPE
+ 	/*xgmac*/
+ 	if(mac_reg >= NSS_XGMAC_CSR_BASE_ADDR) {
