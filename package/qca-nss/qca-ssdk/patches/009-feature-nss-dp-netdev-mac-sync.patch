@@ -51,7 +51,7 @@
 +}
 +
  #if IS_ENABLED(CONFIG_NET_DSA)
- static void ssdk_dsa_schedule_link_polling(struct net_device *dev)
+ static void ssdk_dsa_refresh_link_polling(struct net_device *dev)
  {
 @@ -1729,6 +1775,7 @@ static int ssdk_dev_event(struct notifie
  			}
@@ -59,7 +59,7 @@
  		case NETDEV_CHANGE:
 +			ssdk_netdev_refresh_mac_sw_sync(dev);
  #if IS_ENABLED(CONFIG_NET_DSA)
- 			ssdk_dsa_schedule_link_polling(dev);
+ 			ssdk_dsa_refresh_link_polling(dev);
  #endif
 @@ -1753,8 +1800,9 @@ static int ssdk_dev_event(struct notifie
  #endif
