@@ -1,14 +1,15 @@
 --- a/drivers/net/wireless/ath/ath11k/ahb.c
 +++ b/drivers/net/wireless/ath/ath11k/ahb.c
-@@ -387,6 +387,7 @@ static void ath11k_ahb_ext_irq_enable(st
+@@ -387,6 +387,8 @@ static void ath11k_ahb_ext_irq_enable(st
  		struct ath11k_ext_irq_grp *irq_grp = &ab->ext_irq_grp[i];
  
  		if (!irq_grp->napi_enabled) {
-+			dev_set_threaded(irq_grp->napi_ndev, true);
++			dev_set_threaded(irq_grp->napi_ndev,
++					 NETDEV_NAPI_THREADED_ENABLED);
  			napi_enable(&irq_grp->napi);
  			irq_grp->napi_enabled = true;
  		}
-@@ -538,6 +539,7 @@ static int ath11k_ahb_config_ext_irq(str
+@@ -538,6 +540,7 @@ static int ath11k_ahb_config_ext_irq(str
  	int irq;
  	int ret;
  	bool nss_offload;
@@ -16,7 +17,7 @@
  
  	/* TCL Completion, REO Dest, ERR, Exception and h2rxdma rings are offloaded
  	 * to nss when its enabled, hence don't enable these interrupts
-@@ -555,6 +557,9 @@ static int ath11k_ahb_config_ext_irq(str
+@@ -555,6 +558,9 @@ static int ath11k_ahb_config_ext_irq(str
  		if (!irq_grp->napi_ndev)
  			return -ENOMEM;
  
@@ -26,7 +27,7 @@
  		netif_napi_add(irq_grp->napi_ndev, &irq_grp->napi,
  			       ath11k_ahb_ext_grp_napi_poll);
  
-@@ -620,6 +625,8 @@ static int ath11k_ahb_config_ext_irq(str
+@@ -620,6 +626,8 @@ static int ath11k_ahb_config_ext_irq(str
  		}
  	}
  
@@ -37,15 +38,16 @@
  
 --- a/drivers/net/wireless/ath/ath11k/pcic.c
 +++ b/drivers/net/wireless/ath/ath11k/pcic.c
-@@ -498,6 +498,7 @@ void ath11k_pcic_ext_irq_enable(struct a
+@@ -498,6 +498,8 @@ void ath11k_pcic_ext_irq_enable(struct a
  		struct ath11k_ext_irq_grp *irq_grp = &ab->ext_irq_grp[i];
  
  		if (!irq_grp->napi_enabled) {
-+			dev_set_threaded(irq_grp->napi_ndev, true);
++			dev_set_threaded(irq_grp->napi_ndev,
++					 NETDEV_NAPI_THREADED_ENABLED);
  			napi_enable(&irq_grp->napi);
  			irq_grp->napi_enabled = true;
  		}
-@@ -585,6 +586,7 @@ static int ath11k_pcic_ext_irq_config(st
+@@ -585,6 +587,7 @@ static int ath11k_pcic_ext_irq_config(st
  	u32 user_base_data = 0, base_vector = 0;
  	struct ath11k_ext_irq_grp *irq_grp;
  	unsigned long irq_flags;
@@ -53,7 +55,7 @@
  
  	ret = ath11k_pcic_get_user_msi_assignment(ab, "DP", &num_vectors,
  						  &user_base_data,
-@@ -608,6 +610,9 @@ static int ath11k_pcic_ext_irq_config(st
+@@ -608,6 +611,9 @@ static int ath11k_pcic_ext_irq_config(st
  			goto fail_allocate;
  		}
  
@@ -63,7 +65,7 @@
  		netif_napi_add(irq_grp->napi_ndev, &irq_grp->napi,
  			       ath11k_pcic_ext_grp_napi_poll);
  
-@@ -662,6 +667,8 @@ static int ath11k_pcic_ext_irq_config(st
+@@ -662,6 +668,8 @@ static int ath11k_pcic_ext_irq_config(st
  		ath11k_pcic_ext_grp_disable(irq_grp);
  	}
  

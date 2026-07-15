@@ -18,7 +18,7 @@ Signed-off-by: Aloka Dixit <quic_alokad@quicinc.com>
  	kfree_skb(skb);
  }
  
-+void ieee80211_8023_xmit_ap(struct ieee80211_sub_if_data *sdata,
++static void ieee80211_8023_xmit_ap(struct ieee80211_sub_if_data *sdata,
 +			    struct net_device *dev, struct sta_info *sta,
 +			    struct ieee80211_key *key, struct sk_buff *skb)
 +{
