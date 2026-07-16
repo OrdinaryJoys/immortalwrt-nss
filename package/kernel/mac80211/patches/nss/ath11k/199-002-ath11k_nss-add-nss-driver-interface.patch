@@ -48,7 +48,7 @@ Signed-off-by: Sriram R <srirrama@codeaurora.org>
  ath11k_ahb-y += ahb.o
 --- /dev/null
 +++ b/drivers/net/wireless/ath/ath11k/nss.c
-@@ -0,0 +1,2399 @@
+@@ -0,0 +1,2400 @@
 +// SPDX-License-Identifier: BSD-3-Clause-Clear
 +/*
 + * Copyright (c) 2020 The Linux Foundation. All rights reserved.
