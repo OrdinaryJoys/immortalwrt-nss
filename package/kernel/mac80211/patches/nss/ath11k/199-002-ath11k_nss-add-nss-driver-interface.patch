@@ -125,7 +125,7 @@ Signed-off-by: Sriram R <srirrama@codeaurora.org>
 +	struct ath11k_peer *peer;
 +	struct nss_wifili_peer_ctrl_stats *pstats = NULL;
 +	int i, j;
-+	u64 tx_packets, tx_bytes, tx_dropped = 0;
++	u64 tx_packets, tx_bytes, tx_dropped;
 +	u64 rx_packets, rx_bytes, rx_dropped;
 +
 +	if (!ab->nss.stats_enabled)
@@ -168,6 +168,7 @@ Signed-off-by: Sriram R <srirrama@codeaurora.org>
 +		peer->nss.nss_stats->tx_bytes += tx_bytes;
 +		peer->nss.nss_stats->tx_retries += pstats->tx.retries;
 +
++		tx_dropped = 0;
 +		for (j = 0; j < NSS_WIFILI_TQM_RR_MAX; j++)
 +			tx_dropped += pstats->tx.dropped.drop_stats[j];
 +
