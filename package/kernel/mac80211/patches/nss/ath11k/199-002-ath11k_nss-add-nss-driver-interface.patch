@@ -48,7 +48,7 @@ Signed-off-by: Sriram R <srirrama@codeaurora.org>
  ath11k_ahb-y += ahb.o
 --- /dev/null
 +++ b/drivers/net/wireless/ath/ath11k/nss.c
-@@ -0,0 +1,2400 @@
+@@ -0,0 +1,2402 @@
 +// SPDX-License-Identifier: BSD-3-Clause-Clear
 +/*
 + * Copyright (c) 2020 The Linux Foundation. All rights reserved.
@@ -172,7 +172,9 @@ Signed-off-by: Sriram R <srirrama@codeaurora.org>
 +		for (j = 0; j < NSS_WIFILI_TQM_RR_MAX; j++)
 +			tx_dropped += pstats->tx.dropped.drop_stats[j];
 +
-+		peer->nss.nss_stats->tx_failed += tx_dropped;
++		peer->nss.nss_stats->tx_dropped += tx_dropped;
++		peer->nss.nss_stats->tx_failed +=
++			pstats->retry.tx_failed_retry_count;
 +
 +		ATH11K_NSS_TXRX_NETDEV_STATS(tx, peer->vif, tx_bytes, tx_packets);
 +
@@ -2451,7 +2453,7 @@ Signed-off-by: Sriram R <srirrama@codeaurora.org>
 +}
 --- /dev/null
 +++ b/drivers/net/wireless/ath/ath11k/nss.h
-@@ -0,0 +1,307 @@
+@@ -0,0 +1,308 @@
 +/* SPDX-License-Identifier: BSD-3-Clause-Clear */
 +/*
 + * Copyright (c) 2020 The Linux Foundation. All rights reserved.
@@ -2570,6 +2572,7 @@ Signed-off-by: Sriram R <srirrama@codeaurora.org>
 +	u32 tx_bytes;
 +	u32 tx_retries;
 +	u32 tx_failed;
++	u32 tx_dropped;
 +	u32 rx_packets;
 +	u32 rx_bytes;
 +	u32 rx_dropped;

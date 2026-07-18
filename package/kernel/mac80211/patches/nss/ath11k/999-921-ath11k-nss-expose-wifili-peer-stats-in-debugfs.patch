@@ -7,8 +7,9 @@ story of the offloaded data path: MSDU-level aggregation counts (A-MSDU
 vs unaggregated) in both directions, OFDMA transmit counts, the retry
 control block including the 12.5 firmware's per-MPDU retry counters,
 intra-BSS forwarding and rx MIC/decrypt errors. The host consumed only
-packet/byte/retry/failed totals for the station rate bookkeeping and
-threw the rest away, and nothing exposed even the kept fields.
+packet/byte/retry totals for station bookkeeping, mixed firmware queue
+drops into the cfg80211 no-ACK failure counter, threw the rest away, and
+exposed none of the kept fields.
 
 Accumulate the full set into the existing per-peer nss_stats block and
 add a per-station "nss_stats" debugfs file (created only when NSS
@@ -21,7 +22,7 @@ already controls.
 Signed-off-by: Julius Bairaktaris <julius@bairaktaris.de>
 --- a/drivers/net/wireless/ath/ath11k/debugfs_sta.c
 +++ b/drivers/net/wireless/ath/ath11k/debugfs_sta.c
-@@ -1104,11 +1104,84 @@ static const struct file_operations fops
+@@ -1104,11 +1104,83 @@ static const struct file_operations fops
  	.llseek = default_llseek,
  };
  
@@ -56,11 +57,10 @@ Signed-off-by: Julius Bairaktaris <julius@bairaktaris.de>
 +	len += scnprintf(buf + len, size - len, "tx_bytes %u\n", stats.tx_bytes);
 +	len += scnprintf(buf + len, size - len, "tx_retries %u\n", stats.tx_retries);
 +	len += scnprintf(buf + len, size - len, "tx_failed %u\n", stats.tx_failed);
++	len += scnprintf(buf + len, size - len, "tx_dropped %u\n", stats.tx_dropped);
 +	len += scnprintf(buf + len, size - len, "tx_amsdu %u\n", stats.tx_amsdu);
 +	len += scnprintf(buf + len, size - len, "tx_non_amsdu %u\n", stats.tx_non_amsdu);
 +	len += scnprintf(buf + len, size - len, "tx_ofdma %u\n", stats.tx_ofdma);
-+	len += scnprintf(buf + len, size - len, "tx_failed_retries %u\n",
-+			 stats.tx_failed_retries);
 +	len += scnprintf(buf + len, size - len, "tx_multiple_retries %u\n",
 +			 stats.tx_multiple_retries);
 +#ifdef NSS_FIRMWARE_VERSION_12_5
@@ -108,15 +108,13 @@ Signed-off-by: Julius Bairaktaris <julius@bairaktaris.de>
  				    &fops_tx_stats);
 --- a/drivers/net/wireless/ath/ath11k/nss.c
 +++ b/drivers/net/wireless/ath/ath11k/nss.c
-@@ -206,6 +206,27 @@ static void ath11k_nss_get_peer_stats(st
+@@ -208,6 +208,25 @@ static void ath11k_nss_get_peer_stats(st
  			pstats->rx.err.decrypt_err;
  		peer->nss.nss_stats->rx_dropped += rx_dropped;
  
 +		peer->nss.nss_stats->tx_amsdu += pstats->tx.amsdu_cnt;
 +		peer->nss.nss_stats->tx_non_amsdu += pstats->tx.non_amsdu_cnt;
 +		peer->nss.nss_stats->tx_ofdma += pstats->tx.ofdma;
-+		peer->nss.nss_stats->tx_failed_retries +=
-+			pstats->retry.tx_failed_retry_count;
 +		peer->nss.nss_stats->tx_multiple_retries +=
 +			pstats->retry.tx_multiple_retry_count;
 +#ifdef NSS_FIRMWARE_VERSION_12_5
@@ -138,7 +136,7 @@ Signed-off-by: Julius Bairaktaris <julius@bairaktaris.de>
  		else
 --- a/drivers/net/wireless/ath/ath11k/nss.h
 +++ b/drivers/net/wireless/ath/ath11k/nss.h
-@@ -148,6 +148,21 @@ struct peer_stats {
+@@ -149,6 +149,20 @@ struct peer_stats {
  	u32 rx_dropped;
  	u32 last_rxdrop;
  	struct rate_info rxrate;
@@ -146,7 +144,6 @@ Signed-off-by: Julius Bairaktaris <julius@bairaktaris.de>
 +	u32 tx_amsdu;
 +	u32 tx_non_amsdu;
 +	u32 tx_ofdma;
-+	u32 tx_failed_retries;
 +	u32 tx_multiple_retries;
 +	u32 tx_mpdu_retries;
 +	u32 tx_mpdu_total_retries;

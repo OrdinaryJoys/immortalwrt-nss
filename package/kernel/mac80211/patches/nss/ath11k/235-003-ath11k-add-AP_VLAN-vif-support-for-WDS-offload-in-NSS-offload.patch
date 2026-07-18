@@ -518,9 +518,11 @@ Signed-off-by: Sathishkumar Muruganandam <murugana@codeaurora.org>
  				      u8* mac_addr, enum ath11k_ast_entry_type type)
 --- a/drivers/net/wireless/ath/ath11k/nss.c
 +++ b/drivers/net/wireless/ath/ath11k/nss.c
-@@ -124,7 +124,10 @@ static void ath11k_nss_get_peer_stats(st
+@@ -124,9 +124,12 @@ static void ath11k_nss_get_peer_stats(st
  
- 		peer->nss.nss_stats->tx_failed += tx_dropped;
+ 		peer->nss.nss_stats->tx_dropped += tx_dropped;
+ 		peer->nss.nss_stats->tx_failed +=
+ 			pstats->retry.tx_failed_retry_count;
  
 -		ATH11K_NSS_TXRX_NETDEV_STATS(tx, peer->vif, tx_bytes, tx_packets);
 +		if (peer->nss.ext_vdev_up)
