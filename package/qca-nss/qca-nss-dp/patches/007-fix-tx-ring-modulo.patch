@@ -1,0 +1,15 @@
+From: AX6 NSS fix chain
+Subject: [PATCH] edma_v1: fix tx ring mapping expression
+
+The modulo operands are reversed: edma_hw.txdesc_rings % skbq should be
+skbq % edma_hw.txdesc_rings. Single-ring AX6 has no functional change
+but the source expression is wrong and would misroute on multi-ring DTS.
+
+--- a/hal/dp_ops/edma_dp/edma_v1/edma_data_plane.c
++++ b/hal/dp_ops/edma_dp/edma_v1/edma_data_plane.c
+@@ -1,5 +1,5 @@
+ 	skbq = skb_get_queue_mapping(skb);
+ 	tx_ring = 0;
+ 	if ((edma_hw.txdesc_rings > 1) && (skbq > 0))
+-		tx_ring = edma_hw.txdesc_rings % skbq;
++		tx_ring = skbq % edma_hw.txdesc_rings;
