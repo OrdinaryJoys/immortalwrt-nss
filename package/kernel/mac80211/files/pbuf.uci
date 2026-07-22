@@ -5,7 +5,7 @@ config general opt
   # option memory_profile '1gb'
   # option memory_profile '512mb'
   # option memory_profile '256mb'
-  option scaling_governor 'schedutil'
+  option scaling_governor 'performance'
   option reload_wifi '0'
   # n2h_queue_limit: 2048 for >=1GB, 256 only for <=512MB (qosmio recommendation)
   option n2h_queue_limit_core0 '2048'
