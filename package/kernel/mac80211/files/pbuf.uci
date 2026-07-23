@@ -10,3 +10,7 @@ config general opt
   # n2h_queue_limit: 2048 for >=1GB, 256 only for <=512MB (qosmio recommendation)
   option n2h_queue_limit_core0 '2048'
   option n2h_queue_limit_core1 '2048'
+  # qosmio 1GB profile defaults (override via UCI)
+  # option n2h_high_water_core0 '72512'
+  # option n2h_wifi_pool_buf '36864'
+  # option extra_pbuf_core0 '10000000'

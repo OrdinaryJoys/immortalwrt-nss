@@ -186,7 +186,9 @@ apply_nss_config() {
   config_get_bool auto_scale opt auto_scale 0
   config_get n2h_queue_limit_core0 opt n2h_queue_limit_core0 256
   config_get n2h_queue_limit_core1 opt n2h_queue_limit_core1 256
-
+  config_get n2h_high_water_core0 opt n2h_high_water_core0 72512
+  config_get n2h_wifi_pool_buf opt n2h_wifi_pool_buf 36864
+  config_get extra_pbuf_core0 opt extra_pbuf_core0 10000000
   sysctl -w dev.nss.clock.auto_scale="$auto_scale" > /dev/null 2>&1
 
   sysctl -w dev.nss.n2hcfg.n2h_queue_limit_core0="$n2h_queue_limit_core0" > /dev/null 2>&1
@@ -223,7 +225,7 @@ apply_nss_config() {
   case "$memory_profile" in
     # 1GB+ profile
     1024 | 1g*)
-      extra_pbuf_core0=10000000 n2h_high_water_core0=65536 n2h_wifi_pool_buf=32768 apply_sysctl
+      extra_pbuf_core0=10000000 n2h_high_water_core0=72512 n2h_wifi_pool_buf=32768 apply_sysctl
       ;;
       # 512MB profile
     512 | 512m*)
