@@ -1,0 +1,47 @@
+From: AX6 EDMA correctness audit
+Subject: [PATCH 5/6] edma_v1: fix TX teardown store index
+
+edma_cleanup_txdesc_ring_res() uses txdesc->buffer_addr as the TX
+store index to retrieve the skb, but buffer_addr is the DMA address
+programmed into the TX descriptor, not the store index. The store
+index is an opaque value returned by the firmware/hardware in the
+completion descriptor or is maintained by the driver itself.
+
+Use the ring position (descriptor index) as the store index, or
+store the index in a separate driver-managed field. This prevents
+out-of-bounds array access, wrong skb retrieval, and potential
+crash on teardown.
+
+Fixes F5 from AX6 cross-audit 2026-07-26.
+⚠ PATCH NEEDS BUILD-TREE VERIFICATION: the teardown function name,
+  descriptor structure, and store-index scheme must be confirmed
+  against QSDK source. The correct fix may involve using the ring
+  index directly or adding a dedicated store_idx field.
+
+--- a/hal/dp_ops/edma_dp/edma_v1/edma_cfg.c
++++ b/hal/dp_ops/edma_dp/edma_v1/edma_cfg.c
+@@ -XXX,XX +XXX,XX @@ static void edma_cleanup_txdesc_ring_res
+
+ 	for (i = 0; i < EDMA_TX_RING_SIZE; i++) {
+ 		txdesc = &edma_hw.txdesc_rings[ring].desc[i];
+-		store_idx = txdesc->buffer_addr;
+-		skb = tx_skb_store[store_idx];
++		/*
++		 * Use the ring index as store index — the store was
++		 * populated in ring order during TX. buffer_addr is
++		 * a DMA address, not a store index.
++		 */
++		skb = tx_skb_store[i];
+
+ 		if (!skb)
+ 			continue;
+
+-		dma_unmap_single(dev, virt_to_phys(skb->data),
+-				 skb_headlen(skb) + preheader,
++		dma_unmap_single(dev, tx_skb_store[i].dma_handle,
++				 tx_skb_store[i].dma_len,
+ 				 DMA_TO_DEVICE);
+ 		dev_kfree_skb_any(skb);
++		tx_skb_store[i].skb = NULL;
++		tx_skb_store[i].dma_handle = 0;
+ 	}

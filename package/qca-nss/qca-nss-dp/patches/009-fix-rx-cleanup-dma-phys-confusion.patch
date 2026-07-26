@@ -1,0 +1,52 @@
+From: AX6 EDMA correctness audit
+Subject: [PATCH 3/6] edma_v1: don't treat DMA address as physical address in RX cleanup
+
+The RX cleanup path calls phys_to_virt(descriptor->buffer_addr) to
+recover the skb pointer. descriptor->buffer_addr is a DMA address
+programmed by dma_map_single(), not a CPU physical address. On
+IPQ807x with identity-mapped DMA these may coincide, but the
+operation is semantically wrong and breaks under IOMMU.
+
+Store the skb pointer alongside the DMA mapping when refilling the
+RX ring, and use the stored pointer in cleanup instead of reversing
+the DMA address.
+
+Fixes F3 from AX6 cross-audit 2026-07-26.
+⚠ PATCH NEEDS BUILD-TREE VERIFICATION: the RX ring descriptor structure
+  and cleanup/refill paths must be verified against QSDK source.
+
+--- a/hal/dp_ops/edma_dp/edma_v1/edma_data_plane.c
++++ b/hal/dp_ops/edma_dp/edma_v1/edma_data_plane.c
+@@ -XXX,XX +XXX,XX @@ static int edma_rx_refill(struct edma_hw
+ 	dma = dma_map_single(dev, skb->data, edma_hw.rx_buf_size,
+ 			     DMA_FROM_DEVICE);
+ 	if (dma_mapping_error(dev, dma)) {
+ 		dev_kfree_skb_any(skb);
+ 		return -ENOMEM;
+ 	}
+
++	/*
++	 * Store the skb pointer alongside the DMA address so the
++	 * cleanup path can recover it without assuming DMA == phys.
++	 */
++	edma_hw.rx_skb_store[ring][idx] = skb;
++
+ 	descriptor->buffer_addr = dma;
+ 	descriptor->buffer_len  = edma_hw.rx_buf_size;
+@@ -XXX,XX +XXX,XX @@ static void edma_rx_cleanup(struct edma_
+ 	for (i = 0; i < EDMA_RX_RING_SIZE; i++) {
+ 		descriptor = &edma_hw.rx_desc_ring[ring][i];
+
+-		skb = (struct sk_buff *)phys_to_virt(descriptor->buffer_addr);
++		skb = edma_hw.rx_skb_store[ring][i];
+
+ 		if (!skb)
+ 			continue;
+
+-		dma_addr = descriptor->buffer_addr;
++		dma_addr = descriptor->buffer_addr;
+ 		dma_unmap_single(dev, dma_addr, edma_hw.rx_buf_size,
+ 				 DMA_FROM_DEVICE);
+ 		dev_kfree_skb_any(skb);
++		edma_hw.rx_skb_store[ring][i] = NULL;
+ 	}

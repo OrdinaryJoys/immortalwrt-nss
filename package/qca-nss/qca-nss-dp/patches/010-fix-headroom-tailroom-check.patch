@@ -1,0 +1,28 @@
+From: AX6 EDMA correctness audit
+Subject: [PATCH 4/6] edma_v1: fix headroom/tailroom check in TX path
+
+The original code checks skb_headroom(skb) < ntail where ntail is the
+needed tailroom. The correct API for tailroom is skb_tailroom().
+skb_headroom() returns the space before skb->data, which is unrelated
+to the tailroom requirement.
+
+If needed_tailroom is 0 (the common case for EDMA v1 which only sends
+head fragments), this bug is dormant. The fix is still required for
+correctness and to prevent silent buffer overflow if tailroom is ever
+needed (e.g. for L2 header push in VLAN/QinQ configurations).
+
+Fixes F4 from AX6 cross-audit 2026-07-26.
+⚠ PATCH NEEDS BUILD-TREE VERIFICATION: confirm the variable name
+  (ntail / needed_tailroom) and the exact location in edma_tx_rx.c.
+
+--- a/hal/dp_ops/edma_dp/edma_v1/edma_tx_rx.c
++++ b/hal/dp_ops/edma_dp/edma_v1/edma_tx_rx.c
+@@ -XXX,XX +XXX,XX @@ static int edma_tx_linearize_or_clone(st
+
+ 	if (skb_cloned(skb) ||
+ 	    skb_headroom(skb) < nhead ||
+-	    skb_headroom(skb) < ntail)
++	    skb_tailroom(skb) < ntail)
+ 		return -ENOMEM;
+
+ 	return 0;

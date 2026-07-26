@@ -1,0 +1,54 @@
+From: AX6 EDMA correctness audit
+Subject: [PATCH 2/6] edma_v1: save DMA handle for TX completion unmap
+
+The TX completion path reconstructs the DMA address via virt_to_phys()
+instead of using the handle returned by dma_map_single(). The Linux
+DMA API requires dma_unmap_single() to be called with the SAME handle
+that dma_map_single() returned.
+
+On IPQ807x with identity-mapped DMA this may work by coincidence, but
+it is not portable and breaks under IOMMU or swiotlb.
+
+Save the DMA handle and mapped length in each TX store entry, and use
+them in the completion path. Also clear the entry after unmap to
+prevent double-unmap.
+
+Fixes F2 from AX6 cross-audit 2026-07-26.
+⚠ PATCH NEEDS BUILD-TREE VERIFICATION: the TX store entry structure
+  (tx_skb_store or equivalent) must be extended with dma_handle and
+  dma_len fields. Verify the structure layout against QSDK source.
+
+--- a/hal/dp_ops/edma_dp/edma_v1/edma_data_plane.c
++++ b/hal/dp_ops/edma_dp/edma_v1/edma_data_plane.c
+@@ -XXX,XX +XXX,XX @@ struct edma_tx_store_entry {
+ 	struct sk_buff *skb;
++	dma_addr_t dma_handle;
++	size_t dma_len;
+ };
+
+@@ -XXX,XX +XXX,XX @@ static int edma_tx_packet(struct sk_buff
+ 	preheader = edma_get_preheader_len();
+ 	dma = dma_map_single(dev, skb->data, skb_headlen(skb) + preheader,
+ 			     DMA_TO_DEVICE);
+ 	if (dma_mapping_error(dev, dma))
+ 		goto drop;
+
++	store_entry->dma_handle = dma;
++	store_entry->dma_len    = skb_headlen(skb) + preheader;
++
+ 	/* ... TX descriptor programming ... */
+
+@@ -XXX,XX +XXX,XX @@ static int edma_tx_completion(struct edm
+ 	store_idx = completion->store_index;
+ 	store_entry = &tx_skb_store[store_idx];
+
+-	dma_addr = virt_to_phys(store_entry->skb->data);
+-	dma_unmap_single(dev, dma_addr, skb_headlen(store_entry->skb) + preheader,
+-			 DMA_TO_DEVICE);
++	dma_unmap_single(dev, store_entry->dma_handle, store_entry->dma_len,
++			 DMA_TO_DEVICE);
++	store_entry->dma_handle = 0;
++	store_entry->dma_len = 0;
+
+ 	dev_kfree_skb_any(store_entry->skb);
++	store_entry->skb = NULL;

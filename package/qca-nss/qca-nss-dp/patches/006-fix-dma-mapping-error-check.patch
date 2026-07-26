@@ -1,0 +1,31 @@
+From: AX6 EDMA correctness audit
+Subject: [PATCH 1/6] edma_v1: use dma_mapping_error() instead of !dma check
+
+The Linux DMA API requires dma_mapping_error(dev, dma) to test for
+mapping failures. DMA address 0 can be a valid address on some
+platforms, and error values are not guaranteed to be 0. The current
+code uses `if (!dma)` which is incorrect.
+
+Fixes F1 from AX6 cross-audit 2026-07-26.
+⚠ PATCH NEEDS BUILD-TREE VERIFICATION: line numbers and exact file
+  paths must be confirmed against the extracted QSDK EDMA v1 source.
+
+--- a/hal/dp_ops/edma_dp/edma_v1/edma_data_plane.c
++++ b/hal/dp_ops/edma_dp/edma_v1/edma_data_plane.c
+@@ -XXX,XX +XXX,XX @@ static int edma_tx_packet(struct sk_buff
+ 	preheader = edma_get_preheader_len();
+ 	dma = dma_map_single(dev, skb->data, skb_headlen(skb) + preheader,
+ 			     DMA_TO_DEVICE);
+-	if (!dma)
++	if (dma_mapping_error(dev, dma))
+ 		goto drop;
+
+ 	/* ... TX descriptor programming ... */
+@@ -XXX,XX +XXX,XX @@ static int edma_rx_refill(struct edma_hw
+ 	dma = dma_map_single(dev, skb->data, edma_hw.rx_buf_size,
+ 			     DMA_FROM_DEVICE);
+-	if (!dma) {
++	if (dma_mapping_error(dev, dma)) {
+ 		dev_kfree_skb_any(skb);
+ 		return -ENOMEM;
+ 	}

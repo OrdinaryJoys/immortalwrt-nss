@@ -1,0 +1,43 @@
+From: AX6 EDMA correctness audit
+Subject: [PATCH 6/6] edma_v1: fix TX teardown consumer index double increment
+
+edma_cleanup_txdesc_ring_res() executes two consecutive increments on
+the consumer index:
+
+    cons_idx = (cons_idx + 1) & mask;
+    cons_idx++;
+
+The first line increments modulo ring size (correct), but the second
+line does an unconditional +1 that skips the next descriptor. This
+leaves one descriptor per wrap unprocessed and its skb leaked.
+
+Remove the duplicate increment. Also fix the wrap handling to avoid
+index confusion when the ring wraps around.
+
+Fixes F6 from AX6 cross-audit 2026-07-26.
+⚠ PATCH NEEDS BUILD-TREE VERIFICATION: the exact teardown loop
+  structure, variable names (cons_idx, mask), and wrap logic must
+  be confirmed against QSDK source.
+
+--- a/hal/dp_ops/edma_dp/edma_v1/edma_cfg.c
++++ b/hal/dp_ops/edma_dp/edma_v1/edma_cfg.c
+@@ -XXX,XX +XXX,XX @@ static void edma_cleanup_txdesc_ring_res
+
+ 	for (i = 0; i < EDMA_TX_RING_SIZE; i++) {
+ 		/* ... skb cleanup per descriptor ... */
+
+-		cons_idx = (cons_idx + 1) & mask;
+-		cons_idx++;
++		cons_idx = (cons_idx + 1) & mask;
+
+ 		/*
+ 		 * Handle wrap: the hardware may have wrapped the
+-		 * consumer index. Re-read the producer to stay in sync.
++		 * consumer index. Keep the modulo result; the next
++		 * iteration will advance correctly.
+ 		 */
+-		if (cons_idx == 0)
+-			cons_idx = edma_hw.txdesc_rings[ring].prod_idx & mask;
+ 	}
+
+ 	edma_hw.txdesc_rings[ring].cons_idx = cons_idx;
