@@ -7,7 +7,7 @@ but the source expression is wrong and would misroute on multi-ring DTS.
 
 --- a/hal/dp_ops/edma_dp/edma_v1/edma_data_plane.c
 +++ b/hal/dp_ops/edma_dp/edma_v1/edma_data_plane.c
-@@ -1,5 +1,5 @@
+@@ -1,4 +1,4 @@
  	skbq = skb_get_queue_mapping(skb);
  	tx_ring = 0;
  	if ((edma_hw.txdesc_rings > 1) && (skbq > 0))
