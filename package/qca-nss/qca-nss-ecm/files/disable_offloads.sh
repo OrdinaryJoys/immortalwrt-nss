@@ -187,6 +187,8 @@ disable_offload() {
 	config_get_bool disable_interrupt_moderation general disable_interrupt_moderation 0
 	config_get_bool disable_gro									general disable_gro 0
 	config_get_bool disable_gro_list						 general disable_gro_list 1
+	config_get offload_host_ifaces              general offload_host_ifaces ""
+	config_get offload_physical_policy          general offload_physical_policy "disable"
 
 	[ -z "$1" ] && interface=$(echo /sys/class/net/*/device) || interface=$*
 
@@ -198,6 +200,37 @@ disable_offload() {
 		if [ "$i" = lo ] || [ -f "$iface" ]; then
 			continue
 		fi
+
+		#
+		# Per-interface offload policy (P0-C, AX6 corrective plan 2026-07-26).
+		# When offload_host_ifaces is empty (default for non-AX6 platforms),
+		# every physical interface gets the full disable treatment.
+		# When set (e.g. "br-lan" on AX6 stock), only those get hard-disabled;
+		# remaining ports follow offload_physical_policy.
+		#
+		iface_policy="disable"
+
+		if [ -n "$offload_host_ifaces" ]; then
+			is_host=0
+			for h in $offload_host_ifaces; do
+				[ "$i" = "$h" ] && { is_host=1; break; }
+			done
+
+			if [ "$is_host" -eq 0 ]; then
+				iface_policy="$offload_physical_policy"
+			fi
+		fi
+
+		case "$iface_policy" in
+			report)
+				continue
+				;;
+			disable)
+				;;
+			*)
+				logger -t "[offload]" "unknown physical policy '$offload_physical_policy' — defaulting to disable for $i"
+				;;
+		esac
 
 		if [ "$disable_gro" -eq 1 ]; then
 			disable_feature gro "$i"

@@ -1,22 +1,23 @@
 #!/bin/sh
 # shellcheck disable=1090
 #
-# Physical-port offload audit hotplug.
+# Physical-port offload policy hotplug (P0-C unified).
 #
-# When a physical netdev comes up (ACTION=add), log its current ethtool
-# offload state WITHOUT changing it. Forwarded traffic on NSS data-plane
-# ports (wan, lan1-3) goes through the NSS/PPE hardware, not the Linux
-# network stack; blanket-disabling offloads on these ports reduces
-# fallback-path performance without a proven correctness benefit.
+# When a physical netdev comes up (ACTION=add), apply the ECM offload
+# policy via the single disable_offload() entry point.  The policy is
+# UCI-driven inside disable_offload():
+#   ecm.general.offload_host_ifaces      — host-path interfaces (hard disable)
+#   ecm.general.offload_physical_policy   — "disable" (default) or "report"
 #
-# br-lan host-path offload protection is handled separately by the ECM
-# init script (qca-nss-ecm.init → load_ecm → disable_offload).
+# Default (no UCI): force-disable all physical interfaces — preserves
+# upstream qualcommax behaviour unchanged.
 #
-# This hotplug gathers per-interface baseline data for future per-feature
-# A/B testing. When a specific offload feature is proven harmful on a
-# specific physical port, the disable policy can be targeted.
+# AX6 stock: offload_host_ifaces="br-lan", physical_policy="report"
+# → br-lan gets hard-disabled (via 100-disable_offloads_br_lan);
+#   physical ports are logged without forced changes.
 #
-# Fixes C-06 from AX6 cross-audit 2026-07-26.
+# ECM init, reload, and this hotplug share the same UCI-driven path.
+#
 
 PROG=${0##*/}
 
@@ -29,23 +30,9 @@ INC="/lib/netifd/offload/disable_offloads.sh"
 	exit 1
 }
 
-# Physical ports: log current state, don't force-disable.
+# Only physical interfaces (virtual bridges handled by 100-disable_offloads_br_lan).
 if [ -r "/sys/class/net/$INTERFACE/device" ]; then
-	config_load ecm
-	config_get_bool disable_offloads general disable_offloads 0
-
-	if [ "$disable_offloads" -eq 1 ]; then
-		if ethtool -k "$INTERFACE" 1>/dev/null 2>/dev/null; then
-			enabled=$(ethtool -k "$INTERFACE" 2>/dev/null | awk '$2 == "on" {printf "%s%s", sep, $1; sep=", "}')
-			if [ -n "$enabled" ]; then
-				logger -t "[offload-report]" \
-					"$INTERFACE: offloads ON ($enabled) — physical NSS data-plane port; forwarded traffic uses NSS/PPE. Per-feature A/B pending."
-			else
-				logger -t "[offload-report]" \
-					"$INTERFACE: all offloads off"
-			fi
-		fi
-	fi
+	disable_offload "$INTERFACE"
 fi
 
 exit 0
