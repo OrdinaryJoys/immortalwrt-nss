@@ -1,8 +1,47 @@
+From: AX6 NSS fix chain
+Subject: [PATCH] nss-drv: fix current_freq read + keep core stats on fixed frequency
+
+Two fixes fused into one patch (no ordering dependency):
+
+1. current_freq sysctl read: the proc_handler treated reads like writes,
+   clearing the returned length. Fix: only enter the write path when
+   write=1; guard nss_wq access for reads and before wq creation.
+
+2. Auto-scale / fixed-frequency stats: when auto_scale is off the
+   original code set stats_enable=0, which also silenced cpu_load_ubi.
+   Keep stats_enable=1 so NSS core stats continue updating at a fixed
+   frequency. Refactor the auto_scale handler to match: early-return
+   for reads and missing workqueue, consistent stats_enable=1.
+
+Fuses local 012 + VIKINGYFY 020 per AX6 cross-audit 2026-07-26 §6 P0.4.
+
 --- a/nss_init.c
 +++ b/nss_init.c
+@@ -180,15 +180,15 @@ static int nss_current_freq_handler(cons
+ {
+ 	int ret, i;
+
+-	BUG_ON(!nss_wq);
+-
+ 	ret = proc_dointvec(ctl, write, buffer, lenp, ppos);
+
+-	if (!*lenp || (*ppos && !write)) {
+-		printk("Frequency Set to %d\n", nss_cmd_buf.current_freq);
+-		*lenp = 0;
++	if (ret || !write || !*lenp)
++		return ret;
++
++	if (!nss_wq)
+ 		return ret;
+-	}
++
++	printk("Frequency Set to %d\n", nss_cmd_buf.current_freq);
+
+ 	/* Delayed probe can expose this sysctl before the core is ready. */
+ 	if (nss_top_main.nss[NSS_CORE_0].state != NSS_CORE_STATE_INITIALIZED)
 @@ -207,7 +207,8 @@ static int nss_current_freq_handler(cons
  	}
- 
+
  	/*
 -	 * Turn off Auto Scale
 +	 * Turn off frequency scaling, but keep NSS core stats enabled so
@@ -16,17 +55,17 @@
  	nss_work->frequency = nss_cmd_buf.current_freq;
 -	nss_work->stats_enable = 0;
 +	nss_work->stats_enable = 1;
- 
+
  	/*
 -	 * Ensure we start with a fresh set of samples later
 +	 * Start the fixed-frequency stats window with a fresh sample set.
  	 */
  	nss_reset_frequency_stats_samples();
- 
+
 @@ -246,30 +247,40 @@ static int nss_auto_scale_handler(const
  		return ret;
  	}
- 
+
 +	if (!write) {
 +		return ret;
 +	}
@@ -83,30 +122,30 @@
 +
  		return ret;
  	}
- 
+
 @@ -279,6 +290,7 @@ static int nss_auto_scale_handler(const
  	nss_runtime_samples.freq_scale_index = 1;
  	nss_runtime_samples.sample_count = 0;
  	nss_runtime_samples.initialized = 0;
 +	nss_runtime_samples.freq_scale_ready = 0;
  	nss_cmd_buf.current_freq = nss_runtime_samples.freq_scale[nss_runtime_samples.freq_scale_index].frequency;
- 
+
  	nss_work = (nss_work_t *)kmalloc(sizeof(nss_work_t), GFP_ATOMIC);
 @@ -291,8 +303,7 @@ static int nss_auto_scale_handler(const
  	nss_work->stats_enable = 1;
  	queue_work(nss_wq, (struct work_struct *)nss_work);
- 
+
 -	nss_cmd_buf.auto_scale = 0;
 -	nss_runtime_samples.freq_scale_ready = 1;
 +	nss_cmd_buf.auto_scale = 1;
- 
+
  	return ret;
  }
 --- a/nss_freq.c
 +++ b/nss_freq.c
 @@ -210,15 +210,6 @@ static void nss_freq_scale_frequency(str
  	uint32_t index = nss_runtime_samples.freq_scale_index;
- 
+
  	/*
 -	 * We do not accept any statistics if auto scaling is off,
 -	 * we start with a fresh sample set when scaling is
@@ -122,7 +161,7 @@
  	b_index = nss_runtime_samples.buffer_index;
 @@ -232,12 +223,11 @@ static void nss_freq_scale_frequency(str
  		nss_runtime_samples.sample_count++;
- 
+
  		/*
 -		 * Samples Are All Ready, Start Auto Scale
 +		 * Samples are ready for reporting and, if enabled, scaling.
@@ -133,12 +172,12 @@
  			nss_runtime_samples.initialized = 1;
 +			nss_runtime_samples.freq_scale_ready = 1;
  		}
- 
+
  		return;
 @@ -421,7 +411,13 @@ bool nss_freq_sched_change(nss_freq_scal
- 
+
  	nss_work->frequency = nss_runtime_samples.freq_scale[index].frequency;
- 
+
 -	nss_work->stats_enable = auto_scale;
 +	if (!auto_scale) {
 +		nss_cmd_buf.auto_scale = 0;
@@ -149,4 +188,3 @@
 +	nss_work->stats_enable = 1;
  	nss_cmd_buf.current_freq = nss_work->frequency;
  	queue_work(nss_wq, (struct work_struct *)nss_work);
- 
