@@ -223,6 +223,22 @@ disable_offload() {
 
 		case "$iface_policy" in
 			report)
+				#
+				# Physical port: log current state without changing it.
+				# Forwarded traffic on NSS data-plane ports goes through
+				# NSS/PPE hardware; blanket-disable may reduce fallback
+				# performance without a proven correctness benefit.
+				#
+				if [ "$disable_offloads" -eq 1 ] && ethtool -k "$i" 1>/dev/null 2>/dev/null; then
+					enabled_features=$(ethtool -k "$i" 2>/dev/null | awk '"'"'$2 == "on" {printf "%s%s", sep, $1; sep=", "}'"'"')
+					if [ -n "$enabled_features" ]; then
+						logger -t "[offload-report]" \
+							"$i: offloads ON ($enabled_features) â physical NSS data-plane port; per-feature A/B pending"
+					else
+						logger -t "[offload-report]" \
+							"$i: all offloads off"
+					fi
+				fi
 				continue
 				;;
 			disable)
@@ -255,5 +271,34 @@ disable_offload() {
 		if [ "$disable_interrupt_moderation" -eq 1 ]; then
 			disable_interrupt_moderation "$i"
 		fi
+
+	# After processing physical interfaces, apply host-path policy to
+	# any virtual interfaces (e.g. br-lan) that were listed in
+	# offload_host_ifaces but not covered by the device enumeration.
+	# This closes the gap where ECM init/reload parameterless calls
+	# only see /sys/class/net/*/device (P0 offload 2026-07-27).
+	if [ -n "$offload_host_ifaces" ] && [ "$disable_offloads" -eq 1 ]; then
+		for h in $offload_host_ifaces; do
+			[ -d "/sys/class/net/$h" ] || continue
+			[ -d "/sys/class/net/$h/device" ] && continue
+			# Only virtual interfaces reach here (no device node)
+			if [ "$disable_gro" -eq 1 ]; then
+				disable_feature gro "$h"
+			fi
+			if [ "$disable_gro_list" -eq 1 ]; then
+				disable_feature "rx-gro-list" "$h"
+			fi
+			if [ "$disable_offloads" -eq 1 ]; then
+				disable_offloads "$h"
+			fi
+			if [ "$disable_flow_control" -eq 1 ]; then
+				disable_flow_control "$h"
+			fi
+			if [ "$disable_interrupt_moderation" -eq 1 ]; then
+				disable_interrupt_moderation "$h"
+			fi
+		done
+	fi
+
 	done
 }
