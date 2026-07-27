@@ -1,0 +1,22 @@
+From: OpenWrt Build System <openwrt@localhost>
+Subject: [PATCH] nss-drv: reject auto_scale work before core init
+
+The frequency sysctls are registered before probe-gated NSS cores have
+finished booting. A write in that window can queue work against
+uninitialized resources. The current_freq handler already has this guard
+(in fused 012); add the same check to nss_auto_scale_handler.
+
+Source: VIKINGYFY/immortalwrt patch 017 (partial backport).
+
+--- a/nss_init.c
++++ b/nss_init.c
+@@ -259,6 +259,9 @@ static int nss_auto_scale_handler(const
+ 		return ret;
+ 	}
+
++	if (nss_top_main.nss[NSS_CORE_0].state != NSS_CORE_STATE_INITIALIZED)
++		return ret;
++
+ 	if (nss_cmd_buf.auto_scale != 1) {
+ 		/*
+ 		 * Disable frequency scaling, but keep core stats reporting
