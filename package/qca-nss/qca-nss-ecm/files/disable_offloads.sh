@@ -230,10 +230,10 @@ disable_offload() {
 				# performance without a proven correctness benefit.
 				#
 				if [ "$disable_offloads" -eq 1 ] && ethtool -k "$i" 1>/dev/null 2>/dev/null; then
-					enabled_features=$(ethtool -k "$i" 2>/dev/null | awk '"'"'$2 == "on" {printf "%s%s", sep, $1; sep=", "}'"'"')
+					enabled_features=$(ethtool -k "$i" 2>/dev/null | awk '$2 == "on" {printf "%s%s", sep, $1; sep=", "}')
 					if [ -n "$enabled_features" ]; then
 						logger -t "[offload-report]" \
-							"$i: offloads ON ($enabled_features) â physical NSS data-plane port; per-feature A/B pending"
+							"$i: offloads ON ($enabled_features) -- physical NSS data-plane port; per-feature A/B pending"
 					else
 						logger -t "[offload-report]" \
 							"$i: all offloads off"
@@ -271,6 +271,9 @@ disable_offload() {
 		if [ "$disable_interrupt_moderation" -eq 1 ]; then
 			disable_interrupt_moderation "$i"
 		fi
+	fi
+
+	done
 
 	# After processing physical interfaces, apply host-path policy to
 	# any virtual interfaces (e.g. br-lan) that were listed in
@@ -298,7 +301,4 @@ disable_offload() {
 				disable_interrupt_moderation "$h"
 			fi
 		done
-	fi
-
-	done
 }
