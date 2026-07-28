@@ -7,7 +7,10 @@
 # Reference:
 # https://forum.openwrt.org/t/how-to-make-ethtool-setting-persistent-on-br-lan/6433/14
 #
-. /lib/functions.sh
+# Keep the production default while allowing the policy to be exercised by
+# the repository fixture without requiring an OpenWrt root filesystem.
+# shellcheck source=/lib/functions.sh
+. "${OFFLOAD_FUNCTIONS_SH:-/lib/functions.sh}"
 
 log() {
 	local status="$1"
@@ -179,6 +182,10 @@ disable_interrupt_moderation() {
 }
 
 disable_offload() {
+	local interface
+	local device_path
+	local offload_sys_class_net
+
 	config_load ecm
 
 	config_get_bool enable_bridge_filtering			general enable_bridge_filtering 0
@@ -190,7 +197,25 @@ disable_offload() {
 	config_get offload_host_ifaces              general offload_host_ifaces ""
 	config_get offload_physical_policy          general offload_physical_policy "disable"
 
-	[ -z "$1" ] && interface=$(echo /sys/class/net/*/device) || interface=$*
+	offload_sys_class_net="${OFFLOAD_SYS_CLASS_NET:-/sys/class/net}"
+	if [ "$#" -eq 0 ]; then
+		interface=""
+		for device_path in "$offload_sys_class_net"/*/device; do
+			[ -e "$device_path" ] || continue
+			interface="${interface}${interface:+ }${device_path}"
+		done
+
+		# Virtual host-path interfaces do not have a device node and are not
+		# included by the physical interface enumeration above. Add each one
+		# to the same list so every interface follows exactly one policy pass.
+		for h in $offload_host_ifaces; do
+			[ -d "$offload_sys_class_net/$h" ] || continue
+			[ -e "$offload_sys_class_net/$h/device" ] && continue
+			interface="${interface}${interface:+ }${h}"
+		done
+	else
+		interface="$*"
+	fi
 
 	for iface in $interface; do
 		i=${iface%/*}
@@ -244,7 +269,7 @@ disable_offload() {
 			disable)
 				;;
 			*)
-				logger -t "[offload]" "unknown physical policy '$offload_physical_policy' — defaulting to disable for $i"
+				logger -t "[offload]" "unknown physical policy '$offload_physical_policy' -- defaulting to disable for $i"
 				;;
 		esac
 
@@ -271,34 +296,5 @@ disable_offload() {
 		if [ "$disable_interrupt_moderation" -eq 1 ]; then
 			disable_interrupt_moderation "$i"
 		fi
-	fi
-
 	done
-
-	# After processing physical interfaces, apply host-path policy to
-	# any virtual interfaces (e.g. br-lan) that were listed in
-	# offload_host_ifaces but not covered by the device enumeration.
-	# This closes the gap where ECM init/reload parameterless calls
-	# only see /sys/class/net/*/device (P0 offload 2026-07-27).
-	if [ -n "$offload_host_ifaces" ] && [ "$disable_offloads" -eq 1 ]; then
-		for h in $offload_host_ifaces; do
-			[ -d "/sys/class/net/$h" ] || continue
-			[ -d "/sys/class/net/$h/device" ] && continue
-			# Only virtual interfaces reach here (no device node)
-			if [ "$disable_gro" -eq 1 ]; then
-				disable_feature gro "$h"
-			fi
-			if [ "$disable_gro_list" -eq 1 ]; then
-				disable_feature "rx-gro-list" "$h"
-			fi
-			if [ "$disable_offloads" -eq 1 ]; then
-				disable_offloads "$h"
-			fi
-			if [ "$disable_flow_control" -eq 1 ]; then
-				disable_flow_control "$h"
-			fi
-			if [ "$disable_interrupt_moderation" -eq 1 ]; then
-				disable_interrupt_moderation "$h"
-			fi
-		done
 }
