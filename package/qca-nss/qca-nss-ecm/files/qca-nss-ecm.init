@@ -190,13 +190,12 @@ service_triggers() {
 reload_service() {
 	disable_packet_steering
 
-	# Re-apply interface offload policy after network restart.
-	# network restart resets physical interface ethtool features
-	# (rx/tx checksum, SG, TSO) to kernel defaults. The EDMA v1
-	# driver does not implement hardware checksum or SG, so these
-	# MUST be disabled at the Linux level to avoid the observed
-	# local-terminated packet loss, retransmission and management
-	# interface unresponsiveness.
+		# Re-apply the configured interface-offload policy after a network
+		# restart, because netifd or a driver rebind can restore netdev feature
+		# defaults. EDMA v1 does not advertise hardware checksum support, but
+		# Linux GRO/GSO are software batching features and are not inherently
+		# corrupt. Board profiles can therefore select a conservative host-path
+		# policy while leaving physical NSS data-plane ports report-only.
 	if [ -r /lib/netifd/offload/disable_offloads.sh ]; then
 		. /lib/netifd/offload/disable_offloads.sh
 		disable_offload

@@ -281,7 +281,7 @@ disable_offload() {
 			disable_feature "rx-gro-list" "$i"
 		else
 			logger -p user.warn -s "[ethtool] Enabling rx-gro-list (GRO Fraglist) will break UDP related traffic. (e.g. DNS, DHCP)"
-			logger -p user.warn -s "[ethtool] Leave this feature enabled unless you know what you are doing."
+			logger -p user.warn -s "[ethtool] Leave this feature disabled unless you know what you are doing."
 			logger -p user.warn -s "[ethtool] Run \`uci set ecm.general.disable_gro_list=1 && uci commit ecm && service qca-nss-ecm restart\`"
 		fi
 
