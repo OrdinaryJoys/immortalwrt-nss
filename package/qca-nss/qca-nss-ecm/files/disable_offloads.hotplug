@@ -13,8 +13,9 @@
 # upstream qualcommax behaviour unchanged.
 #
 # AX6 stock: offload_host_ifaces="br-lan", physical_policy="report"
-# → br-lan gets hard-disabled (via 100-disable_offloads_br_lan);
-#   physical ports are logged without forced changes.
+# means physical ports are logged without forced changes. Virtual host-path
+# interfaces are handled by parameterless init/reload calls or a board overlay
+# hotplug hook when the bridge is recreated.
 #
 # ECM init, reload, and this hotplug share the same UCI-driven path.
 #
@@ -30,7 +31,8 @@ INC="/lib/netifd/offload/disable_offloads.sh"
 	exit 1
 }
 
-# Only physical interfaces (virtual bridges handled by 100-disable_offloads_br_lan).
+# This package hotplug handles physical interfaces only. Virtual host paths are
+# deliberately left to init/reload or a board-specific bridge hotplug hook.
 if [ -r "/sys/class/net/$INTERFACE/device" ]; then
 	disable_offload "$INTERFACE"
 fi
