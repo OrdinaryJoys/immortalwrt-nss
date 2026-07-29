@@ -2,11 +2,12 @@ From: OpenWrt Build System <openwrt@localhost>
 Subject: [PATCH] qca-nss-dp: split EDMA v1 Rx and Tx NAPI candidate
 
 Based on VIKINGYFY/immortalwrt commit a4638cd4389. This candidate omits
-the duplicate TX ring modulo hunk and the hunk that enables GRO by default.
+the duplicate TX ring modulo hunk and all GRO receive-path changes.
 
 Move legacy EDMA v1 receive and Tx completion handling to independent
 NAPI contexts so their budgets and interrupt masks no longer interfere.
-Keep GRO user-toggleable without changing the current default feature state.
+Keep the existing netif_receive_skb() handoff so GRO remains a separate
+follow-up candidate instead of an implicit split-NAPI variable.
 
 Also correct IRQ unwind, descriptor indexing and DMA mapping lifetime
 issues found while auditing the QSDK data path. Hardware checksum offload
@@ -352,15 +353,6 @@ Signed-off-by: OpenWrt Build System <openwrt@localhost>
  
  		edma_hw.napi_added = 1;
  	}
-@@ -878,6 +897,8 @@
- 		return NSS_DP_FAILURE;
- 	}
- 
-+	edma_if_set_features(dpc);
-+
- 	/*
- 	 * Headroom needed for Tx preheader
- 	 */
 --- a/hal/dp_ops/edma_dp/edma_v1/edma_data_plane.h
 +++ b/hal/dp_ops/edma_dp/edma_v1/edma_data_plane.h
 @@ -171,8 +171,10 @@
@@ -543,15 +535,6 @@ Signed-off-by: OpenWrt Build System <openwrt@localhost>
  		skb = ehw->rx_skb_store[store_index];
  		ehw->rx_skb_store[store_index] = NULL;
  		if (unlikely(!skb)) {
-@@ -397,6 +410,8 @@
- 		if (unlikely(EDMA_RXPH_SERVICE_CODE_GET(rxph) ==
- 					NSS_PTP_EVENT_SERVICE_CODE))
- 			nss_phy_tstamp_rx_buf(ndev, skb);
-+		else if (likely(ndev->features & NETIF_F_GRO))
-+			napi_gro_receive(&ehw->rx_napi, skb);
- 		else
- 			netif_receive_skb(skb);
- 
 @@ -413,8 +428,6 @@
  		work_done++;
  	}

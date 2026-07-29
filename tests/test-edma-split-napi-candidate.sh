@@ -14,16 +14,20 @@ for required in \
 	'edma_handle_rx_irq' \
 	'edma_handle_tx_irq' \
 	'edma_rx_napi' \
-	'edma_tx_napi' \
-	'napi_gro_receive(&ehw->rx_napi, skb)'; do
+	'edma_tx_napi'; do
 	grep -Fq "$required" "$PATCH" || {
 		echo "missing split-NAPI candidate requirement: $required" >&2
 		exit 1
 	}
 done
 
-if grep -Fq 'netdev->hw_features |= NETIF_F_GRO' "$PATCH"; then
-	echo 'split-NAPI candidate must not enable GRO by default' >&2
+if grep -Fq 'NETIF_F_GRO' "$PATCH" || grep -Fq 'napi_gro_receive' "$PATCH"; then
+	echo 'split-NAPI candidate must not include the separate GRO variable' >&2
+	exit 1
+fi
+
+if grep -Fq 'edma_if_set_features(dpc);' "$PATCH"; then
+	echo 'split-NAPI candidate must not add a redundant pre-registration feature call' >&2
 	exit 1
 fi
 
