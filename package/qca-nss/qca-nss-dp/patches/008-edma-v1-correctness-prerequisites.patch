@@ -1,19 +1,20 @@
 From 9d4c9b504abfb76e17051f7769970a2ff7222803 Mon Sep 17 00:00:00 2001
 From: OpenWrt Build System <openwrt@localhost>
 Date: Thu, 30 Jul 2026 08:01:12 +0800
-Subject: [PATCH 1/2] qca-nss-dp: harden EDMA v1 correctness prerequisites
+Subject: [PATCH 1/2] qca-nss-dp: harden EDMA v1 correctness prerequisites (F1-F6)
 
-Split the correctness prerequisites from the RX/TX NAPI topology change. Validate DMA mappings before publishing descriptors, retain exact TX DMA addresses for unmap, decode descriptor fields with the correct endianness, reject invalid store indices, and unwind only IRQs that were actually requested with the matching dev_id. Keep the original single-NAPI topology and receive handoff unchanged.
+Split the correctness prerequisites from the RX/TX NAPI topology change. Validate DMA mappings before publishing descriptors, retain exact TX DMA addresses for unmap, decode descriptor fields with the correct endianness, reject invalid store indices, fix headroom-vs-tailroom API misuse in TX path, and unwind only IRQs that were actually requested with the matching dev_id. Keep the original single-NAPI topology and receive handoff unchanged.
 
 Based on VIKINGYFY/immortalwrt a4638cd4389.
+F1 headroom/tailroom fix from AX6 EDMA cross-audit 2026-07-26.
 
 Signed-off-by: OpenWrt Build System <openwrt@localhost>
 ---
  hal/dp_ops/edma_dp/edma_v1/edma_cfg.c        | 41 +++++++-----
- hal/dp_ops/edma_dp/edma_v1/edma_data_plane.c | 58 ++++++++++-------
+ hal/dp_ops/edma_dp/edma_v1/edma_data_plane.c | 60 +++++++++++-------
  hal/dp_ops/edma_dp/edma_v1/edma_data_plane.h |  9 +--
  hal/dp_ops/edma_dp/edma_v1/edma_tx_rx.c      | 67 ++++++++++----------
- 4 files changed, 99 insertions(+), 76 deletions(-)
+ 4 files changed, 100 insertions(+), 77 deletions(-)
 
 diff --git a/hal/dp_ops/edma_dp/edma_v1/edma_cfg.c b/hal/dp_ops/edma_dp/edma_v1/edma_cfg.c
 index fba67c4..62563bf 100644
@@ -148,6 +149,15 @@ index 03029c9..842108f 100644
  
  	/*
  	 * Disable RxFill Rings used by this driver
+@@ -548,7 +548,7 @@ static netdev_tx_t edma_if_xmit(struct nss_dp_data_plane_ctx *dpc,
+
+ 	if (skb_cloned(skb) ||
+ 		(skb_headroom(skb) < nhead) ||
+-		(skb_headroom(skb) < ntail)) {
++		(skb_tailroom(skb) < ntail)) {
+ 		expand_skb = true;
+ 	}
+
 @@ -657,6 +655,7 @@ static int edma_irq_init(void)
  {
  	int err;
