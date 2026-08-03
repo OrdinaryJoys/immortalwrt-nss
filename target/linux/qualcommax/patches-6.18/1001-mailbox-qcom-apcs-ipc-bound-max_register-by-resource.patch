@@ -39,7 +39,7 @@ Signed-off-by: AX6 NSS Repair Project
 
 --- a/drivers/mailbox/qcom-apcs-ipc-mailbox.c
 +++ b/drivers/mailbox/qcom-apcs-ipc-mailbox.c
-@@ -70,18 +70,30 @@ static int qcom_apcs_ipc_probe(struct platform_device *pdev)
+@@ -70,18 +70,31 @@ static int qcom_apcs_ipc_probe(struct platform_device *pdev)
  	struct qcom_apcs_ipc *apcs;
  	const struct qcom_apcs_ipc_data *apcs_data;
  	struct regmap *regmap;
