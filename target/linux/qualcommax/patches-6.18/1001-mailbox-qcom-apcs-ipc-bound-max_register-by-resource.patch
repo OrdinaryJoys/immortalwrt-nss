@@ -48,11 +48,11 @@ Signed-off-by: AX6 NSS Repair Project
  	void __iomem *base;
  	unsigned long i;
  	int ret;
-
+ 
  	apcs = devm_kzalloc(&pdev->dev, sizeof(*apcs), GFP_KERNEL);
  	if (!apcs)
  		return -ENOMEM;
-
+ 
 +	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
 +	if (!res)
 +		return -ENODEV;
@@ -60,7 +60,7 @@ Signed-off-by: AX6 NSS Repair Project
  	base = devm_platform_ioremap_resource(pdev, 0);
  	if (IS_ERR(base))
  		return PTR_ERR(base);
-
+ 
 -	regmap = devm_regmap_init_mmio(&pdev->dev, base, &apcs_regmap_config);
 +	/*
 +	 * Bound max_register to the actual resource size so that
