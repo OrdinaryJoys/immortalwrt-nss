@@ -1,0 +1,74 @@
+From: AX6 NSS Repair Project
+Date: Sun, 3 Aug 2026 11:00:00 +0800
+Subject: [PATCH] mailbox: qcom-apcs-ipc: bound max_register by actual resource size
+
+The global apcs_regmap_config.max_register is hard-coded to 0x1008 to
+accommodate SDX55 (offset=0x1008), but this value exceeds the MMIO
+resource size on IPQ8074/IPQ6018 (0x1000 bytes).  When userspace reads
+the regmap debugfs `registers` node, the regmap core iterates from 0 to
+max_register inclusive with stride 4, accessing offset 0x1008 which lies
+beyond the mapped region:
+
+  Unable to handle kernel paging request at virtual address ffffffc080e86000
+  ESR = 0x0000000096000007  (DABT, current EL)
+  FSC = 0x07: level 3 translation fault
+  pc : regmap_mmio_read32le+0x8/0x20
+  Call trace:
+   regmap_mmio_read32le
+   _regmap_bus_reg_read
+   _regmap_read
+   regmap_read
+   regmap_read_debugfs
+   regmap_map_read_file
+   full_proxy_read  →  vfs_read  →  ksys_read
+   ... el0_svc ...
+  Kernel panic - not syncing: Oops: Fatal exception
+
+Fix by computing the safe max_register at probe time from the actual
+resource size.  A local copy of apcs_regmap_config is used so that
+SDX55 (whose resource covers the full 0x1008) is not affected.
+
+The clock child device (when present) accesses register offset 8 or 16,
+both well within the bounded range on all SoCs.
+
+Cc: stable@vger.kernel.org
+Signed-off-by: AX6 NSS Repair Project
+---
+ drivers/mailbox/qcom-apcs-ipc-mailbox.c | 14 +++++++++++++-
+ 1 file changed, 13 insertions(+), 1 deletion(-)
+
+--- a/drivers/mailbox/qcom-apcs-ipc-mailbox.c
++++ b/drivers/mailbox/qcom-apcs-ipc-mailbox.c
+@@ -70,18 +70,30 @@ static int qcom_apcs_ipc_probe(struct platform_device *pdev)
+ 	struct qcom_apcs_ipc *apcs;
+ 	const struct qcom_apcs_ipc_data *apcs_data;
+ 	struct regmap *regmap;
++	struct regmap_config regmap_config_local;
++	struct resource *res;
+ 	void __iomem *base;
+ 	unsigned long i;
+ 	int ret;
+
+ 	apcs = devm_kzalloc(&pdev->dev, sizeof(*apcs), GFP_KERNEL);
+ 	if (!apcs)
+ 		return -ENOMEM;
+
++	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
++	if (!res)
++		return -ENODEV;
++
+ 	base = devm_platform_ioremap_resource(pdev, 0);
+ 	if (IS_ERR(base))
+ 		return PTR_ERR(base);
+
+-	regmap = devm_regmap_init_mmio(&pdev->dev, base, &apcs_regmap_config);
++	/*
++	 * Bound max_register to the actual resource size so that
++	 * debugfs regmap reads cannot access beyond the mapped region.
++	 */
++	regmap_config_local = apcs_regmap_config;
++	regmap_config_local.max_register = resource_size(res) -
++					   apcs_regmap_config.reg_stride;
++	regmap = devm_regmap_init_mmio(&pdev->dev, base, &regmap_config_local);
+ 	if (IS_ERR(regmap))
+ 		return PTR_ERR(regmap);
