@@ -20,6 +20,15 @@ get_cpu_mask() {
 	printf '%x' "$mask"
 }
 
+get_board_devices() {
+	# DSA-style LANs are represented by network.*.ports[], while routed
+	# interfaces such as WAN use network.*.device. Cover both layouts so
+	# qca-nss-dp host traffic gets the same RPS/RFS policy on every port.
+	jsonfilter -i /etc/board.json \
+		-e '@.network[*].device' \
+		-e '@.network[*].ports[*]' 2>/dev/null | sort -u
+}
+
 start() {
 	local flow_cnt sock_flow_entries cpu_mask
 
@@ -27,7 +36,7 @@ start() {
 	sock_flow_entries=65535
 	cpu_mask="$(get_cpu_mask)"
 
-	for eth in $(jsonfilter -i "/etc/board.json" -e "@.network[*].device"); do
+	for eth in $(get_board_devices); do
 		[ -d "/sys/class/net/$eth" ] || continue
 		for i in "/sys/class/net/$eth"/queues/rx-*/rps_cpus; do [ -w "$i" ] && echo "$cpu_mask" > "$i"; done
 		for i in "/sys/class/net/$eth"/queues/rx-*/rps_flow_cnt; do [ -w "$i" ] && echo "$flow_cnt" > "$i"; done
