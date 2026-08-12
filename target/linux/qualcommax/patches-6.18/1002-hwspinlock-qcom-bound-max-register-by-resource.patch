@@ -1,0 +1,65 @@
+From: AX6 NSS Repair Project
+Date: Tue, 12 Aug 2026 11:00:00 +0800
+Subject: [PATCH] hwspinlock: qcom: bound MMIO regmap to resource size
+
+The qcom,tcsr-mutex regmap advertises max_register 0x20000.  On
+IPQ8074 the MMIO resource is also 0x20000 bytes, whose last complete
+32-bit register starts at offset 0x1fffc.  Because max_register is
+inclusive, a regmap debugfs dump reaches offset 0x20000 and accesses
+one register beyond the mapping.
+
+An IPQ8074 system reproduced the resulting fatal data abort in
+regmap_mmio_read32le while userspace read the regmap debugfs file.  The
+faulting register offset was 0x20000 and the process was grep.
+
+Make a probe-local copy of the selected per-SoC regmap configuration
+and clamp its upper bound to the last complete register in the MMIO
+resource.  Preserve a smaller driver-defined upper bound when the DT
+resource is larger, and reject resources smaller than one register to
+avoid unsigned underflow.
+
+Signed-off-by: AX6 NSS Repair Project
+---
+ drivers/hwspinlock/qcom_hwspinlock.c | 18 +++++++++++++++++-
+ 1 file changed, 17 insertions(+), 1 deletion(-)
+
+--- a/drivers/hwspinlock/qcom_hwspinlock.c
++++ b/drivers/hwspinlock/qcom_hwspinlock.c
+@@ -182,19 +182,36 @@ static struct regmap *qcom_hwspinlock_probe_mmio(struct platform_device *pdev,
+ 						 u32 *offset, u32 *stride)
+ {
+ 	const struct qcom_hwspinlock_of_data *data;
++	struct regmap_config regmap_config;
+ 	struct device *dev = &pdev->dev;
++	struct resource *res;
++	resource_size_t size;
+ 	void __iomem *base;
+ 
+ 	data = of_device_get_match_data(dev);
+ 	if (!data->regmap_config)
+ 		return ERR_PTR(-EINVAL);
+ 
+ 	*offset = data->offset;
+ 	*stride = data->stride;
+ 
++	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
++	if (!res)
++		return ERR_PTR(-EINVAL);
++
++	size = resource_size(res);
++	if (size < data->regmap_config->reg_stride)
++		return ERR_PTR(-EINVAL);
++
+ 	base = devm_platform_ioremap_resource(pdev, 0);
+ 	if (IS_ERR(base))
+ 		return ERR_CAST(base);
+ 
+-	return devm_regmap_init_mmio(dev, base, data->regmap_config);
++
++	regmap_config = *data->regmap_config;
++	regmap_config.max_register = min_t(resource_size_t,
++					regmap_config.max_register,
++					size - regmap_config.reg_stride);
++
++	return devm_regmap_init_mmio(dev, base, &regmap_config);
+ }

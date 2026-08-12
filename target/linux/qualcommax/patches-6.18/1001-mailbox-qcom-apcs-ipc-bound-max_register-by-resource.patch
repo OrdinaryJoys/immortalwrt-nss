@@ -24,9 +24,10 @@ beyond the mapped region:
    ... el0_svc ...
   Kernel panic - not syncing: Oops: Fatal exception
 
-Fix by computing the safe max_register at probe time from the actual
-resource size.  A local copy of apcs_regmap_config is used so that
-SDX55 (whose resource covers the full 0x1008) is not affected.
+Fix by clamping max_register at probe time to the last complete register
+inside the actual resource.  A local copy of apcs_regmap_config preserves
+the per-driver upper bound on platforms with a larger resource, while a
+small-resource guard prevents unsigned underflow.
 
 The clock child device (when present) accesses register offset 8 or 16,
 both well within the bounded range on all SoCs.
@@ -34,17 +35,18 @@ both well within the bounded range on all SoCs.
 Cc: stable@vger.kernel.org
 Signed-off-by: AX6 NSS Repair Project
 ---
- drivers/mailbox/qcom-apcs-ipc-mailbox.c | 14 +++++++++++++-
- 1 file changed, 13 insertions(+), 1 deletion(-)
+ drivers/mailbox/qcom-apcs-ipc-mailbox.c | 22 +++++++++++++++++++++-
+ 1 file changed, 21 insertions(+), 1 deletion(-)
 
 --- a/drivers/mailbox/qcom-apcs-ipc-mailbox.c
 +++ b/drivers/mailbox/qcom-apcs-ipc-mailbox.c
-@@ -70,18 +70,31 @@ static int qcom_apcs_ipc_probe(struct platform_device *pdev)
+@@ -70,18 +70,38 @@ static int qcom_apcs_ipc_probe(struct platform_device *pdev)
  	struct qcom_apcs_ipc *apcs;
  	const struct qcom_apcs_ipc_data *apcs_data;
  	struct regmap *regmap;
 +	struct regmap_config regmap_config_local;
 +	struct resource *res;
++	resource_size_t size;
  	void __iomem *base;
  	unsigned long i;
  	int ret;
@@ -57,18 +59,24 @@ Signed-off-by: AX6 NSS Repair Project
 +	if (!res)
 +		return -ENODEV;
 +
++	size = resource_size(res);
++	if (size < apcs_regmap_config.reg_stride)
++		return -EINVAL;
++
  	base = devm_platform_ioremap_resource(pdev, 0);
  	if (IS_ERR(base))
  		return PTR_ERR(base);
  
 -	regmap = devm_regmap_init_mmio(&pdev->dev, base, &apcs_regmap_config);
 +	/*
-+	 * Bound max_register to the actual resource size so that
-+	 * debugfs regmap reads cannot access beyond the mapped region.
++	 * Keep the driver's original upper bound, but never let debugfs
++	 * regmap reads reach beyond the mapped resource.
 +	 */
 +	regmap_config_local = apcs_regmap_config;
-+	regmap_config_local.max_register = resource_size(res) -
-+					   apcs_regmap_config.reg_stride;
++	regmap_config_local.max_register = min_t(resource_size_t,
++					   apcs_regmap_config.max_register,
++					   size -
++					   apcs_regmap_config.reg_stride);
 +	regmap = devm_regmap_init_mmio(&pdev->dev, base, &regmap_config_local);
  	if (IS_ERR(regmap))
  		return PTR_ERR(regmap);

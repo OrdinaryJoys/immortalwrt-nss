@@ -17,7 +17,8 @@
 #   arch/arm64/boot/dts/qcom/ipq6018.dtsi    mailbox@b111000  reg <0x0 0x0b111000 0x0 0x1000>
 #   arch/arm/boot/dts/qcom/qcom-sdx55.dtsi   mailbox@17810000 reg <0x17810000 0x2000>
 #   regmap 语义: MMIO 地址 = base + reg (reg 即字节偏移), debugfs 以 reg_stride 步进
-#   读到 max_register 为止; 修复后 max_register = resource_size - reg_stride
+#   读到 max_register 为止; 修复后 max_register =
+#   min(原 max_register, resource_size - reg_stride)
 #
 # 返回码: 0 = 全部通过; 1 = 存在失败项
 
@@ -63,8 +64,10 @@ fi
 # ── 3. 补丁内容断言 ────────────────────────────────────────────────────────
 grep -q "platform_get_resource(pdev, IORESOURCE_MEM, 0)" "$PATCH" \
     && ok "含 platform_get_resource 资源检查" || bad "含 platform_get_resource 资源检查"
-grep -q "regmap_config_local.max_register = resource_size(res)" "$PATCH" \
-    && ok "max_register 绑定 resource_size" || bad "max_register 绑定 resource_size"
+grep -q "regmap_config_local.max_register = min_t(resource_size_t" "$PATCH" \
+    && ok "max_register 使用资源边界 clamp" || bad "max_register 使用资源边界 clamp"
+grep -q "size < apcs_regmap_config.reg_stride" "$PATCH" \
+    && ok "资源小于 stride 时拒绝初始化" || bad "资源小于 stride 时拒绝初始化"
 grep -q "apcs_regmap_config.reg_stride" "$PATCH" \
     && ok "减去 reg_stride (本地副本模板)" || bad "减去 reg_stride (本地副本模板)"
 grep -q "regmap_config_local = apcs_regmap_config" "$PATCH" \
@@ -107,22 +110,36 @@ fi
 
 # ── 5. 三 SoC offset/resource/max 关系矩阵 ─────────────────────────────────
 # 常量来自 v6.18 驱动 + mainline DTS (见文件头); 断言公式:
-#   max_register = resource_size - reg_stride(4)
+#   max_register = min(original_max, resource_size - reg_stride(4))
 #   合法: offset <= max_register        (mailbox 读写可达)
 #   安全: max_register < resource_size  (debugfs 步进读到 max 不越界)
 STRIDE=4
 check_soc() {
-    SOC=$1; OFF=$2; RES=$3
-    MAX=$((RES - STRIDE))
+    SOC=$1; OFF=$2; RES=$3; ORIGINAL_MAX=$4
+    OFF=$((OFF))
+    RES=$((RES))
+    ORIGINAL_MAX=$((ORIGINAL_MAX))
+    RESOURCE_MAX=$((RES - STRIDE))
+    if [ "$ORIGINAL_MAX" -lt "$RESOURCE_MAX" ]; then
+        MAX=$ORIGINAL_MAX
+    else
+        MAX=$RESOURCE_MAX
+    fi
     if [ $((MAX)) -ge $((OFF)) ] && [ $((MAX)) -lt $((RES)) ]; then
         ok "$SOC: offset=0x$(printf '%x' "$((OFF))") resource=0x$(printf '%x' "$((RES))") max=0x$(printf '%x' "$MAX") (offset≤max 且不越界)"
     else
         bad "$SOC: offset=0x$(printf '%x' "$((OFF))") resource=0x$(printf '%x' "$((RES))") max=0x$(printf '%x' "$MAX") 关系不成立"
     fi
 }
-check_soc "IPQ8074" "0x8"   "0x1000"
-check_soc "IPQ6018" "0x8"   "0x1000"
-check_soc "SDX55"   "0x1008" "0x2000"
+check_soc "IPQ8074" "0x8"    "0x1000" "0x1008"
+check_soc "IPQ6018" "0x8"    "0x1000" "0x1008"
+check_soc "SDX55"   "0x1008" "0x2000" "0x1008"
+
+if [ 2 -lt "$STRIDE" ]; then
+    ok "极小资源 2B 小于 stride 4B 时由 probe 拒绝，公式不会下溢"
+else
+    bad "极小资源下溢 guard 测试"
+fi
 
 # ── 6. 补丁对 v6.18 驱动可干净应用 + 应用后语义 ────────────────────────────
 if [ -f "$FIXTURE" ]; then
@@ -142,7 +159,9 @@ if [ -f "$FIXTURE" ]; then
                 echo "APPLY_FAIL"
             fi
             if git apply -p1 "$PATCH" 2>/dev/null && \
-               grep -q "regmap_config_local.max_register = resource_size(res)" \
+               grep -q "regmap_config_local.max_register = min_t(resource_size_t" \
+                    drivers/mailbox/qcom-apcs-ipc-mailbox.c && \
+               grep -q "size < apcs_regmap_config.reg_stride" \
                     drivers/mailbox/qcom-apcs-ipc-mailbox.c && \
                grep -q "platform_get_resource(pdev, IORESOURCE_MEM, 0)" \
                     drivers/mailbox/qcom-apcs-ipc-mailbox.c && \

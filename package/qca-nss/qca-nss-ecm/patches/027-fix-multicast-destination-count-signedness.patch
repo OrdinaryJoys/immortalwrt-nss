@@ -1,0 +1,66 @@
+From: Abhradeep Roy <abhradee@qti.qualcomm.com>
+Date: Fri, 31 Oct 2025 17:31:20 -0700
+Subject: [PATCH] qca-nss-ecm: keep multicast destination count signed
+
+ipmr_find_mfc_entry() and ip6mr_find_mfc_entry() return negative error
+codes.  Storing the result in an unsigned destination count makes the
+existing dst_if_cnt < 0 checks ineffective and can turn an error into a
+large loop bound.  Keep the result signed in all NSS and SFE IPv4/IPv6
+multicast bridge update paths.
+
+Backport of CodeLinaro qca-nss-ecm commit
+5ff84400cfc9de77f45e4b3da581bf803051a466.
+
+Signed-off-by: Abhradeep Roy <abhradee@qti.qualcomm.com>
+Signed-off-by: AX6 NSS Repair Project
+---
+ frontends/nss/ecm_nss_multicast_ipv4.c | 2 +-
+ frontends/nss/ecm_nss_multicast_ipv6.c | 2 +-
+ frontends/sfe/ecm_sfe_multicast_ipv4.c | 2 +-
+ frontends/sfe/ecm_sfe_multicast_ipv6.c | 2 +-
+ 4 files changed, 4 insertions(+), 4 deletions(-)
+
+--- a/frontends/nss/ecm_nss_multicast_ipv4.c
++++ b/frontends/nss/ecm_nss_multicast_ipv4.c
+@@ -2071,7 +2071,7 @@ static void ecm_nss_multicast_ipv4_bridg
+ 			int i;
+ 			__be32 ip_src;
+ 			__be32 ip_grp;
+-			uint32_t dst_if_cnt;
++			int dst_if_cnt;
+ 			uint32_t dst_dev[ECM_DB_MULTICAST_IF_MAX];
+ 
+ 			/*
+--- a/frontends/nss/ecm_nss_multicast_ipv6.c
++++ b/frontends/nss/ecm_nss_multicast_ipv6.c
+@@ -2028,7 +2028,7 @@ static void ecm_nss_multicast_ipv6_bridg
+ 			int i;
+ 			struct in6_addr ip_src;
+ 			struct in6_addr ip_grp;
+-			uint32_t dst_if_cnt;
++			int dst_if_cnt;
+ 			uint32_t dst_dev[ECM_DB_MULTICAST_IF_MAX];
+ 
+ 			/*
+--- a/frontends/sfe/ecm_sfe_multicast_ipv4.c
++++ b/frontends/sfe/ecm_sfe_multicast_ipv4.c
+@@ -2539,7 +2539,7 @@ static void ecm_sfe_multicast_ipv4_bridg
+ 			int i;
+ 			__be32 ip_src;
+ 			__be32 ip_grp;
+-			uint32_t dst_if_cnt;
++			int dst_if_cnt;
+ 			uint32_t dst_dev[ECM_DB_MULTICAST_IF_MAX];
+ 
+ 			/*
+--- a/frontends/sfe/ecm_sfe_multicast_ipv6.c
++++ b/frontends/sfe/ecm_sfe_multicast_ipv6.c
+@@ -2552,7 +2552,7 @@ static void ecm_sfe_multicast_ipv6_bridg
+ 			int i;
+ 			struct in6_addr ip_src;
+ 			struct in6_addr ip_grp;
+-			uint32_t dst_if_cnt;
++			int dst_if_cnt;
+ 			uint32_t dst_dev[ECM_DB_MULTICAST_IF_MAX];
+ 
+ 			/*
