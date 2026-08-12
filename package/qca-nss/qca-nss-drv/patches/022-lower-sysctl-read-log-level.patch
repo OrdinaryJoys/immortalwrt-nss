@@ -1,0 +1,63 @@
+From: AX6 NSS Repair Project
+Subject: [PATCH] nss-drv: demote read-only sysctl debug prints to pr_debug
+
+Reading the dev.nss sysctl tree (e.g. `sysctl dev.nss` or iterating
+/proc/sys/dev/nss) invokes the frequency-table, average-instruction and
+min-reuse read handlers, which emit unqualified printk() calls.
+Unqualified printk() defaults to KERN_WARNING, so a plain read floods
+the kernel log with warn-level noise.  Observed on AX6 (IPQ8074):
+repeated kern.warn/alert lines at 16:09 and 07:36 from full sysctl
+reads, with no write or configuration change involved.
+
+These prints are informational only; no tooling parses them from dmesg.
+Demote all six read-path calls to pr_debug so routine reads stay silent
+while the output remains available under dynamic debug.  Write-path
+printk (Frequency Set / Frequency not found / SPI debug / coredump)
+and the *lenp = 0 read contracts are unchanged.
+
+diff --git a/nss_init.c b/nss_init.c
+index 1a7e6ce..8df6d33 100644
+--- a/nss_init.c
++++ b/nss_init.c
+@@ -311,16 +311,16 @@ static int nss_get_freq_table_handler(struct ctl_table *ctl, int write, void __u
+ 		return ret;
+ 	}
+ 
+-	printk("Frequency Supported - ");
++	pr_debug("Frequency Supported - ");
+ 
+ 	i = 0;
+ 	while (i < NSS_FREQ_MAX_SCALE) {
+ 		if (nss_runtime_samples.freq_scale[i].frequency != NSS_FREQ_SCALE_NA) {
+-			printk("%d Hz ", nss_runtime_samples.freq_scale[i].frequency);
++			pr_debug("%d Hz ", nss_runtime_samples.freq_scale[i].frequency);
+ 		}
+ 		i++;
+ 	}
+-	printk("\n");
++	pr_debug("\n");
+ 
+ 	*lenp = 0;
+ 	return ret;
+@@ -340,7 +340,7 @@ static int nss_get_average_inst_handler(struct ctl_table *ctl, int write, void _
+ 		return ret;
+ 	}
+ 
+-	printk("Current Inst Per Ms %x\n", nss_runtime_samples.average);
++	pr_debug("Current Inst Per Ms %x\n", nss_runtime_samples.average);
+ 
+ 	*lenp = 0;
+ 	return ret;
+@@ -455,10 +455,10 @@ static int nss_get_min_reuse_handler(struct ctl_table *ctl, int write, void __us
+ 
+ 	for (core_id = 0; core_id < NSS_CORE_MAX; core_id++) {
+ 		nss_ctx = (struct nss_ctx_instance *)&nss_top_main.nss[core_id];
+-		printk("core %d: %d ", core_id, nss_core_get_min_reuse(nss_ctx));
++		pr_debug("core %d: %d ", core_id, nss_core_get_min_reuse(nss_ctx));
+ 	}
+ 
+-	printk("\n");
++	pr_debug("\n");
+ 	*lenp = 0;
+ 	return ret;
+ }
