@@ -3,10 +3,17 @@
 
 START=99
 
+BOARD_JSON=${IRQ_BOARD_JSON:-/etc/board.json}
+BOARD_DETECT=${IRQ_BOARD_DETECT:-/bin/board_detect}
+CPU_ONLINE=${IRQ_CPU_ONLINE:-/sys/devices/system/cpu/online}
+SYS_CLASS_NET=${IRQ_SYS_CLASS_NET:-/sys/class/net}
+UCI_FUNCTIONS=${IRQ_UCI_FUNCTIONS:-/lib/functions.sh}
+RPS_SOCK_FLOW_ENTRIES=${IRQ_RPS_SOCK_FLOW_ENTRIES:-/proc/sys/net/core/rps_sock_flow_entries}
+
 get_cpu_mask() {
 	local cpu range start end mask=0
 
-	for range in $(tr ',' ' ' < /sys/devices/system/cpu/online 2> /dev/null); do
+	for range in $(tr ',' ' ' < "$CPU_ONLINE" 2> /dev/null); do
 		start="${range%-*}"
 		end="${range#*-}"
 		[ "$start" = "$end" ] && end="$start"
@@ -20,28 +27,101 @@ get_cpu_mask() {
 	printf '%x' "$mask"
 }
 
-get_board_devices() {
-	# DSA-style LANs are represented by network.*.ports[], while routed
-	# interfaces such as WAN use network.*.device. Cover both layouts so
-	# qca-nss-dp host traffic gets the same RPS/RFS policy on every port.
-	jsonfilter -i /etc/board.json \
+get_json_devices() {
+	local json="$1"
+
+	[ -s "$json" ] || return 1
+	jsonfilter -i "$json" \
 		-e '@.network[*].device' \
 		-e '@.network[*].ports[*]' 2>/dev/null | sort -u
 }
 
+emit_uci_devices() {
+	local section="$1" device ports eth
+
+	config_get device "$section" device
+	config_get ports "$section" ports
+	for eth in $device $ports; do
+		printf '%s\n' "$eth"
+	done
+}
+
+get_uci_devices() {
+	[ -r "$UCI_FUNCTIONS" ] || return 1
+	# shellcheck disable=SC1090
+	. "$UCI_FUNCTIONS"
+	config_load network || return 1
+	config_foreach emit_uci_devices device
+	config_foreach emit_uci_devices interface
+}
+
+get_sysfs_devices() {
+	local path eth
+
+	for path in "$SYS_CLASS_NET"/*; do
+		[ -d "$path" ] || continue
+		eth=${path##*/}
+		case "$eth" in
+			eth*|lan*|wan*) printf '%s\n' "$eth" ;;
+		esac
+	done
+}
+
+filter_data_plane_devices() {
+	local eth
+
+	while IFS= read -r eth; do
+		case "$eth" in
+			''|*[!A-Za-z0-9_.:-]*|lo|br-*|wlan*|phy*|zt*|ifb*|tun*|tap*) continue ;;
+		esac
+		[ -d "$SYS_CLASS_NET/$eth" ] || continue
+		printf '%s\n' "$eth"
+	done | sort -u
+}
+
+get_board_devices() {
+	local devices board_tmp
+
+	# DSA-style LANs are represented by network.*.ports[], while routed
+	# interfaces such as WAN use network.*.device. Cover both layouts so
+	# qca-nss-dp host traffic gets the same RPS/RFS policy on every port.
+	devices=$(get_json_devices "$BOARD_JSON") || devices=
+
+	# The preinit copy of board.json can disappear across the first overlay
+	# pivot. Re-detect into /tmp at S99 instead of assuming /tmp/board.json was
+	# retained after 82_config_generate moved it into the preinit /etc tree.
+	if [ -z "$devices" ] && [ -x "$BOARD_DETECT" ]; then
+		board_tmp="${TMPDIR:-/tmp}/set-irq-affinity-board.$$"
+		if "$BOARD_DETECT" "$board_tmp" >/dev/null 2>&1; then
+			devices=$(get_json_devices "$board_tmp") || devices=
+		fi
+		rm -f "$board_tmp"
+	fi
+
+	if [ -z "$devices" ]; then
+		devices=$(get_uci_devices) || devices=
+	fi
+	if [ -z "$devices" ]; then
+		devices=$(get_sysfs_devices) || devices=
+	fi
+	printf '%s\n' "$devices" | filter_data_plane_devices
+}
+
 start() {
-	local flow_cnt sock_flow_entries cpu_mask
+	local flow_cnt sock_flow_entries cpu_mask devices
 
 	flow_cnt=8192
 	sock_flow_entries=65535
 	cpu_mask="$(get_cpu_mask)"
+	devices="$(get_board_devices)"
+	logger -t set-irq-affinity \
+		"RPS start: mask=$cpu_mask devices=$(printf '%s\n' "$devices" | tr '\n' ' ')"
 
-	for eth in $(get_board_devices); do
-		[ -d "/sys/class/net/$eth" ] || continue
-		for i in "/sys/class/net/$eth"/queues/rx-*/rps_cpus; do [ -w "$i" ] && echo "$cpu_mask" > "$i"; done
-		for i in "/sys/class/net/$eth"/queues/rx-*/rps_flow_cnt; do [ -w "$i" ] && echo "$flow_cnt" > "$i"; done
-		for i in "/sys/class/net/$eth"/queues/tx-*/xps_cpus; do [ -w "$i" ] && echo "$cpu_mask" > "$i"; done
+	for eth in $devices; do
+		for i in "$SYS_CLASS_NET/$eth"/queues/rx-*/rps_cpus; do [ -w "$i" ] && echo "$cpu_mask" > "$i"; done
+		for i in "$SYS_CLASS_NET/$eth"/queues/rx-*/rps_flow_cnt; do [ -w "$i" ] && echo "$flow_cnt" > "$i"; done
+		for i in "$SYS_CLASS_NET/$eth"/queues/tx-*/xps_cpus; do [ -w "$i" ] && echo "$cpu_mask" > "$i"; done
 	done
 
-	[ -w "/proc/sys/net/core/rps_sock_flow_entries" ] && echo "$sock_flow_entries" > "/proc/sys/net/core/rps_sock_flow_entries"
+	[ -w "$RPS_SOCK_FLOW_ENTRIES" ] && echo "$sock_flow_entries" > "$RPS_SOCK_FLOW_ENTRIES"
 }
