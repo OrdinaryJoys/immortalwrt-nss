@@ -1,0 +1,27 @@
+#!/bin/sh
+# Re-assert the RPS/RFS/XPS queue policy after data-plane interface events.
+#
+# On the very first boot the NSS datapath re-creates the bridge-port queues
+# when a WiFi AP joins br-lan. That happens after S99set-irq-affinity has
+# already applied the policy, and the queue re-creation resets rps_cpus to 0.
+# Re-applying on the interface event closes that gap; the writes are
+# idempotent, so re-asserting on every matching event is safe.
+
+case "${ACTION:-}" in
+	ifup|iface|ifupdate|add) ;;
+	*) exit 0 ;;
+esac
+
+case "${INTERFACE:-}" in
+	lan*|wan|eth*|phy*) ;;
+	*) exit 0 ;;
+esac
+
+[ -x /etc/init.d/set-irq-affinity ] || exit 0
+
+# Defer briefly so a just-completed datapath reconfiguration has settled,
+# and run in the background so hotplug delivery is never blocked.
+(
+	sleep 3
+	/etc/init.d/set-irq-affinity start >/dev/null 2>&1
+) &

@@ -107,8 +107,28 @@ get_board_devices() {
 	printf '%s\n' "$devices" | filter_data_plane_devices
 }
 
+apply_queue_policy() {
+	local eth i applied=0
+
+	for eth in $devices; do
+		for i in "$SYS_CLASS_NET/$eth"/queues/rx-*/rps_cpus; do
+			if [ -w "$i" ] && printf '%s\n' "$cpu_mask" > "$i" 2>/dev/null; then
+				applied=$((applied + 1))
+			fi
+		done
+		for i in "$SYS_CLASS_NET/$eth"/queues/rx-*/rps_flow_cnt; do
+			[ -w "$i" ] && printf '%s\n' "$flow_cnt" > "$i" 2>/dev/null
+		done
+		for i in "$SYS_CLASS_NET/$eth"/queues/tx-*/xps_cpus; do
+			[ -w "$i" ] && printf '%s\n' "$cpu_mask" > "$i" 2>/dev/null
+		done
+	done
+
+	printf '%s\n' "$applied"
+}
+
 start() {
-	local flow_cnt sock_flow_entries cpu_mask devices
+	local flow_cnt sock_flow_entries cpu_mask devices applied attempts
 
 	flow_cnt=8192
 	sock_flow_entries=65535
@@ -117,11 +137,27 @@ start() {
 	logger -t set-irq-affinity \
 		"RPS start: mask=$cpu_mask devices=$(printf '%s\n' "$devices" | tr '\n' ' ')"
 
-	for eth in $devices; do
-		for i in "$SYS_CLASS_NET/$eth"/queues/rx-*/rps_cpus; do [ -w "$i" ] && echo "$cpu_mask" > "$i"; done
-		for i in "$SYS_CLASS_NET/$eth"/queues/rx-*/rps_flow_cnt; do [ -w "$i" ] && echo "$flow_cnt" > "$i"; done
-		for i in "$SYS_CLASS_NET/$eth"/queues/tx-*/xps_cpus; do [ -w "$i" ] && echo "$cpu_mask" > "$i"; done
+	# On the very first boot the NSS datapath can attach after S99, so the
+	# per-port queues may not exist yet and the writes are silently lost.
+	# Retry until at least one data-plane queue accepts the mask and log the
+	# outcome so a missing queue set is never silent.
+	attempts=10
+	applied=0
+	while [ "$attempts" -gt 0 ]; do
+		applied=$(apply_queue_policy)
+		[ "$applied" -gt 0 ] && break
+		logger -t set-irq-affinity \
+			"RPS retry: no writable data-plane queue yet (attempts left=$((attempts - 1)))"
+		attempts=$((attempts - 1))
+		[ "$attempts" -gt 0 ] && sleep 3
 	done
+
+	if [ "$applied" -gt 0 ]; then
+		logger -t set-irq-affinity "RPS applied: $applied queue(s), mask=$cpu_mask"
+	else
+		logger -t set-irq-affinity -p user.warn \
+			"RPS apply failed: no writable data-plane queue (mask=$cpu_mask)"
+	fi
 
 	[ -w "$RPS_SOCK_FLOW_ENTRIES" ] && echo "$sock_flow_entries" > "$RPS_SOCK_FLOW_ENTRIES"
 }

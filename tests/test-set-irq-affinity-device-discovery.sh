@@ -49,6 +49,7 @@ jsonfilter() {
 }
 
 logger() { :; }
+sleep() { :; }
 
 IRQ_BOARD_JSON=$TMP/board.json
 IRQ_BOARD_DETECT=$TMP/bin/board-detect
@@ -113,6 +114,19 @@ if [ "$(cat "$IRQ_SYS_CLASS_NET/lan1/queues/rx-0/rps_cpus")" = f ] &&
 	ok 'discovered device receives the complete RPS/RFS/XPS policy'
 else
 	bad 'discovered device receives the complete RPS/RFS/XPS policy'
+fi
+
+# No queues at all (first-boot gap): the retry loop must exhaust and finish
+# instead of hanging; the warning path is exercised with sleep mocked out.
+rm -rf "$IRQ_SYS_CLASS_NET"/*/queues
+BOARD_DETECT_FAIL=1
+UCI_DEVICE=eth0
+UCI_PORTS=
+export BOARD_DETECT_FAIL UCI_DEVICE UCI_PORTS
+if start; then
+	ok 'queue-less first boot retries and finishes without hanging'
+else
+	bad 'queue-less first boot retries and finishes without hanging'
 fi
 
 echo "=== summary: PASS=$PASS FAIL=$FAIL ==="
