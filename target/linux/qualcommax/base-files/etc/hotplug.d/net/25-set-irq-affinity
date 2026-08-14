@@ -13,7 +13,7 @@ case "${ACTION:-}" in
 esac
 
 case "${INTERFACE:-}" in
-	lan*|wan|eth*|phy*) ;;
+	lan*|wan|eth*|phy*|br-*|zt*) ;;
 	*) exit 0 ;;
 esac
 
