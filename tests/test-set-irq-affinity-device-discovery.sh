@@ -107,6 +107,9 @@ printf 'lan1\n' > "$IRQ_BOARD_JSON"
 BOARD_DETECT_FAIL=0
 export BOARD_DETECT_FAIL
 start
+# The boot path spawns background re-assert waves; wait for them so their
+# idempotent writes cannot race the readback assertions below.
+wait 2>/dev/null || true
 
 if [ "$(cat "$IRQ_SYS_CLASS_NET/lan1/queues/rx-0/rps_cpus")" = f ] &&
    [ "$(cat "$IRQ_SYS_CLASS_NET/lan1/queues/rx-0/rps_flow_cnt")" = 8192 ] &&
@@ -125,6 +128,7 @@ UCI_DEVICE=eth0
 UCI_PORTS=
 export BOARD_DETECT_FAIL UCI_DEVICE UCI_PORTS
 if start; then
+	wait 2>/dev/null || true
 	ok 'queue-less first boot retries and finishes without hanging'
 else
 	bad 'queue-less first boot retries and finishes without hanging'
