@@ -50,6 +50,7 @@ jsonfilter() {
 
 logger() { :; }
 sleep() { :; }
+extra_command() { :; }
 
 IRQ_BOARD_JSON=$TMP/board.json
 IRQ_BOARD_DETECT=$TMP/bin/board-detect

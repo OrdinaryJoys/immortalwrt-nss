@@ -3,6 +3,8 @@
 
 START=99
 
+extra_command "start_rps" "Re-assert the RPS/RFS/XPS queue policy"
+
 BOARD_JSON=${IRQ_BOARD_JSON:-/etc/board.json}
 BOARD_DETECT=${IRQ_BOARD_DETECT:-/bin/board_detect}
 CPU_ONLINE=${IRQ_CPU_ONLINE:-/sys/devices/system/cpu/online}
@@ -159,5 +161,28 @@ start() {
 			"RPS apply failed: no writable data-plane queue (mask=$cpu_mask)"
 	fi
 
+	# The EDMA datapath completes its deferred probe shortly after S99 and
+	# silently re-creates the port queues, resetting rps_cpus to 0 (verified
+	# on AX6 hardware: S99 apply, then the queue re-creation arrives with the
+	# driver's sync_state, and no interface event reliably follows). Re-assert
+	# on fixed delays so the final state is deterministic. Every wave is
+	# idempotent and cheap.
+	(
+		for delay in 30 90 180 300; do
+			sleep "$delay"
+			n=$(apply_queue_policy)
+			logger -t set-irq-affinity "RPS re-assert (wave +${delay}s): $n queue(s)"
+		done
+	) &
+
 	[ -w "$RPS_SOCK_FLOW_ENTRIES" ] && echo "$sock_flow_entries" > "$RPS_SOCK_FLOW_ENTRIES"
+}
+
+start_rps() {
+	local cpu_mask devices applied
+
+	cpu_mask="$(get_cpu_mask)"
+	devices="$(get_board_devices)"
+	applied=$(apply_queue_policy)
+	logger -t set-irq-affinity "RPS event re-assert: $applied queue(s), mask=$cpu_mask"
 }

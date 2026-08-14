@@ -20,8 +20,9 @@ esac
 [ -x /etc/init.d/set-irq-affinity ] || exit 0
 
 # Defer briefly so a just-completed datapath reconfiguration has settled,
-# and run in the background so hotplug delivery is never blocked.
+# and run in the background so hotplug delivery is never blocked. Use the
+# event-only entry so no extra delayed re-assert waves are spawned per event.
 (
 	sleep 3
-	/etc/init.d/set-irq-affinity start >/dev/null 2>&1
+	/etc/init.d/set-irq-affinity start_rps >/dev/null 2>&1
 ) &
