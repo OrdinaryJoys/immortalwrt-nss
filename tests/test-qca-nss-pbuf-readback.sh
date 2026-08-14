@@ -11,6 +11,7 @@ PASS=0
 FAIL=0
 MODE=normal
 WRITE_COUNT=0
+WRITE_LOG=$TMP/write.log
 
 ok() { PASS=$((PASS + 1)); echo "PASS: $1"; }
 bad() { FAIL=$((FAIL + 1)); echo "FAIL: $1"; }
@@ -38,6 +39,7 @@ sysctl() {
   key=${2%%=*}
   value=${2#*=}
   WRITE_COUNT=$((WRITE_COUNT + 1))
+  printf '%s=%s\n' "$key" "$value" >> "$WRITE_LOG"
 
   case "$MODE:$key" in
     retry:dev.nss.n2hcfg.extra_pbuf_core0)
@@ -51,6 +53,13 @@ sysctl() {
       ;;
     normal:dev.nss.n2hcfg.extra_pbuf_core0)
       set_value "$key" $(((value + 4095) / 4096 * 4096))
+      ;;
+    coupled:dev.nss.n2hcfg.extra_pbuf_core0)
+      set_value "$key" $(((value + 4095) / 4096 * 4096))
+      ;;
+    coupled:dev.nss.n2hcfg.n2h_wifi_pool_buf)
+      set_value "$key" "$value"
+      set_value dev.nss.n2hcfg.n2h_high_water_core0 "$value"
       ;;
     *)
       set_value "$key" "$value"
@@ -68,6 +77,46 @@ getconf() { printf '4096\n'; }
 
 KEY=dev.nss.n2hcfg.extra_pbuf_core0
 
+reset_writes() {
+  WRITE_COUNT=0
+  : > "$WRITE_LOG"
+}
+
+test_profile() {
+  label=$1
+  requested_extra=$2
+  expected_extra=$3
+  expected_high=$4
+  expected_wifi=$5
+  high_key=dev.nss.n2hcfg.n2h_high_water_core0
+  wifi_key=dev.nss.n2hcfg.n2h_wifi_pool_buf
+
+  set_value "$KEY" 0
+  set_value "$high_key" 0
+  set_value "$wifi_key" 0
+  MODE=coupled
+  reset_writes
+  # shellcheck disable=SC2034
+  board='test'
+  # shellcheck disable=SC2034
+  extra_pbuf_core0=$requested_extra
+  # shellcheck disable=SC2034
+  n2h_high_water_core0=$expected_high
+  # shellcheck disable=SC2034
+  n2h_wifi_pool_buf=$expected_wifi
+
+  if apply_sysctl &&
+     [ "$(get_value "$KEY")" = "$expected_extra" ] &&
+     [ "$(get_value "$high_key")" = "$expected_high" ] &&
+     [ "$(get_value "$wifi_key")" = "$expected_wifi" ] &&
+     [ "$(sed 's/=.*//' "$WRITE_LOG" | tr '\n' ' ')" = \
+       "$KEY $wifi_key $high_key " ]; then
+    ok "$label profile preserves final high-water after the WiFi pool update"
+  else
+    bad "$label profile preserves final high-water after the WiFi pool update"
+  fi
+}
+
 set_value test.exact 0
 MODE=normal
 WRITE_COUNT=0
@@ -76,6 +125,10 @@ if write_sysctl_exact test.exact 65536 && [ "$(get_value test.exact)" = 65536 ];
 else
   bad "exact sysctl write is verified"
 fi
+
+test_profile 1GB 10000000 10002432 65536 32768
+test_profile 512MB 8000000 8003584 32768 16384
+test_profile 256MB 4000000 4001792 16384 8192
 
 set_value "$KEY" 0
 MODE=normal

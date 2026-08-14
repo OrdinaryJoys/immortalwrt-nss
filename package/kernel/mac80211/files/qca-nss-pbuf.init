@@ -237,15 +237,41 @@ configure_extra_pbuf() {
   return 1
 }
 
+verify_pbuf_profile() {
+  local requested_extra="$1" expected_high="$2" expected_wifi="$3"
+  local page_size expected_extra actual_extra actual_high actual_wifi
+
+  page_size=$(get_kernel_page_size)
+  expected_extra=$(((requested_extra + page_size - 1) / page_size * page_size))
+  actual_extra=$(read_sysctl_value dev.nss.n2hcfg.extra_pbuf_core0)
+  actual_high=$(read_sysctl_value dev.nss.n2hcfg.n2h_high_water_core0)
+  actual_wifi=$(read_sysctl_value dev.nss.n2hcfg.n2h_wifi_pool_buf)
+
+  if [ "$actual_extra" = "$expected_extra" ] &&
+     [ "$actual_high" = "$expected_high" ] &&
+     [ "$actual_wifi" = "$expected_wifi" ]; then
+    return 0
+  fi
+
+  logger -t "$NAME" -p user.error \
+    "NSS pbuf profile verification failed: extra=${actual_extra:-unavailable}/$expected_extra, high=${actual_high:-unavailable}/$expected_high, wifi=${actual_wifi:-unavailable}/$expected_wifi"
+  return 1
+}
+
 apply_sysctl() {
   logger -t "$NAME" "$board - setting dev.nss.n2hcfg.extra_pbuf_core0=$extra_pbuf_core0"
   configure_extra_pbuf "$extra_pbuf_core0" || return 1
 
+  logger -t "$NAME" "$board - setting dev.nss.n2hcfg.n2h_wifi_pool_buf=$n2h_wifi_pool_buf"
+  write_sysctl_exact dev.nss.n2hcfg.n2h_wifi_pool_buf "$n2h_wifi_pool_buf" || return 1
+
+  # The WiFi pool update adjusts the N2H high-water split in qca-nss-drv.
+  # Program and verify high-water last so the final profile remains exact.
   logger -t "$NAME" "$board - setting dev.nss.n2hcfg.n2h_high_water_core0=$n2h_high_water_core0"
   write_sysctl_exact dev.nss.n2hcfg.n2h_high_water_core0 "$n2h_high_water_core0" || return 1
 
-  logger -t "$NAME" "$board - setting dev.nss.n2hcfg.n2h_wifi_pool_buf=$n2h_wifi_pool_buf"
-  write_sysctl_exact dev.nss.n2hcfg.n2h_wifi_pool_buf "$n2h_wifi_pool_buf" || return 1
+  verify_pbuf_profile \
+    "$extra_pbuf_core0" "$n2h_high_water_core0" "$n2h_wifi_pool_buf"
 }
 
 apply_nss_config() {
