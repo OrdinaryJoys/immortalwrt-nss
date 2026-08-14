@@ -262,12 +262,19 @@ apply_sysctl() {
   logger -t "$NAME" "$board - setting dev.nss.n2hcfg.extra_pbuf_core0=$extra_pbuf_core0"
   configure_extra_pbuf "$extra_pbuf_core0" || return 1
 
+  # qca-nss-drv semantics (verified on AX6 hardware, 2026-08-14):
+  #   - the WiFi pool write is rejected while high-water is below the WiFi
+  #     value (boot default high=8704 < wifi=32768 -> readback stays 0), and
+  #   - a successful WiFi pool write overwrites high-water with the WiFi value.
+  # Program high-water first so the WiFi write is accepted, re-assert
+  # high-water afterwards, then verify the final profile is exact.
+  logger -t "$NAME" "$board - setting dev.nss.n2hcfg.n2h_high_water_core0=$n2h_high_water_core0"
+  write_sysctl_exact dev.nss.n2hcfg.n2h_high_water_core0 "$n2h_high_water_core0" || return 1
+
   logger -t "$NAME" "$board - setting dev.nss.n2hcfg.n2h_wifi_pool_buf=$n2h_wifi_pool_buf"
   write_sysctl_exact dev.nss.n2hcfg.n2h_wifi_pool_buf "$n2h_wifi_pool_buf" || return 1
 
-  # The WiFi pool update adjusts the N2H high-water split in qca-nss-drv.
-  # Program and verify high-water last so the final profile remains exact.
-  logger -t "$NAME" "$board - setting dev.nss.n2hcfg.n2h_high_water_core0=$n2h_high_water_core0"
+  logger -t "$NAME" "$board - re-asserting dev.nss.n2hcfg.n2h_high_water_core0=$n2h_high_water_core0"
   write_sysctl_exact dev.nss.n2hcfg.n2h_high_water_core0 "$n2h_high_water_core0" || return 1
 
   verify_pbuf_profile \

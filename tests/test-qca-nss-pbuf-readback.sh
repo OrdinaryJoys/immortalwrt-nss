@@ -58,6 +58,10 @@ sysctl() {
       set_value "$key" $(((value + 4095) / 4096 * 4096))
       ;;
     coupled:dev.nss.n2hcfg.n2h_wifi_pool_buf)
+      # Hardware-verified driver semantics: the WiFi pool write is rejected
+      # while high-water is below the WiFi value, and a successful write
+      # overwrites high-water with the WiFi value.
+      [ "$(get_value dev.nss.n2hcfg.n2h_high_water_core0)" -lt "$value" ] && return 1
       set_value "$key" "$value"
       set_value dev.nss.n2hcfg.n2h_high_water_core0 "$value"
       ;;
@@ -110,7 +114,7 @@ test_profile() {
      [ "$(get_value "$high_key")" = "$expected_high" ] &&
      [ "$(get_value "$wifi_key")" = "$expected_wifi" ] &&
      [ "$(sed 's/=.*//' "$WRITE_LOG" | tr '\n' ' ')" = \
-       "$KEY $wifi_key $high_key " ]; then
+       "$KEY $high_key $wifi_key $high_key " ]; then
     ok "$label profile preserves final high-water after the WiFi pool update"
   else
     bad "$label profile preserves final high-water after the WiFi pool update"
@@ -129,6 +133,28 @@ fi
 test_profile 1GB 10000000 10002432 65536 32768
 test_profile 512MB 8000000 8003584 32768 16384
 test_profile 256MB 4000000 4001792 16384 8192
+
+# Hardware-verified scenario: on a fresh boot high-water sits at the driver
+# default (8704 on AX6), below the 1GB WiFi pool value. The WiFi write is
+# rejected until high-water is programmed first; the re-asserted high-water
+# must survive afterwards.
+set_value "$KEY" 0
+set_value dev.nss.n2hcfg.n2h_high_water_core0 8704
+set_value dev.nss.n2hcfg.n2h_wifi_pool_buf 0
+MODE=coupled
+reset_writes
+board='test'
+extra_pbuf_core0=10000000
+n2h_high_water_core0=65536
+n2h_wifi_pool_buf=32768
+if apply_sysctl &&
+   [ "$(get_value "$KEY")" = 10002432 ] &&
+   [ "$(get_value dev.nss.n2hcfg.n2h_high_water_core0)" = 65536 ] &&
+   [ "$(get_value dev.nss.n2hcfg.n2h_wifi_pool_buf)" = 32768 ]; then
+  ok "boot-default high-water (8704) no longer rejects the WiFi pool write"
+else
+  bad "boot-default high-water (8704) no longer rejects the WiFi pool write"
+fi
 
 set_value "$KEY" 0
 MODE=normal
