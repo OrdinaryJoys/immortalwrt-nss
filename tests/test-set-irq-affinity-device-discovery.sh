@@ -150,5 +150,11 @@ else
 	bad 'event re-assert entry applies the complete RPS/RFS/XPS policy'
 fi
 
+if grep -q "Zerotier" "$SCRIPT_DIR/../target/linux/qualcommax/base-files/etc/hotplug.d/net/25-set-irq-affinity"; then
+	ok 'hotplug filter covers the ZeroTier interface name (runtime reload re-assert)'
+else
+	bad 'hotplug filter covers the ZeroTier interface name (runtime reload re-assert)'
+fi
+
 echo "=== summary: PASS=$PASS FAIL=$FAIL ==="
 [ "$FAIL" -eq 0 ]
