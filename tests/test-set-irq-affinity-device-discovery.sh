@@ -136,6 +136,7 @@ fi
 
 # The hotplug event entry must apply the full policy including RFS flow
 # counts (a previous version left flow_cnt unset and zeroed the queues).
+mkdir -p "$IRQ_SYS_CLASS_NET/lan1/queues/rx-0" "$IRQ_SYS_CLASS_NET/lan1/queues/tx-0"
 : > "$IRQ_SYS_CLASS_NET/lan1/queues/rx-0/rps_cpus"
 : > "$IRQ_SYS_CLASS_NET/lan1/queues/rx-0/rps_flow_cnt"
 : > "$IRQ_SYS_CLASS_NET/lan1/queues/tx-0/xps_cpus"
