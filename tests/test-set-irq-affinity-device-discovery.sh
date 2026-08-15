@@ -134,5 +134,20 @@ else
 	bad 'queue-less first boot retries and finishes without hanging'
 fi
 
+# The hotplug event entry must apply the full policy including RFS flow
+# counts (a previous version left flow_cnt unset and zeroed the queues).
+: > "$IRQ_SYS_CLASS_NET/lan1/queues/rx-0/rps_cpus"
+: > "$IRQ_SYS_CLASS_NET/lan1/queues/rx-0/rps_flow_cnt"
+: > "$IRQ_SYS_CLASS_NET/lan1/queues/tx-0/xps_cpus"
+start_rps
+wait 2>/dev/null || true
+if [ "$(cat "$IRQ_SYS_CLASS_NET/lan1/queues/rx-0/rps_cpus")" = f ] &&
+   [ "$(cat "$IRQ_SYS_CLASS_NET/lan1/queues/rx-0/rps_flow_cnt")" = 8192 ] &&
+   [ "$(cat "$IRQ_SYS_CLASS_NET/lan1/queues/tx-0/xps_cpus")" = f ]; then
+	ok 'event re-assert entry applies the complete RPS/RFS/XPS policy'
+else
+	bad 'event re-assert entry applies the complete RPS/RFS/XPS policy'
+fi
+
 echo "=== summary: PASS=$PASS FAIL=$FAIL ==="
 [ "$FAIL" -eq 0 ]

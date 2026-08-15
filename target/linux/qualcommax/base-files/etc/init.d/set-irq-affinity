@@ -179,8 +179,9 @@ start() {
 }
 
 start_rps() {
-	local cpu_mask devices applied
+	local flow_cnt cpu_mask devices applied
 
+	flow_cnt=8192
 	cpu_mask="$(get_cpu_mask)"
 	devices="$(get_board_devices)"
 	applied=$(apply_queue_policy)
