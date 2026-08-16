@@ -130,7 +130,7 @@ else
   bad "exact sysctl write is verified"
 fi
 
-test_profile 1GB 10000000 10002432 72512 36864
+test_profile 1GB 10000000 10002432 131072 36864
 test_profile 512MB 8000000 8003584 32768 16384
 test_profile 256MB 4000000 4001792 16384 8192
 
