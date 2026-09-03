@@ -2,7 +2,7 @@
 
 set -eu
 
-ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
+ROOT="$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)"
 PATCH="$ROOT/package/kernel/mac80211/patches/nss/ath11k/999-933-ath11k-nss-configure-wifili-tx-desc-from-dt.patch"
 DTS="$ROOT/target/linux/qualcommax/dts/ipq8071-ax6.dts"
 MAC80211_MAKEFILE="$ROOT/package/kernel/mac80211/Makefile"
