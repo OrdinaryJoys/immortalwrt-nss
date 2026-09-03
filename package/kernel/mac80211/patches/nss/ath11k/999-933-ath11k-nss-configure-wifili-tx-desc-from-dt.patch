@@ -1,0 +1,112 @@
+From: OrdinaryJoys <ordinaryjoys@users.noreply.github.com>
+Date: Thu, 3 Sep 2026 16:35:00 +0800
+Subject: [PATCH] wifi: ath11k: configure NSS WiFi TX descriptors from DT
+
+Keep the Qualcomm 8192-per-radio default for existing boards, but allow a
+board with sufficient memory to request a larger pool. Validate alignment,
+the NSS device-wide descriptor limit, and the primary plus additional page
+message capacity before accepting the override. Use the same value for the
+per-radio NSS buffer limits so the pool and runtime limit cannot diverge.
+
+---
+ drivers/net/wireless/ath/ath11k/nss.c | 51 ++++++++++++++++++++++-----
+ drivers/net/wireless/ath/ath11k/nss.h |  2 ++
+ 2 files changed, 44 insertions(+), 9 deletions(-)
+
+--- a/drivers/net/wireless/ath/ath11k/nss.c
++++ b/drivers/net/wireless/ath/ath11k/nss.c
+@@ -4205,7 +4205,45 @@
+ 	*page_idx = curr_page_idx;
+ 	return 0;
+ }
++
++static u32 ath11k_nss_get_tx_desc_limit(struct ath11k_base *ab, u32 num_pool)
++{
++	u32 limit = ATH11K_WIFILI_DBDC_NUM_TX_DESC;
++	u32 total_desc;
++	u32 total_pages;
+ 
++	if (of_property_read_u32(ab->dev->of_node,
++				 "qcom,nss-wifili-tx-desc-count", &limit))
++		return limit;
++
++	if (limit < 1024 || limit > ATH11K_WIFILI_MAX_TX_DESC ||
++	    limit % 1024)
++		goto invalid;
++
++	total_desc = limit * num_pool;
++	if (total_desc > ATH11K_WIFILI_MAX_TX_DESC)
++		goto invalid;
++
++	total_pages = DIV_ROUND_UP((total_desc + num_pool) *
++				   WIFILI_NSS_TX_DESC_SIZE,
++				   WIFILI_NSS_MAX_MEM_PAGE_SIZE);
++	total_pages += DIV_ROUND_UP((total_desc + num_pool) *
++				    WIFILI_NSS_TX_EXT_DESC_SIZE,
++				    WIFILI_NSS_MAX_EXT_MEM_PAGE_SIZE);
++	if (total_pages >= ATH11K_NSS_MAX_NUMBER_OF_PAGE)
++		goto invalid;
++
++	ath11k_info(ab, "NSS WiFi TX descriptors: %u per radio, %u pages\n",
++		    limit, total_pages);
++	return limit;
++
++invalid:
++	ath11k_warn(ab,
++		    "invalid NSS WiFi TX descriptor count %u for %u radios; using %u\n",
++		    limit, num_pool, ATH11K_WIFILI_DBDC_NUM_TX_DESC);
++	return ATH11K_WIFILI_DBDC_NUM_TX_DESC;
++}
++
+ static int ath11k_nss_fill_tx_desc_info(struct ath11k_base *ab,
+ 					struct nss_wifili_init_msg *wim)
+ {
+@@ -4226,20 +4264,20 @@
+ 
+ 	dim->num_pool = ab->num_radios;
+ 	dim->num_tx_device_limit = ATH11K_WIFILI_MAX_TX_DESC;
++	ab->nss.tx_desc_limit = ath11k_nss_get_tx_desc_limit(ab, dim->num_pool);
+ 
+-	//TODO Revisit below calc based on platform/mem cfg
+ 	switch (dim->num_pool) {
+ 	case 1:
+-		tx_desc_limit_0 = ATH11K_WIFILI_DBDC_NUM_TX_DESC;
++		tx_desc_limit_0 = ab->nss.tx_desc_limit;
+ 		break;
+ 	case 2:
+-		tx_desc_limit_0 = ATH11K_WIFILI_DBDC_NUM_TX_DESC;
+-		tx_desc_limit_1 = ATH11K_WIFILI_DBDC_NUM_TX_DESC;
++		tx_desc_limit_0 = ab->nss.tx_desc_limit;
++		tx_desc_limit_1 = ab->nss.tx_desc_limit;
+ 		break;
+ 	case 3:
+-		tx_desc_limit_0 = ATH11K_WIFILI_DBTC_NUM_TX_DESC;
+-		tx_desc_limit_1 = ATH11K_WIFILI_DBTC_NUM_TX_DESC;
+-		tx_desc_limit_2 = ATH11K_WIFILI_DBTC_NUM_TX_DESC;
++		tx_desc_limit_0 = ab->nss.tx_desc_limit;
++		tx_desc_limit_1 = ab->nss.tx_desc_limit;
++		tx_desc_limit_2 = ab->nss.tx_desc_limit;
+ 		break;
+ 	default:
+ 		ath11k_warn(ab, "unexpected num radios during tx desc alloc\n");
+@@ -4723,7 +4761,8 @@
+ 	 */
+ 
+ 	for (i = 0; i < ATH11K_NSS_RADIO_TX_LIMIT_RANGE; i++)
+-		ath11k_nss_radio_buf_cfg(ar, i, ATH11K_NSS_RADIO_TX_LIMIT_RANGE3);
++		ath11k_nss_radio_buf_cfg(ar, i, ab->nss.tx_desc_limit ?:
++					 ATH11K_NSS_RADIO_TX_LIMIT_RANGE3);
+ 
+ 	return 0;
+ 
+--- a/drivers/net/wireless/ath/ath11k/nss.h
++++ b/drivers/net/wireless/ath/ath11k/nss.h
+@@ -287,6 +287,8 @@
+ 	int response;
+ 	/* if nss_wifili_thread_scheme_alloc successfully allocated thread scheme */
+ 	bool thread_scheme_allocated;
++	/* Per-radio TX descriptor count sent to NSS WiFi offload. */
++	u32 tx_desc_limit;
+ 	/* Below is used for identifying allocated tx descriptors */
+ 	dma_addr_t tx_desc_paddr[ATH11K_NSS_MAX_NUMBER_OF_PAGE];
+ 	uint32_t * tx_desc_vaddr[ATH11K_NSS_MAX_NUMBER_OF_PAGE];
