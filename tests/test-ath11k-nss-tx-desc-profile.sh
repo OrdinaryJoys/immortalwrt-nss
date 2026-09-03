@@ -5,6 +5,7 @@ set -eu
 ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
 PATCH="$ROOT/package/kernel/mac80211/patches/nss/ath11k/999-933-ath11k-nss-configure-wifili-tx-desc-from-dt.patch"
 DTS="$ROOT/target/linux/qualcommax/dts/ipq8071-ax6.dts"
+MAC80211_MAKEFILE="$ROOT/package/kernel/mac80211/Makefile"
 
 fail()
 {
@@ -14,6 +15,8 @@ fail()
 
 grep -q 'qcom,nss-wifili-tx-desc-count = <16384>;' "$DTS" ||
 	fail "AX6 does not request the 16384 descriptor candidate"
+grep -q '^PKG_RELEASE:=5$' "$MAC80211_MAKEFILE" ||
+	fail "mac80211 package release was not bumped for the NSS patch"
 grep -q 'u32 limit = ATH11K_WIFILI_DBDC_NUM_TX_DESC;' "$PATCH" ||
 	fail "upstream-compatible 8192 default is not preserved"
 grep -q 'limit % 1024' "$PATCH" || fail "descriptor alignment guard missing"
