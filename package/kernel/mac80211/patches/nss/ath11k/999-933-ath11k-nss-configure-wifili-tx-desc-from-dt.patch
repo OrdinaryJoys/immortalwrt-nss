@@ -9,26 +9,28 @@ message capacity before accepting the override. Use the same value for the
 per-radio NSS buffer limits so the pool and runtime limit cannot diverge.
 
 ---
- drivers/net/wireless/ath/ath11k/nss.c | 51 ++++++++++++++++++++++-----
+ drivers/net/wireless/ath/ath11k/nss.c | 57 ++++++++++++++++++++++++++++-----
  drivers/net/wireless/ath/ath11k/nss.h |  2 ++
- 2 files changed, 44 insertions(+), 9 deletions(-)
+ 2 files changed, 51 insertions(+), 8 deletions(-)
 
 --- a/drivers/net/wireless/ath/ath11k/nss.c
 +++ b/drivers/net/wireless/ath/ath11k/nss.c
-@@ -4205,7 +4205,45 @@
+@@ -4205,7 +4205,47 @@
  	*page_idx = curr_page_idx;
  	return 0;
  }
 +
 +static u32 ath11k_nss_get_tx_desc_limit(struct ath11k_base *ab, u32 num_pool)
 +{
-+	u32 limit = ATH11K_WIFILI_DBDC_NUM_TX_DESC;
++	u32 default_limit = num_pool == 3 ? ATH11K_WIFILI_DBTC_NUM_TX_DESC :
++					    ATH11K_WIFILI_DBDC_NUM_TX_DESC;
++	u32 limit;
 +	u32 total_desc;
 +	u32 total_pages;
  
 +	if (of_property_read_u32(ab->dev->of_node,
 +				 "qcom,nss-wifili-tx-desc-count", &limit))
-+		return limit;
++		return default_limit;
 +
 +	if (limit < 1024 || limit > ATH11K_WIFILI_MAX_TX_DESC ||
 +	    limit % 1024)
@@ -54,8 +56,8 @@ per-radio NSS buffer limits so the pool and runtime limit cannot diverge.
 +invalid:
 +	ath11k_warn(ab,
 +		    "invalid NSS WiFi TX descriptor count %u for %u radios; using %u\n",
-+		    limit, num_pool, ATH11K_WIFILI_DBDC_NUM_TX_DESC);
-+	return ATH11K_WIFILI_DBDC_NUM_TX_DESC;
++		    limit, num_pool, default_limit);
++	return default_limit;
 +}
 +
  static int ath11k_nss_fill_tx_desc_info(struct ath11k_base *ab,

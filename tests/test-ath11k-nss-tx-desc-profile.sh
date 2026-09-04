@@ -17,8 +17,12 @@ grep -q 'qcom,nss-wifili-tx-desc-count = <16384>;' "$DTS" ||
 	fail "AX6 does not request the 16384 descriptor candidate"
 grep -q '^PKG_RELEASE:=5$' "$MAC80211_MAKEFILE" ||
 	fail "mac80211 package release was not bumped for the NSS patch"
-grep -q 'u32 limit = ATH11K_WIFILI_DBDC_NUM_TX_DESC;' "$PATCH" ||
-	fail "upstream-compatible 8192 default is not preserved"
+grep -q 'num_pool == 3 ? ATH11K_WIFILI_DBTC_NUM_TX_DESC' "$PATCH" ||
+	fail "three-radio DBTC default is not preserved"
+grep -q 'ATH11K_WIFILI_DBDC_NUM_TX_DESC;' "$PATCH" ||
+	fail "one/two-radio DBDC default is not preserved"
+grep -q 'return default_limit;' "$PATCH" ||
+	fail "boards without the DT property do not retain their topology default"
 grep -q 'limit % 1024' "$PATCH" || fail "descriptor alignment guard missing"
 grep -q 'total_desc > ATH11K_WIFILI_MAX_TX_DESC' "$PATCH" ||
 	fail "device-wide descriptor limit guard missing"
