@@ -1,7 +1,7 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=qca-nss-ecm
-PKG_RELEASE:=10
+PKG_RELEASE:=11
 
 PKG_SOURCE_URL:=https://git.codelinaro.org/clo/qsdk/oss/lklm/qca-nss-ecm.git
 PKG_SOURCE_PROTO:=git
@@ -21,6 +21,7 @@ PKG_CONFIG_DEPENDS:= \
 	CONFIG_BRIDGE_VLAN_FILTERING \
 	CONFIG_IPV6 \
 	CONFIG_NSS_DRV_PPPOE_ENABLE \
+	CONFIG_NSS_DRV_RMNET_ENABLE \
 	CONFIG_PACKAGE_kmod-bonding \
 	CONFIG_PACKAGE_kmod-gre \
 	CONFIG_PACKAGE_kmod-gre6 \
@@ -178,9 +179,9 @@ ifneq ($(CONFIG_PACKAGE_kmod-bonding),)
 ECM_MAKE_OPTS += ECM_INTERFACE_BOND_ENABLE=y
 endif
 
-ifneq ($(CONFIG_PACKAGE_kmod-qmi_wwan_q),)
-ECM_MAKE_OPTS += ECM_INTERFACE_RAWIP_ENABLE=y
-endif
+# RAWIP calls nss_rmnet_rx_get_ifnum(), which is only exported when the
+# NSS core driver builds its RMNET support.
+ECM_MAKE_OPTS += ECM_INTERFACE_RAWIP_ENABLE=$(if $(and $(CONFIG_PACKAGE_kmod-qmi_wwan_q),$(CONFIG_NSS_DRV_RMNET_ENABLE)),y,n)
 
 ifneq ($(CONFIG_NSS_FIRMWARE_VERSION_12_5),)
 EXTRA_CFLAGS += -DNSS_FIRMWARE_VERSION_12_5
