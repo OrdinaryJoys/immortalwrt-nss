@@ -15,7 +15,11 @@ fail()
 
 grep -q 'qcom,nss-wifili-tx-desc-count = <16384>;' "$DTS" ||
 	fail "AX6 does not request the 16384 descriptor candidate"
-grep -q '^PKG_RELEASE:=5$' "$MAC80211_MAKEFILE" ||
+release=$(sed -n 's/^PKG_RELEASE:=//p' "$MAC80211_MAKEFILE")
+case "$release" in
+	''|*[!0-9]*) fail "mac80211 package release must be one numeric value" ;;
+esac
+[ "$release" -ge 5 ] ||
 	fail "mac80211 package release was not bumped for the NSS patch"
 grep -q 'num_pool == 3 ? ATH11K_WIFILI_DBTC_NUM_TX_DESC' "$PATCH" ||
 	fail "three-radio DBTC default is not preserved"

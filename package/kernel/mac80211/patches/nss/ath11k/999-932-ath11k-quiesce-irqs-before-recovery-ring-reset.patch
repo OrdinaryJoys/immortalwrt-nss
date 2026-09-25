@@ -18,6 +18,13 @@ touch CE MMIO that may be inaccessible while the Q6 is down.
 This keeps the existing per-ring recovery guards as defense in depth while
 making the resource teardown itself ordered against IRQ workers.
 
+Skip the recovery quiesce on the controlled reset path, where
+ath11k_core_reset() already disabled IRQs before power-down. The AHB
+operations below are idempotent, but the shared core also serves PCIC:
+its multi-MSI disable increments the IRQ depth on every call. Match the
+is_reset boundary from upstream f7a74e131d3f instead of relying on an
+AHB-only guard to protect all buses.
+
 --- a/drivers/net/wireless/ath/ath11k/ahb.c
 +++ b/drivers/net/wireless/ath/ath11k/ahb.c
 @@ -352,6 +352,9 @@ static void ath11k_ahb_ce_irqs_enable(st
@@ -82,13 +89,15 @@ making the resource teardown itself ordered against IRQ workers.
  	 * The remoteproc core marks the state before it starts the
 --- a/drivers/net/wireless/ath/ath11k/core.c
 +++ b/drivers/net/wireless/ath/ath11k/core.c
-@@ -2415,6 +2415,10 @@ static int ath11k_core_reconfigure_on_cr
+@@ -2415,6 +2415,12 @@ static int ath11k_core_reconfigure_on_cr
  
  	mutex_lock(&ab->core_lock);
  
-+	ath11k_hif_irq_disable(ab);
-+	if (test_bit(ATH11K_FLAG_CE_IRQ_ENABLED, &ab->dev_flags))
-+		ath11k_hif_ce_irq_disable(ab);
++	if (!ab->is_reset) {
++		ath11k_hif_irq_disable(ab);
++		if (test_bit(ATH11K_FLAG_CE_IRQ_ENABLED, &ab->dev_flags))
++			ath11k_hif_ce_irq_disable(ab);
++	}
 +
  	ath11k_nss_teardown(ab);
  	ab->nss.enabled = false;
