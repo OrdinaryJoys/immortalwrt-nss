@@ -76,7 +76,8 @@ filter_data_plane_devices() {
 		case "$eth" in
 			''|*[!A-Za-z0-9_.:-]*|lo|br-*|wlan*|phy*|zt*|ifb*|tun*|tap*) continue ;;
 		esac
-		[ -d "$SYS_CLASS_NET/$eth" ] || continue
+		# Keep an expected port even while absent from sysfs. Otherwise one
+		# ready port can hide a missing/late port and falsely complete start().
 		printf '%s\n' "$eth"
 	done | sort -u
 }
@@ -109,60 +110,195 @@ get_board_devices() {
 	printf '%s\n' "$devices" | filter_data_plane_devices
 }
 
+queue_policy_error() {
+	# Diagnostics must not replace the policy result when logger itself fails.
+	logger -t set-irq-affinity -p user.warn "RPS policy: $*" || :
+}
+
+normalize_queue_mask() {
+	local value="$1" group normalized='' first=1
+
+	# Kernel cpumap readback can pad 32-bit words with zeroes. Compare the
+	# complete bitmap, not a substring, while accepting that representation.
+	while :; do
+		group=${value%%,*}
+		case "$group" in ''|*[!0-9a-fA-F]*) return 1 ;; esac
+		[ "${#group}" -le 8 ] || return 1
+		[ "$first" = 1 ] || [ "${#group}" -eq 8 ] || return 1
+		normalized="$normalized$group"
+		case "$value" in
+			*,*) value=${value#*,}; first=0 ;;
+			*) break ;;
+		esac
+	done
+	while [ "${normalized#0}" != "$normalized" ]; do normalized=${normalized#0}; done
+	case "$normalized" in
+		*[A-F]*) printf '%s' "$normalized" | tr 'A-F' 'a-f' ;;
+		*) printf '%s' "${normalized:-0}" ;;
+	esac
+}
+
+check_queue_value() {
+	local path="$1" expected="$2" kind="$3" actual
+
+	if [ ! -f "$path" ] || [ ! -r "$path" ]; then
+		queue_policy_error "missing/unreadable attribute $path"
+		return 1
+	fi
+	if ! actual=$(cat "$path" 2>/dev/null); then
+		queue_policy_error "read failed: $path"
+		return 1
+	fi
+	if [ "$kind" = mask ]; then
+		actual=$(normalize_queue_mask "$actual") || actual=invalid
+		expected=$(normalize_queue_mask "$expected") || expected=invalid-expected
+	fi
+	if [ "$actual" != "$expected" ]; then
+		queue_policy_error "readback mismatch: $path expected=$expected actual=$actual"
+		return 1
+	fi
+	return 0
+}
+
+write_queue_value() {
+	local path="$1" requested="$2" expected="$3" kind="$4"
+
+	# Do not create a missing regular file in an offline fixture, and do not
+	# mistake a vanished kernel attribute for a successful queue update.
+	if [ ! -f "$path" ] || [ ! -w "$path" ]; then
+		queue_policy_error "missing/unwritable attribute $path"
+		return 1
+	fi
+	if ! { printf '%s\n' "$requested" > "$path"; } 2>/dev/null; then
+		queue_policy_error "write failed: $path"
+		return 1
+	fi
+	check_queue_value "$path" "$expected" "$kind"
+}
+
+get_device_queues() {
+	local path name
+	for path in "$SYS_CLASS_NET/$1/queues/$2-"*; do
+		[ -d "$path" ] || continue
+		name=${path##*/}
+		name=${name#*-}
+		case "$name" in ''|*[!0-9]*) continue ;; esac
+		printf '%s\n' "$path"
+	done
+}
+
 apply_queue_policy() {
-	local eth i devices applied=0
+	local eth i devices final_devices rx tx ifindex final_ifindex rx_ok record
+	local identities='' all_rx='' all_tx='' final_rx='' final_tx=''
+	local applied=0 failed=0
 
-	# Ports can appear after the first discovery (including between re-assert
-	# waves). Do not keep the boot-time, sysfs-filtered device list forever.
+	# Re-discover every attempt/wave. All expected ports and all currently
+	# enumerated RX/TX queues are required, not just the first writable RX.
 	devices="$(get_board_devices)"
-
+	if [ -z "$devices" ]; then
+		queue_policy_error "no data-plane devices discovered"
+		failed=1
+	fi
 	for eth in $devices; do
-		for i in "$SYS_CLASS_NET/$eth"/queues/rx-*/rps_cpus; do
-			if [ -w "$i" ] && printf '%s\n' "$cpu_mask" > "$i" 2>/dev/null; then
-				applied=$((applied + 1))
-			fi
+		ifindex=$(cat "$SYS_CLASS_NET/$eth/ifindex" 2>/dev/null) || ifindex=
+		case "$ifindex" in
+			''|0|*[!0-9]*)
+				queue_policy_error "missing/invalid interface identity: $eth"
+				failed=1
+				continue
+				;;
+		esac
+		rx=$(get_device_queues "$eth" rx)
+		tx=$(get_device_queues "$eth" tx)
+		identities="$identities $eth=$ifindex"
+		all_rx="$all_rx $rx"
+		all_tx="$all_tx $tx"
+		if [ -z "$rx" ] || [ -z "$tx" ]; then
+			queue_policy_error "incomplete RX/TX queue set: $eth"
+			failed=1
+		fi
+		for i in $rx; do
+			rx_ok=1
+			write_queue_value "$i/rps_cpus" "$cpu_mask" "$cpu_mask" mask || { failed=1; rx_ok=0; }
+			write_queue_value "$i/rps_flow_cnt" "$flow_cnt" "$flow_cnt" number || { failed=1; rx_ok=0; }
+			[ "$rx_ok" = 0 ] || applied=$((applied + 1))
 		done
-		for i in "$SYS_CLASS_NET/$eth"/queues/rx-*/rps_flow_cnt; do
-			[ -w "$i" ] && printf '%s\n' "$flow_cnt" > "$i" 2>/dev/null
-		done
-		for i in "$SYS_CLASS_NET/$eth"/queues/tx-*/xps_cpus; do
-			[ -w "$i" ] && printf '%s\n' "$cpu_mask" > "$i" 2>/dev/null
+		for i in $tx; do
+			write_queue_value "$i/xps_cpus" "$cpu_mask" "$cpu_mask" mask || failed=1
 		done
 	done
 
+	# Keep the established request, whose kernel proc handler rounds 65535
+	# up to 65536 entries. An unrounded/clamped/different readback is failure.
+	write_queue_value "$RPS_SOCK_FLOW_ENTRIES" "$sock_flow_entries" 65536 number || failed=1
+	final_devices="$(get_board_devices)"
+	if [ "$devices" != "$final_devices" ]; then
+		queue_policy_error "device discovery changed during apply"
+		failed=1
+	fi
+	# Validate the whole set after *all* writes, including global RFS. A reset
+	# of an earlier device while a later one succeeds must not produce PASS.
+	# This remains a bounded snapshot, not an atomic sysfs transaction.
+	for record in $identities; do
+		eth=${record%=*}
+		ifindex=${record#*=}
+		final_ifindex=$(cat "$SYS_CLASS_NET/$eth/ifindex" 2>/dev/null) || final_ifindex=
+		if [ "$ifindex" != "$final_ifindex" ]; then
+			queue_policy_error "device identity changed during apply: $eth"
+			failed=1
+		fi
+		final_rx="$final_rx $(get_device_queues "$eth" rx)"
+		final_tx="$final_tx $(get_device_queues "$eth" tx)"
+	done
+	if [ "$all_rx" != "$final_rx" ] || [ "$all_tx" != "$final_tx" ]; then
+		queue_policy_error "queue set changed during apply"
+		failed=1
+	fi
+	for i in $all_rx; do
+		check_queue_value "$i/rps_cpus" "$cpu_mask" mask || failed=1
+		check_queue_value "$i/rps_flow_cnt" "$flow_cnt" number || failed=1
+	done
+	for i in $all_tx; do
+		check_queue_value "$i/xps_cpus" "$cpu_mask" mask || failed=1
+	done
+	check_queue_value "$RPS_SOCK_FLOW_ENTRIES" 65536 number || failed=1
 	printf '%s\n' "$applied"
+	return "$failed"
 }
 
 start() {
-	local flow_cnt sock_flow_entries cpu_mask devices applied attempts
+	local flow_cnt sock_flow_entries cpu_mask devices applied attempts result n delay
 
 	flow_cnt=8192
 	sock_flow_entries=65535
 	cpu_mask="$(get_cpu_mask)"
 	devices="$(get_board_devices)"
 	logger -t set-irq-affinity \
-		"RPS start: mask=$cpu_mask devices=$(printf '%s\n' "$devices" | tr '\n' ' ')"
+		"RPS start: mask=$cpu_mask devices=$(printf '%s\n' "$devices" | tr '\n' ' ')" || :
 
 	# On the very first boot the NSS datapath can attach after S99, so the
 	# per-port queues may not exist yet and the writes are silently lost.
-	# Retry until at least one data-plane queue accepts the mask and log the
-	# outcome so a missing queue set is never silent.
+	# Retry until the complete discovered policy passes writes and readback.
+	# Partial application is useful best effort, but is never reported healthy.
 	attempts=10
 	applied=0
+	result=1
 	while [ "$attempts" -gt 0 ]; do
-		applied=$(apply_queue_policy)
-		[ "$applied" -gt 0 ] && break
+		if applied=$(apply_queue_policy); then
+			result=0
+			break
+		fi
 		logger -t set-irq-affinity \
-			"RPS retry: no writable data-plane queue yet (attempts left=$((attempts - 1)))"
+			"RPS retry: incomplete policy (attempts left=$((attempts - 1)))" || :
 		attempts=$((attempts - 1))
 		[ "$attempts" -gt 0 ] && sleep 3
 	done
 
-	if [ "$applied" -gt 0 ]; then
-		logger -t set-irq-affinity "RPS applied: $applied queue(s), mask=$cpu_mask"
+	if [ "$result" = 0 ]; then
+		logger -t set-irq-affinity "RPS applied: $applied RX queue(s), complete policy, mask=$cpu_mask" || :
 	else
 		logger -t set-irq-affinity -p user.warn \
-			"RPS apply failed: no writable data-plane queue (mask=$cpu_mask)"
+			"RPS apply failed: incomplete policy (mask=$cpu_mask)" || :
 	fi
 
 	# The EDMA datapath completes its deferred probe shortly after S99 and
@@ -174,20 +310,32 @@ start() {
 	(
 		for delay in 30 90 180 300; do
 			sleep "$delay"
-			n=$(apply_queue_policy)
-			logger -t set-irq-affinity "RPS re-assert (wave +${delay}s): $n queue(s)"
+			if n=$(apply_queue_policy); then
+				logger -t set-irq-affinity "RPS re-assert (wave +${delay}s): $n RX queue(s), complete policy" || :
+			else
+				logger -t set-irq-affinity -p user.warn \
+					"RPS re-assert failed (wave +${delay}s): incomplete policy, $n RX queue(s) verified" || :
+			fi
 		done
 	) &
 
-	[ -w "$RPS_SOCK_FLOW_ENTRIES" ] && echo "$sock_flow_entries" > "$RPS_SOCK_FLOW_ENTRIES"
+	# Asynchronous waves cannot change an already-returned start status. They
+	# report their own result; the immediate complete-policy result is returned.
+	return "$result"
 }
 
 start_rps() {
-	local flow_cnt cpu_mask applied
+	local flow_cnt sock_flow_entries cpu_mask applied result
 
 	flow_cnt=8192
+	sock_flow_entries=65535
 	cpu_mask="$(get_cpu_mask)"
-	applied=$(apply_queue_policy)
-	logger -t set-irq-affinity "RPS event re-assert: $applied queue(s), mask=$cpu_mask"
-	[ "$applied" -gt 0 ]
+	if applied=$(apply_queue_policy); then result=0; else result=$?; fi
+	if [ "$result" = 0 ]; then
+		logger -t set-irq-affinity "RPS event re-assert: $applied RX queue(s), complete policy, mask=$cpu_mask" || :
+	else
+		logger -t set-irq-affinity -p user.warn \
+			"RPS event re-assert failed: incomplete policy, $applied RX queue(s) verified, mask=$cpu_mask" || :
+	fi
+	return "$result"
 }

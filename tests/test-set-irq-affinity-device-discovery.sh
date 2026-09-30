@@ -49,8 +49,19 @@ jsonfilter() {
 }
 
 logger() { :; }
+cat() {
+	# Normal files stand in for sysfs. Only the global proc read emulates the
+	# kernel's roundup_pow_of_two(65535), not an echo-back success contract.
+	if [ "$#" -eq 1 ] && [ "$1" = "$IRQ_RPS_SOCK_FLOW_ENTRIES" ] &&
+	   [ "$(command cat "$1")" = 65535 ]; then
+		printf '65536\n'
+	else
+		command cat "$@"
+	fi
+}
 make_test_queue() {
 	mkdir -p "$IRQ_SYS_CLASS_NET/$1/queues/rx-0" "$IRQ_SYS_CLASS_NET/$1/queues/tx-0"
+	printf '7\n' > "$IRQ_SYS_CLASS_NET/$1/ifindex"
 	printf '0\n' > "$IRQ_SYS_CLASS_NET/$1/queues/rx-0/rps_cpus"
 	printf '0\n' > "$IRQ_SYS_CLASS_NET/$1/queues/rx-0/rps_flow_cnt"
 	printf '0\n' > "$IRQ_SYS_CLASS_NET/$1/queues/tx-0/xps_cpus"
@@ -100,7 +111,7 @@ BOARD_DETECT_DEVICES='wan'
 UCI_DEVICE=eth0
 UCI_PORTS='lan1 lan2'
 export BOARD_DETECT_DEVICES UCI_DEVICE UCI_PORTS
-assert_devices '/etc/board.json is preferred and filtered' 'lan1 lan2 '
+assert_devices '/etc/board.json is preferred; missing expected port is retained' 'lan1 lan2 missing '
 
 rm -f "$IRQ_BOARD_JSON"
 BOARD_DETECT_DEVICES='wan lan2 bad/name wlan0'
@@ -118,6 +129,7 @@ assert_devices 'restricted sysfs scan is the final fallback' 'eth0 lan1 lan2 wan
 
 printf '0-3\n' > "$IRQ_CPU_ONLINE"
 mkdir -p "$IRQ_SYS_CLASS_NET/lan1/queues/rx-0" "$IRQ_SYS_CLASS_NET/lan1/queues/tx-0"
+printf '7\n' > "$IRQ_SYS_CLASS_NET/lan1/ifindex"
 : > "$IRQ_SYS_CLASS_NET/lan1/queues/rx-0/rps_cpus"
 : > "$IRQ_SYS_CLASS_NET/lan1/queues/rx-0/rps_flow_cnt"
 : > "$IRQ_SYS_CLASS_NET/lan1/queues/tx-0/xps_cpus"
@@ -133,7 +145,7 @@ wait 2>/dev/null || true
 if [ "$(cat "$IRQ_SYS_CLASS_NET/lan1/queues/rx-0/rps_cpus")" = f ] &&
    [ "$(cat "$IRQ_SYS_CLASS_NET/lan1/queues/rx-0/rps_flow_cnt")" = 8192 ] &&
    [ "$(cat "$IRQ_SYS_CLASS_NET/lan1/queues/tx-0/xps_cpus")" = f ] &&
-   [ "$(cat "$IRQ_RPS_SOCK_FLOW_ENTRIES")" = 65535 ]; then
+   [ "$(cat "$IRQ_RPS_SOCK_FLOW_ENTRIES")" = 65536 ]; then
 	ok 'discovered device receives the complete RPS/RFS/XPS policy'
 else
 	bad 'discovered device receives the complete RPS/RFS/XPS policy'
@@ -148,9 +160,10 @@ UCI_PORTS=
 export BOARD_DETECT_FAIL UCI_DEVICE UCI_PORTS
 if start; then
 	wait 2>/dev/null || true
-	ok 'queue-less first boot retries and finishes without hanging'
+	bad 'queue-less first boot must fail after bounded retries'
 else
-	bad 'queue-less first boot retries and finishes without hanging'
+	wait 2>/dev/null || true
+	ok 'queue-less first boot retries and fails without hanging'
 fi
 
 # The hotplug event entry must apply the full policy including RFS flow
@@ -200,7 +213,11 @@ assert_queue_policy 'retry discovers a port absent at initial sysfs scan' wan9
 rm -rf "$IRQ_SYS_CLASS_NET/wan9"
 printf 'lan1\nwan9\n' > "$IRQ_BOARD_JSON"
 LATE_DEVICE_PHASE=wave
-start
+if start; then
+	bad 'partially ready startup cannot report complete policy'
+else
+	ok 'partially ready startup reports failure before asynchronous recovery'
+fi
 wait 2>/dev/null || true
 assert_queue_policy 'delayed wave discovers an additional data-plane port' wan9
 assert_queue_policy 'delayed wave restores re-created queues on an existing port' lan1
@@ -219,3 +236,7 @@ fi
 
 echo "=== summary: PASS=$PASS FAIL=$FAIL ==="
 [ "$FAIL" -eq 0 ]
+
+# Invoke the full-policy failure contract against the same source or extracted
+# rootfs script. This keeps legacy CI callers from silently missing the suite.
+IRQ_TEST_SCRIPT="$SCRIPT" python3 "$SCRIPT_DIR/test-set-irq-affinity-policy-errors.py"
