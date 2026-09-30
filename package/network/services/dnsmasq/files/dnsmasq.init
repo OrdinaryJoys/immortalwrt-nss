@@ -1390,10 +1390,16 @@ start_service() {
 	fi
 }
 
+reload_dnsmasq() {
+	start_service "$@"
+	# Signal the old instance before procd commits its replacement. Isolate
+	# the signal request so json_init cannot discard the pending instance JSON.
+	(procd_send_signal dnsmasq "$@")
+}
+
 reload_service() {
 	nftables_clear
-	rc_procd start_service "$@"
-	procd_send_signal dnsmasq "$@"
+	rc_procd reload_dnsmasq "$@"
 }
 
 stop_service() {

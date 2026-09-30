@@ -313,6 +313,8 @@ dropbear_instance()
 	procd_set_param command "$PROG" -F -P "$pid_file"
 	if [ -n "${iface}" ] ; then
 		# if ${iface} is non-empty then ${ndev} is non-empty too
+		# A recreated bridge has a new ifindex even when its name is unchanged.
+		procd_set_param netdev "${ndev}"
 		procd_append_param command -l "${ndev}" -p "${Port}"
 	else
 		if [ -z "${ipaddrs}" ] ; then
