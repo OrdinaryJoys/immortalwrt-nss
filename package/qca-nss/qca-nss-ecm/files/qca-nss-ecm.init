@@ -74,16 +74,25 @@ get_front_end_mode() {
 }
 
 disable_packet_steering() {
-	changed=0
-	uci -q set network.globals.packet_steering='0' && changed=1
-	uci -q delete network.globals.steering_flows && changed=1
-	[ "$changed" -eq 0 ] || uci -q commit network
+	local changed=0 status=0 rc
+	uci -q set network.globals.packet_steering='0' && changed=1 || status=$?
+	# An absent optional key is not an error. A failed deletion is.
+	if uci -q get network.globals.steering_flows >/dev/null; then
+		uci -q delete network.globals.steering_flows && changed=1 || status=$?
+	fi
+	if [ "$changed" -ne 0 ]; then
+		uci -q commit network || status=$?
+	fi
 
+	# Still restore the live queue policy if persistence failed.
 	if [ -e "/usr/libexec/platform/packet-steering.sh" ]; then
 		/usr/libexec/platform/packet-steering.sh 0
 	else
 		/usr/libexec/network/packet-steering.uc -l 0 0
 	fi
+	rc=$?
+	[ "$status" -ne 0 ] || status="$rc"
+	return "$status"
 }
 
 disable_bridge_filtering() {
@@ -126,21 +135,35 @@ set_front_end() {
 	fi
 }
 
+apply_interface_offload_policy() {
+	local status=0
+	# The helper is optional on other targets. Its reported failures are not.
+	if [ -r /lib/netifd/offload/disable_offloads.sh ]; then
+		. /lib/netifd/offload/disable_offloads.sh
+		status=$?
+		if [ "$status" -eq 0 ]; then
+			disable_offload
+			status=$?
+		fi
+		if [ "$status" -ne 0 ]; then
+			logger -p daemon.err -t qca-nss-ecm "interface-offload policy failed (status $status)"
+		fi
+	fi
+	return "$status"
+}
+
 load_ecm() {
+	local status=0 dependencies get_front_end_mode
 	[ -d /sys/module/ecm ] || {
-		local get_front_end_mode
 		get_front_end_mode="$(get_front_end_mode)"
-		modinfo ecm | awk '/depends/{gsub(",","\n",$NF);print $NF}' | xargs -r -n 1 modprobe
-		set_front_end $get_front_end_mode
-		modprobe ecm
+		dependencies="$(modinfo ecm)" || return $?
+		printf '%s\n' "$dependencies" | awk '/depends/{gsub(",","\n",$NF);print $NF}' | xargs -r -n 1 modprobe || return $?
+		set_front_end $get_front_end_mode || return $?
+		modprobe ecm || return $?
 		write_if_writable /sys/kernel/debug/ecm/ecm_classifier_default/accel_delay_pkts 1
 	}
 
-	# shellcheck disable=1091
-	if [ -r /lib/netifd/offload/disable_offloads.sh ]; then
-		. /lib/netifd/offload/disable_offloads.sh
-		disable_offload
-	fi
+	apply_interface_offload_policy || status=$?
 
 	#Flushout stale accelerated connections if any
 	write_if_writable /sys/kernel/debug/ecm/ecm_db/defunct_all 1
@@ -152,6 +175,7 @@ load_ecm() {
 	if [ "$kernel_major" -eq 6 ]; then
 		write_if_writable /proc/sys/net/netfilter/nf_conntrack_events 1
 	fi
+	return "$status"
 }
 
 unload_ecm() {
@@ -194,12 +218,12 @@ reload_service() {
 	# restoration fails, but never let the later stage hide that failure.
 	disable_packet_steering || steering_status=$?
 
-		# Re-apply the configured interface-offload policy after a network
-		# restart, because netifd or a driver rebind can restore netdev feature
-		# defaults. EDMA v1 does not advertise hardware checksum support, but
-		# Linux GRO/GSO are software batching features and are not inherently
-		# corrupt. Board profiles can therefore select a conservative host-path
-		# policy while leaving physical NSS data-plane ports report-only.
+	# Re-apply the configured interface-offload policy after a network
+	# restart, because netifd or a driver rebind can restore netdev feature
+	# defaults. EDMA v1 does not advertise hardware checksum support, but
+	# Linux GRO/GSO are software batching features and are not inherently
+	# corrupt. Board profiles can therefore select a conservative host-path
+	# policy while leaving physical NSS data-plane ports report-only.
 	if [ -r /lib/netifd/offload/disable_offloads.sh ]; then
 		. /lib/netifd/offload/disable_offloads.sh && disable_offload || offload_status=$?
 	fi
@@ -215,23 +239,36 @@ reload_service() {
 }
 
 start_service() {
-	load_ecm
+	# rc.common closes the procd declaration after this callback, replacing
+	# its exit status. service_started exposes our result to the caller.
+	ecm_start_status=0
+	load_ecm || ecm_start_status=$?
 
-	disable_packet_steering
+	disable_packet_steering || ecm_start_status=$?
 
 	# Only enable bridge filtering if using deprecated fw3
 	if [ ! -r /sbin/fw4 ]; then
-		enable_bridge_filtering
+		enable_bridge_filtering || ecm_start_status=$?
 	else
-		disable_bridge_filtering
+		disable_bridge_filtering || ecm_start_status=$?
 	fi
 
 	# If the acceleration engine is NSS, enable wifi redirect
-	[ -d /sys/kernel/debug/ecm/ecm_nss_ipv4 ] && [ -w /proc/sys/dev/nss/general/redirect ] && sysctl -w dev.nss.general.redirect=1
+	if [ -d /sys/kernel/debug/ecm/ecm_nss_ipv4 ] && [ -w /proc/sys/dev/nss/general/redirect ]; then
+		sysctl -w dev.nss.general.redirect=1 || ecm_start_status=$?
+	fi
 
 	if [ -d /sys/module/qca_ovsmgr ]; then
-		insmod ecm_ovs
+		insmod ecm_ovs || ecm_start_status=$?
 	fi
+	if [ "$ecm_start_status" -ne 0 ]; then
+		logger -p daemon.err -t qca-nss-ecm "startup policy incomplete (status $ecm_start_status)"
+	fi
+	return "$ecm_start_status"
+}
+
+service_started() {
+	return "${ecm_start_status:-1}"
 }
 
 stop_service() {
