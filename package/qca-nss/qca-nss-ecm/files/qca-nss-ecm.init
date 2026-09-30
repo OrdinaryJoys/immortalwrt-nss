@@ -157,7 +157,7 @@ load_ecm() {
 	[ -d /sys/module/ecm ] || {
 		get_front_end_mode="$(get_front_end_mode)"
 		dependencies="$(modinfo ecm)" || return $?
-		printf '%s\n' "$dependencies" | awk '/depends/{gsub(",","\n",$NF);print $NF}' | xargs -r -n 1 modprobe || return $?
+		printf '%s\n' "$dependencies" | awk '$1 == "depends:" && NF > 1 {gsub(",","\n",$2);print $2}' | xargs -r -n 1 modprobe || return $?
 		set_front_end $get_front_end_mode || return $?
 		modprobe ecm || return $?
 		write_if_writable /sys/kernel/debug/ecm/ecm_classifier_default/accel_delay_pkts 1

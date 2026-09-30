@@ -71,16 +71,14 @@ exit "${SYSCTL_RC:-0}"
         write('bin/sleep', '#!/bin/sh\nexit 0\n', True)
         write('bin/modinfo', '''#!/bin/sh
 [ "${MODINFO_RC:-0}" -eq 0 ] || exit "$MODINFO_RC"
-echo 'depends: qca_nss_drv'
+echo "depends: ${DEPENDENCIES-qca_nss_drv}"
+echo 'description: this module depends on platform features'
 ''', True)
         write('bin/modprobe', '''#!/bin/sh
 echo "modprobe:$1"
 if [ "$1" = ecm ]; then exit "${MODPROBE_RC:-0}"; fi
+[ -z "${FAIL_DEPENDENCY:-}" ] || [ "$1" = "$FAIL_DEPENDENCY" ] || exit 0
 exit "${DEPENDENCY_RC:-0}"
-''', True)
-        write('bin/xargs', '''#!/bin/sh
-read -r dependency
-[ -z "$dependency" ] || modprobe "$dependency"
 ''', True)
         write('etc/sysctl.d/qca-nss-ecm.conf', '')
         (base / 'sys/module/ecm').mkdir(parents=True)
@@ -119,7 +117,9 @@ return "${OFFLOAD_SOURCE_RC:-0}"
                                   str(base / 'etc/init.d/qca-nss-ecm'), action],
             env=run_env, text=True, capture_output=True, timeout=10)
         output = result.stdout + result.stderr
-        assert result.returncode == expected, (label, expected, result.returncode, output)
+        # BSD and GNU xargs map child failures to different nonzero statuses.
+        valid_status = result.returncode != 0 if expected is None else result.returncode == expected
+        assert valid_status, (label, expected, result.returncode, output)
         for item in require:
             assert item in output, (label, 'missing', item, output)
         for item in forbid:
@@ -160,10 +160,20 @@ for action in ('start', 'boot', 'restart'):
 check('start exposes UCI persistence failure', 'start', expected=6, env={'COMMIT_RC': '6'})
 check('start without previously loaded ECM succeeds', 'start', env={'ECM_LOADED': '0'},
       require=('modprobe:ecm',))
+check('empty module dependency list is valid', 'start',
+      env={'ECM_LOADED': '0', 'DEPENDENCIES': '', 'DEPENDENCY_RC': '6'},
+      require=('modprobe:ecm',), forbid=('modprobe:depends:', 'modprobe:features'))
 check('start propagates modinfo failure', 'start', expected=4,
       env={'ECM_LOADED': '0', 'MODINFO_RC': '4'}, forbid=('modprobe:ecm',))
-check('start propagates dependency failure', 'start', expected=6,
+check('start propagates dependency failure', 'start', expected=None,
       env={'ECM_LOADED': '0', 'DEPENDENCY_RC': '6'}, forbid=('modprobe:ecm',))
+check('all comma-separated dependencies load', 'start',
+      env={'ECM_LOADED': '0', 'DEPENDENCIES': 'qca_nss_drv,qca_nss_ipv4'},
+      require=('modprobe:qca_nss_drv', 'modprobe:qca_nss_ipv4', 'modprobe:ecm'))
+check('later dependency failure prevents ECM load', 'start', expected=None,
+      env={'ECM_LOADED': '0', 'DEPENDENCIES': 'qca_nss_drv,qca_nss_ipv4',
+           'FAIL_DEPENDENCY': 'qca_nss_ipv4', 'DEPENDENCY_RC': '6'},
+      require=('modprobe:qca_nss_drv', 'modprobe:qca_nss_ipv4'), forbid=('modprobe:ecm',))
 check('start propagates ECM module load failure', 'start', expected=7,
       env={'ECM_LOADED': '0', 'MODPROBE_RC': '7'})
 check('start propagates offload helper failure', 'start', expected=9,
