@@ -19,7 +19,7 @@ checks = 0
 
 
 def check(label, action='reload', expected=0, *, env=None, platform=True,
-          offload=True, require=(), forbid=()):
+          offload=True, real_offload=False, require=(), forbid=()):
     global checks
     with tempfile.TemporaryDirectory(prefix='ecm-service-errors-') as tmp:
         base = Path(tmp)
@@ -40,7 +40,19 @@ def check(label, action='reload', expected=0, *, env=None, platform=True,
         write('etc/rc.common', RC_COMMON.read_text())
         write('lib/functions.sh', '''
 config_load() { return 0; }
-config_get() { eval "$1=0"; }
+config_get() {
+    case "$1" in
+        offload_host_ifaces) eval "$1=br-lan";;
+        offload_physical_policy) eval "$1=report";;
+        *) eval "$1=0";;
+    esac
+}
+config_get_bool() {
+    case "$1" in
+        disable_gro_list) eval "$1=1";;
+        *) eval "$1=0";;
+    esac
+}
 list_contains() { return 0; }
 ''')
         write('lib/functions/service.sh', '')
@@ -93,7 +105,26 @@ exit "${STEERING_RC:-0}"
 echo steering-generic
 exit "${GENERIC_RC:-0}"
 ''', True)
-        if offload:
+        if real_offload:
+            helper = ROOT / 'package/qca-nss/qca-nss-ecm/files/disable_offloads.sh'
+            write('lib/netifd/offload/disable_offloads.sh', translate(helper.read_text()))
+            (base / 'sys/class/net/br-lan').mkdir(parents=True)
+            write('bin/ethtool', '''#!/bin/sh
+echo "ethtool:$*" >&2
+case "$1" in
+  -k)
+    state=on
+    [ ! -f "$IPKG_INSTROOT/feature-written" ] || state="${READBACK_STATE:-off}"
+    printf 'Features for br-lan:\nrx-gro-list: %s\n' "$state"
+    ;;
+  -K)
+    [ "${ETHTOOL_RC:-0}" -eq 0 ] || exit "$ETHTOOL_RC"
+    touch "$IPKG_INSTROOT/feature-written"
+    ;;
+  *) exit 99;;
+esac
+''', True)
+        elif offload:
             write('lib/netifd/offload/disable_offloads.sh', '''
 disable_offload() { echo offload-called; return "${OFFLOAD_RC:-0}"; }
 return "${OFFLOAD_SOURCE_RC:-0}"
@@ -127,6 +158,13 @@ return "${OFFLOAD_SOURCE_RC:-0}"
         checks += 1
         print('PASS: ' + label)
 
+
+for action in ('reload', 'start', 'restart'):
+    check(action + ' with real offload helper succeeds', action, real_offload=True)
+    check(action + ' with real helper propagates ethtool failure', action, expected=92,
+          real_offload=True, env={'ETHTOOL_RC': '92'}, require=('offload policy failed',))
+    check(action + ' with real helper rejects partial success', action, expected=1,
+          real_offload=True, env={'READBACK_STATE': 'on'}, require=("readback is 'on'",))
 
 check('reload success', require=('steering-platform', 'offload-called'))
 check('reload preserves steering failure and still applies offload', expected=7,

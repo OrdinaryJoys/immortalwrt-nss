@@ -43,12 +43,16 @@ printf '\n' >> "$TEST_COMMAND_LOG"
 
 case "${1:-}" in
     -k)
+        state=on
+        [ ! -e "$TEST_COMMAND_LOG.$2.changed" ] || state=off
         cat <<'FEATURES'
 Features for interface:
-rx-checksumming: on
-generic-segmentation-offload: on
 rx-gro-list: off
 FEATURES
+        printf 'rx-checksumming: %s\ngeneric-segmentation-offload: %s\n' "$state" "$state"
+        ;;
+    -K)
+        touch "$TEST_COMMAND_LOG.$2.changed"
         ;;
 esac
 EOF
@@ -64,6 +68,7 @@ chmod +x "$TMPDIR_ROOT/bin/logger"
 
 run_policy() {
     : > "$TMPDIR_ROOT/commands.log"
+    rm -f "$TMPDIR_ROOT"/commands.log.*.changed
     PATH="$TMPDIR_ROOT/bin:$PATH" \
     OFFLOAD_FUNCTIONS_SH="$TMPDIR_ROOT/functions.sh" \
     OFFLOAD_SYS_CLASS_NET="$TMPDIR_ROOT/sys/class/net" \
