@@ -5,6 +5,7 @@ START=19
 
 USE_PROCD=1
 PROG=/usr/sbin/dnsmasq
+DNS_REDIRECT_SCOPE="${DNS_REDIRECT_SCOPE:-/usr/libexec/dns-redirect-scope}"
 
 ADD_LOCAL_DOMAIN=1
 ADD_LOCAL_HOSTNAME=1
@@ -1288,13 +1289,33 @@ dnsmasq_start()
 
 	procd_close_instance
 
+	dnsmasq_dns_redirect "$cfg"
+}
+
+# Keep this producer's existing UDP-only semantics. The shared helper emits an
+# explicit trusted-ingress allowlist, never a WAN-name blacklist or empty match.
+dnsmasq_dns_redirect()
+{
+	local cfg="$1" dns_redirect dns_port dns_scope
+
 	config_get_bool dns_redirect "$cfg" dns_redirect 0
+	[ "$dns_redirect" = 1 ] || return 0
 	config_get dns_port "$cfg" port 53
-	if [ "$dns_redirect" = 1 ]; then
-		nft add table inet dnsmasq
-		nft add chain inet dnsmasq prerouting "{ type nat hook prerouting priority -95; policy accept; }"
-		nft add rule inet dnsmasq prerouting "meta nfproto { ipv4, ipv6 } udp dport 53 counter redirect to :$dns_port comment \"DNSMASQ HIJACK\""
+	case "$dns_port" in
+		''|*[!0-9]*)
+			logger -t dnsmasq -p daemon.warn "DNS redirect skipped: invalid DNS port"
+			return 0
+			;;
+	esac
+	# port=0 disables DNS; do not create a redirect to an invalid listener.
+	[ "$dns_port" -gt 0 ] && [ "$dns_port" -le 65535 ] || return 0
+	if ! dns_scope="$("$DNS_REDIRECT_SCOPE")" || [ -z "$dns_scope" ]; then
+		logger -t dnsmasq -p daemon.warn "DNS redirect skipped: no trusted ingress scope"
+		return 0
 	fi
+	nft add table inet dnsmasq
+	nft add chain inet dnsmasq prerouting "{ type nat hook prerouting priority -95; policy accept; }"
+	nft add rule inet dnsmasq prerouting "meta nfproto { ipv4, ipv6 } $dns_scope udp dport 53 counter redirect to :$dns_port comment \"DNSMASQ HIJACK\""
 }
 
 dnsmasq_stop()

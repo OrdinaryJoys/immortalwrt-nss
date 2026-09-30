@@ -10,7 +10,7 @@ include $(TOPDIR)/rules.mk
 PKG_NAME:=dnsmasq
 PKG_UPSTREAM_VERSION:=2.93
 PKG_VERSION:=$(subst test,~~test,$(subst rc,~rc,$(PKG_UPSTREAM_VERSION)))
-PKG_RELEASE:=2
+PKG_RELEASE:=3
 
 PKG_SOURCE:=$(PKG_NAME)-$(PKG_UPSTREAM_VERSION).tar.xz
 PKG_SOURCE_URL:=https://thekelleys.org.uk/dnsmasq/
@@ -173,6 +173,8 @@ define Package/dnsmasq/install
 	$(INSTALL_CONF) ./files/dnsmasq.conf $(1)/etc/dnsmasq.conf
 	$(INSTALL_DIR) $(1)/etc/init.d
 	$(INSTALL_BIN) ./files/dnsmasq.init $(1)/etc/init.d/dnsmasq
+	$(INSTALL_DIR) $(1)/usr/libexec
+	$(INSTALL_BIN) ./files/dns-redirect-scope.sh $(1)/usr/libexec/dns-redirect-scope
 	$(INSTALL_DIR) $(1)/etc/hotplug.d/dhcp
 	$(INSTALL_DIR) $(1)/etc/hotplug.d/neigh
 	$(INSTALL_DIR) $(1)/etc/hotplug.d/ntp
