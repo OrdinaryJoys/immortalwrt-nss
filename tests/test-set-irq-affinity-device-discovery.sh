@@ -3,8 +3,8 @@
 
 set -eu
 
-SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-SCRIPT=$SCRIPT_DIR/../target/linux/qualcommax/base-files/etc/init.d/set-irq-affinity
+SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+SCRIPT=${IRQ_TEST_SCRIPT:-$SCRIPT_DIR/../target/linux/qualcommax/base-files/etc/init.d/set-irq-affinity}
 TMP=$(mktemp -d 2>/dev/null || mktemp -d -t irq-discovery)
 trap 'rm -rf "$TMP"' EXIT HUP INT TERM
 
@@ -49,7 +49,26 @@ jsonfilter() {
 }
 
 logger() { :; }
-sleep() { :; }
+make_test_queue() {
+	mkdir -p "$IRQ_SYS_CLASS_NET/$1/queues/rx-0" "$IRQ_SYS_CLASS_NET/$1/queues/tx-0"
+	printf '0\n' > "$IRQ_SYS_CLASS_NET/$1/queues/rx-0/rps_cpus"
+	printf '0\n' > "$IRQ_SYS_CLASS_NET/$1/queues/rx-0/rps_flow_cnt"
+	printf '0\n' > "$IRQ_SYS_CLASS_NET/$1/queues/tx-0/xps_cpus"
+}
+sleep() {
+	case "${LATE_DEVICE_PHASE:-}:$1" in
+		retry:3)
+			make_test_queue wan9
+			LATE_DEVICE_PHASE=complete
+			;;
+		wave:30)
+			make_test_queue wan9
+			make_test_queue lan1
+			LATE_DEVICE_PHASE=complete
+			;;
+	esac
+	return 0
+}
 extra_command() { :; }
 
 IRQ_BOARD_JSON=$TMP/board.json
@@ -154,6 +173,48 @@ if grep -q "Zerotier" "$SCRIPT_DIR/../target/linux/qualcommax/base-files/etc/hot
 	ok 'hotplug filter covers the ZeroTier interface name (runtime reload re-assert)'
 else
 	bad 'hotplug filter covers the ZeroTier interface name (runtime reload re-assert)'
+fi
+
+assert_queue_policy() {
+	label=$1
+	eth=$2
+	if [ "$(cat "$IRQ_SYS_CLASS_NET/$eth/queues/rx-0/rps_cpus")" = f ] &&
+	   [ "$(cat "$IRQ_SYS_CLASS_NET/$eth/queues/rx-0/rps_flow_cnt")" = 8192 ] &&
+	   [ "$(cat "$IRQ_SYS_CLASS_NET/$eth/queues/tx-0/xps_cpus")" = f ]; then
+		ok "$label"
+	else
+		bad "$label"
+	fi
+}
+
+# The old implementation captured an empty list before sleep(3), so retries
+# and delayed waves could never discover the port created by deferred probe.
+printf 'wan9\n' > "$IRQ_BOARD_JSON"
+LATE_DEVICE_PHASE=retry
+start
+wait 2>/dev/null || true
+assert_queue_policy 'retry discovers a port absent at initial sysfs scan' wan9
+
+# One existing port makes start() stop retrying. A later port still needs
+# discovery in the delayed wave, together with re-created existing queues.
+rm -rf "$IRQ_SYS_CLASS_NET/wan9"
+printf 'lan1\nwan9\n' > "$IRQ_BOARD_JSON"
+LATE_DEVICE_PHASE=wave
+start
+wait 2>/dev/null || true
+assert_queue_policy 'delayed wave discovers an additional data-plane port' wan9
+assert_queue_policy 'delayed wave restores re-created queues on an existing port' lan1
+
+LATE_DEVICE_PHASE=complete
+make_test_queue wan9
+start_rps
+assert_queue_policy 'event entry rediscovers ports and restores their queues' wan9
+
+rm -rf "$IRQ_SYS_CLASS_NET"/*/queues
+if start_rps; then
+	bad 'event entry must report failure when no writable queue exists'
+else
+	ok 'event entry reports failure when no writable queue exists'
 fi
 
 echo "=== summary: PASS=$PASS FAIL=$FAIL ==="

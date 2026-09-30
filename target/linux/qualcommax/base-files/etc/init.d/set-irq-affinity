@@ -110,7 +110,11 @@ get_board_devices() {
 }
 
 apply_queue_policy() {
-	local eth i applied=0
+	local eth i devices applied=0
+
+	# Ports can appear after the first discovery (including between re-assert
+	# waves). Do not keep the boot-time, sysfs-filtered device list forever.
+	devices="$(get_board_devices)"
 
 	for eth in $devices; do
 		for i in "$SYS_CLASS_NET/$eth"/queues/rx-*/rps_cpus; do
@@ -179,11 +183,11 @@ start() {
 }
 
 start_rps() {
-	local flow_cnt cpu_mask devices applied
+	local flow_cnt cpu_mask applied
 
 	flow_cnt=8192
 	cpu_mask="$(get_cpu_mask)"
-	devices="$(get_board_devices)"
 	applied=$(apply_queue_policy)
 	logger -t set-irq-affinity "RPS event re-assert: $applied queue(s), mask=$cpu_mask"
+	[ "$applied" -gt 0 ]
 }
