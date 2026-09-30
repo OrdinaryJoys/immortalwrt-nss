@@ -7,6 +7,7 @@ An optional source-root supports old-source negatives and extracted-image tests.
 """
 from pathlib import Path
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -60,10 +61,10 @@ with tempfile.TemporaryDirectory(prefix='ecm-full-reload-') as directory:
     write(base / 'ecm-init', substitute((root / ecm_path).read_text()), True)
     platform = substitute((root / platform_path).read_text())
     write(binary / 'platform', platform, True)
-    write(base / 'lib/functions.sh', '''list_contains() {
-    [ "$1" = ALL_COMMANDS ] && [ "$2" = reload ]
-}
-''')
+    functions = (root / 'package/base-files/files/lib/functions.sh').read_text()
+    contains = re.findall(r'^list_contains\(\) \{\n.*?^\}', functions, re.M | re.S)
+    assert len(contains) == 1, ('list_contains source anchor drift', len(contains))
+    write(base / 'lib/functions.sh', contains[0] + '\n')
     write(library / 'service.sh', '# no system services in this fixture\n')
     write(library / 'procd.sh', '''procd_lock() { printf 'lock\n' >> "$TRACE"; }
 ''')
@@ -86,6 +87,10 @@ exit "${RPS_RC:-0}"
     write(binary / 'logger', '''#!/bin/sh
 printf '%s\n' "$*" >> "$LOG"
 exit "${LOGGER_RC:-0}"
+''', True)
+    write(binary / 'flock', '''#!/bin/sh
+printf 'lock\n' >> "$TRACE"
+exit 0
 ''', True)
     for command in ('modprobe', 'rmmod', 'insmod', 'sysctl', 'ethtool', 'tc', 'ip', 'ubus', 'sleep'):
         write(binary / command, '#!/bin/sh\necho "unexpected effect: $0 $*" >&2\nexit 98\n', True)

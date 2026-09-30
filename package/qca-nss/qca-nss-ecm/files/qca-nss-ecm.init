@@ -25,36 +25,51 @@ USE_PROCD=1
 write_if_writable() {
 	local file="$1"
 	local value="$2"
+	local actual
 
-	[ -w "$file" ] && echo "$value" > "$file"
+	# Feature-dependent controls may be absent; an existing unwritable
+	# control is an error. Command-style controls have no value readback.
+	[ -e "$file" ] || return 0
+	[ -w "$file" ] || return 1
+	printf '%s\n' "$value" > "$file" || return $?
+	if [ "${3:-}" = verify ]; then
+		actual=$(cat "$file") || return $?
+		[ "$actual" = "$value" ] || return 1
+	fi
 	return 0
 }
 
 sysctl_update() {
-	local name value file
+	local name value file proc status=0 rc actual
 
 	name=${1//\//\\/}
 	value=${2//\//\\/}
 	file=${3:-/etc/sysctl.d/qca-nss-ecm.conf}
+	proc="/proc/sys/$(printf '%s' "$1" | tr . /)"
 
-	if [ -r "/proc/sys/${name//./\/}" ]; then
+	if [ -e "$proc" ]; then
+		[ -r "$proc" ] || return 1
 		sed -i -e '/^#\?\(\s*'"${name}"'\s*=\s*\).*/{s//\1'"${value}"'/;:a;n;ba;q}' \
-			-e '$a'"${name}"'='"${value}" "${file}"
-		sysctl -w "${name}=${value}"
+			-e '$a'"${name}"'='"${value}" "${file}" || status=$?
+		# Restore live safety despite persistence failure, retaining first error.
+		sysctl -w "${name}=${value}" || { rc=$?; [ "$status" -ne 0 ] || status="$rc"; }
+		actual=$(cat "$proc") || { rc=$?; [ "$status" -ne 0 ] || status="$rc"; }
+		[ "$actual" = "$value" ] || { [ "$status" -ne 0 ] || status=1; }
 	else
 		# If the sysctl value is not available but it is found in the file, disable it to avoid
 		# sysctl throwing warnings
 		if grep -qE '^#?\s*'"${name}\s*?=" "${file}"; then
 			sed -i -e '/^#\?\(\s*'"${name}"'\s*=\s*\).*/{s//\#\1'"${value}"'/;:a;n;ba;q}' \
-				-e '$a'"#${name}"'='"${value}" "${file}"
+				-e '$a'"#${name}"'='"${value}" "${file}" || status=$?
 		fi
 	fi
+	return "$status"
 }
 
 get_front_end_mode() {
-	config_load "ecm"
+	config_load "ecm" || return $?
 
-	config_get front_end global acceleration_engine "auto"
+	config_get front_end global acceleration_engine "auto" || return $?
 
 	# shellcheck disable=2154
 	case $front_end in
@@ -78,10 +93,13 @@ disable_packet_steering() {
 	uci -q set network.globals.packet_steering='0' && changed=1 || status=$?
 	# An absent optional key is not an error. A failed deletion is.
 	if uci -q get network.globals.steering_flows >/dev/null; then
-		uci -q delete network.globals.steering_flows && changed=1 || status=$?
+		uci -q delete network.globals.steering_flows && changed=1 || { rc=$?; [ "$status" -ne 0 ] || status="$rc"; }
+	else
+		# Distinguish a missing optional key from an unreadable globals section.
+		uci -q show network.globals >/dev/null || { rc=$?; [ "$status" -ne 0 ] || status="$rc"; }
 	fi
 	if [ "$changed" -ne 0 ]; then
-		uci -q commit network || status=$?
+		uci -q commit network || { rc=$?; [ "$status" -ne 0 ] || status="$rc"; }
 	fi
 
 	# Still restore the live queue policy if persistence failed.
@@ -96,22 +114,26 @@ disable_packet_steering() {
 }
 
 disable_bridge_filtering() {
-	sysctl_update net.bridge.bridge-nf-call-arptables 0
-	sysctl_update net.bridge.bridge-nf-call-iptables 0
-	sysctl_update net.bridge.bridge-nf-call-ip6tables 0
+	local name status=0 rc
+	for name in arptables iptables ip6tables; do
+		sysctl_update "net.bridge.bridge-nf-call-$name" 0 || { rc=$?; [ "$status" -ne 0 ] || status="$rc"; }
+	done
+	return "$status"
 }
 
 enable_bridge_filtering() {
+	local name status=0 rc
 
 	# If bridge filtering is enabled, apply and persist the sysctl flags
-	config_load ecm
-	config_get enable_bridge_filtering general enable_bridge_filtering 0
+	config_load ecm || return $?
+	config_get enable_bridge_filtering general enable_bridge_filtering 0 || return $?
 
 	# shellcheck disable=2154
 	if [ "$enable_bridge_filtering" -eq 1 ]; then
-		sysctl_update net.bridge.bridge-nf-call-arptables 1
-		sysctl_update net.bridge.bridge-nf-call-iptables 1
-		sysctl_update net.bridge.bridge-nf-call-ip6tables 1
+		for name in arptables iptables ip6tables; do
+			sysctl_update "net.bridge.bridge-nf-call-$name" 1 || { rc=$?; [ "$status" -ne 0 ] || status="$rc"; }
+		done
+		return "$status"
 	else
 		disable_bridge_filtering
 	fi
@@ -120,7 +142,9 @@ enable_bridge_filtering() {
 set_front_end() {
 	local get_front_end_mode=${1:-0}
 	local module_conf=/etc/modules.conf
-	[ ! -r "$module_conf" ] && touch "$module_conf"
+	if [ ! -r "$module_conf" ]; then
+		touch "$module_conf" || return $?
+	fi
 	# If "options ecm" exists, modify or append front_end_selection
 	if grep -q "^options ecm" "$module_conf"; then
 		if grep -q "front_end_selection=" "$module_conf"; then
@@ -153,57 +177,62 @@ apply_interface_offload_policy() {
 }
 
 load_ecm() {
-	local status=0 dependencies get_front_end_mode
+	local status=0 rc dependencies get_front_end_mode
 	[ -d /sys/module/ecm ] || {
-		get_front_end_mode="$(get_front_end_mode)"
+		get_front_end_mode="$(get_front_end_mode)" || return $?
 		dependencies="$(modinfo ecm)" || return $?
 		printf '%s\n' "$dependencies" | awk '$1 == "depends:" && NF > 1 {gsub(",","\n",$2);print $2}' | xargs -r -n 1 modprobe || return $?
 		set_front_end $get_front_end_mode || return $?
 		modprobe ecm || return $?
-		write_if_writable /sys/kernel/debug/ecm/ecm_classifier_default/accel_delay_pkts 1
+		write_if_writable /sys/kernel/debug/ecm/ecm_classifier_default/accel_delay_pkts 1 verify || status=$?
 	}
 
-	apply_interface_offload_policy || status=$?
+	apply_interface_offload_policy || { rc=$?; [ "$status" -ne 0 ] || status="$rc"; }
 
 	#Flushout stale accelerated connections if any
-	write_if_writable /sys/kernel/debug/ecm/ecm_db/defunct_all 1
-	write_if_writable /proc/net/nf_conntrack f
+	write_if_writable /sys/kernel/debug/ecm/ecm_db/defunct_all 1 || { rc=$?; [ "$status" -ne 0 ] || status="$rc"; }
+	write_if_writable /proc/net/nf_conntrack f || { rc=$?; [ "$status" -ne 0 ] || status="$rc"; }
 
 	# Set conntrack event mode to 1 for 6.1 kernel to get the conntrack events from ECM
 	local kernel_major
 	kernel_major=$(uname -r | cut -d. -f1)
 	if [ "$kernel_major" -eq 6 ]; then
-		write_if_writable /proc/sys/net/netfilter/nf_conntrack_events 1
+		write_if_writable /proc/sys/net/netfilter/nf_conntrack_events 1 verify || { rc=$?; [ "$status" -ne 0 ] || status="$rc"; }
 	fi
 	return "$status"
 }
 
 unload_ecm() {
-	disable_bridge_filtering
+	local status=0 rc
+	disable_bridge_filtering || status=$?
 
 	# Change it back to 6.1 linux's default setting
 	local kernel_major
 	kernel_major="$(uname -r | cut -d. -f1)"
 	if [ "$kernel_major" -eq 6 ]; then
-		write_if_writable /proc/sys/net/netfilter/nf_conntrack_events 2
+		write_if_writable /proc/sys/net/netfilter/nf_conntrack_events 2 verify || { rc=$?; [ "$status" -ne 0 ] || status="$rc"; }
 	fi
 
 	if [ -d /sys/module/ecm ]; then
 		#
 		# Stop ECM frontends
 		#
-		write_if_writable /sys/kernel/debug/ecm/front_end_ipv4_stop 1
-		write_if_writable /sys/kernel/debug/ecm/front_end_ipv6_stop 1
+		write_if_writable /sys/kernel/debug/ecm/front_end_ipv4_stop 1 verify || { rc=$?; [ "$status" -ne 0 ] || status="$rc"; }
+		write_if_writable /sys/kernel/debug/ecm/front_end_ipv6_stop 1 verify || { rc=$?; [ "$status" -ne 0 ] || status="$rc"; }
 
 		#
 		# Defunct the connections
 		#
-		write_if_writable /sys/kernel/debug/ecm/ecm_db/defunct_all 1
-		write_if_writable /proc/net/nf_conntrack f
+		write_if_writable /sys/kernel/debug/ecm/ecm_db/defunct_all 1 || { rc=$?; [ "$status" -ne 0 ] || status="$rc"; }
+		write_if_writable /proc/net/nf_conntrack f || { rc=$?; [ "$status" -ne 0 ] || status="$rc"; }
 
-		sleep 1
-		rmmod ecm
+		# Do not remove the module if its quiesce controls failed. Keep the
+		# registration and state available for a deliberate recovery attempt.
+		[ "$status" -eq 0 ] || return "$status"
+		sleep 1 || return $?
+		rmmod ecm || return $?
 	fi
+	return "$status"
 }
 
 service_triggers() {
@@ -239,50 +268,139 @@ reload_service() {
 }
 
 start_service() {
-	# rc.common closes the procd declaration after this callback, replacing
-	# its exit status. service_started exposes our result to the caller.
+	local rc
 	ecm_start_status=0
 	load_ecm || ecm_start_status=$?
 
-	disable_packet_steering || ecm_start_status=$?
+	disable_packet_steering || { rc=$?; [ "$ecm_start_status" -ne 0 ] || ecm_start_status="$rc"; }
 
 	# Only enable bridge filtering if using deprecated fw3
 	if [ ! -r /sbin/fw4 ]; then
-		enable_bridge_filtering || ecm_start_status=$?
+		enable_bridge_filtering || { rc=$?; [ "$ecm_start_status" -ne 0 ] || ecm_start_status="$rc"; }
 	else
-		disable_bridge_filtering || ecm_start_status=$?
+		disable_bridge_filtering || { rc=$?; [ "$ecm_start_status" -ne 0 ] || ecm_start_status="$rc"; }
 	fi
+	# Safety policies above are independent. Do not activate additional NSS
+	# redirect/OVS functionality after any earlier prerequisite failure.
+	[ "$ecm_start_status" -eq 0 ] || return "$ecm_start_status"
 
 	# If the acceleration engine is NSS, enable wifi redirect
-	if [ -d /sys/kernel/debug/ecm/ecm_nss_ipv4 ] && [ -w /proc/sys/dev/nss/general/redirect ]; then
-		sysctl -w dev.nss.general.redirect=1 || ecm_start_status=$?
+	if [ -d /sys/kernel/debug/ecm/ecm_nss_ipv4 ]; then
+		sysctl -w dev.nss.general.redirect=1 || return $?
+		[ "$(cat /proc/sys/dev/nss/general/redirect)" = 1 ] || return 1
 	fi
 
 	if [ -d /sys/module/qca_ovsmgr ]; then
-		insmod ecm_ovs || ecm_start_status=$?
+		insmod ecm_ovs || return $?
 	fi
-	if [ "$ecm_start_status" -ne 0 ]; then
-		logger -p daemon.err -t qca-nss-ecm "startup policy incomplete (status $ecm_start_status)"
-	fi
-	return "$ecm_start_status"
-}
-
-service_started() {
-	return "${ecm_start_status:-1}"
+	return 0
 }
 
 stop_service() {
 	# If ECM is already not loaded, just return
 	if [ ! -d /sys/module/ecm ]; then
-		return
+		return 0
 	fi
 
 	# If the acceleration engine is NSS, disable wifi redirect
-	[ -d /sys/kernel/debug/ecm/ecm_nss_ipv4 ] && [ -w /proc/sys/dev/nss/general/redirect ] && sysctl -w dev.nss.general.redirect=0
+	if [ -d /sys/kernel/debug/ecm/ecm_nss_ipv4 ]; then
+		sysctl -w dev.nss.general.redirect=0 || return $?
+		[ "$(cat /proc/sys/dev/nss/general/redirect)" = 0 ] || return 1
+	fi
 
 	if [ -d /sys/module/ecm_ovs ]; then
-		rmmod ecm_ovs
+		rmmod ecm_ovs || return $?
 	fi
 
 	unload_ecm
 }
+
+# rc.common replaces public start/stop/reload functions after sourcing this
+# file. Select private dispatchers for this service only; leave the shared
+# framework and every other service untouched. Its procd library is still
+# loaded normally before these handlers are invoked.
+ecm_procd_adapter() {
+	# The locked procd helper discards errors at namespace restore and JSON
+	# cleanup. Replace only those two adapters in this short-lived ECM process.
+	_procd_call() {
+		local old_cb status=0 rc
+		json_set_namespace procd old_cb || return $?
+		"$@" || status=$?
+		json_set_namespace "$old_cb" || { rc=$?; [ "$status" -ne 0 ] || status="$rc"; }
+		return "$status"
+	}
+	_procd_ubus_call() {
+		local cmd="$1" payload status=0 rc
+		payload=$(json_dump) || status=$?
+		if [ "$status" -eq 0 ]; then
+			[ -z "$PROCD_DEBUG" ] || printf '%s\n' "$payload" >&2
+			ubus call service "$cmd" "$payload" || status=$?
+		fi
+		json_cleanup || { rc=$?; [ "$status" -ne 0 ] || status="$rc"; }
+		return "$status"
+	}
+}
+
+ecm_lock() {
+	local lock_name
+	lock_name=$(basename "${basescript:-$initscript}") || return $?
+	flock -n 1000 2>/dev/null && return 0
+	exec 1000>"$IPKG_INSTROOT/var/lock/procd_${lock_name}.lock" || return $?
+	flock 1000
+}
+
+ecm_start() {
+	local status=0 method=set
+	ecm_procd_adapter
+	ecm_lock || return $?
+	[ -z "$1" ] || method=add
+	procd_open_service "$(basename "${basescript:-$initscript}")" "$initscript" || status=$?
+	if [ "$status" -ne 0 ]; then
+		_procd_call json_cleanup || :
+		return "$status"
+	fi
+	start_service "$@" || status=$?
+	if [ "$status" -ne 0 ]; then
+		# Discard the declaration, do not register a failed partial startup.
+		_procd_call json_cleanup || :
+		logger -p daemon.err -t qca-nss-ecm "startup policy incomplete (status $status)" || :
+		return "$status"
+	fi
+	procd_close_service "$method" || status=$?
+	return "$status"
+}
+
+ecm_stop() {
+	ecm_procd_adapter
+	ecm_lock || return $?
+	stop_service "$@" || return $?
+	procd_kill "$(basename "${basescript:-$initscript}")" "$1"
+}
+
+ecm_restart() {
+	local status=0
+	trap '' TERM
+	ecm_stop "$@" || status=$?
+	trap - TERM
+	[ "$status" -eq 0 ] || return "$status"
+	ecm_start "$@"
+}
+
+ecm_reload() {
+	ecm_lock || return $?
+	reload_service "$@"
+}
+
+ecm_trace() {
+	TRACE_SYSCALLS=1
+	ecm_start "$@"
+}
+
+case "$action" in
+	start|boot) action=ecm_start ;;
+	stop|shutdown) action=ecm_stop ;;
+	restart) action=ecm_restart ;;
+	reload) action=ecm_reload ;;
+	trace) action=ecm_trace ;;
+esac
+EXTRA_COMMANDS="${EXTRA_COMMANDS} ecm_start ecm_stop ecm_restart ecm_reload ecm_trace"
