@@ -188,7 +188,11 @@ service_triggers() {
 }
 
 reload_service() {
-	disable_packet_steering
+	local steering_status=0 offload_status=0
+
+	# Still apply the independent offload safety policy if queue ownership
+	# restoration fails, but never let the later stage hide that failure.
+	disable_packet_steering || steering_status=$?
 
 		# Re-apply the configured interface-offload policy after a network
 		# restart, because netifd or a driver rebind can restore netdev feature
@@ -197,9 +201,17 @@ reload_service() {
 		# corrupt. Board profiles can therefore select a conservative host-path
 		# policy while leaving physical NSS data-plane ports report-only.
 	if [ -r /lib/netifd/offload/disable_offloads.sh ]; then
-		. /lib/netifd/offload/disable_offloads.sh
-		disable_offload
+		. /lib/netifd/offload/disable_offloads.sh && disable_offload || offload_status=$?
 	fi
+
+	if [ "$steering_status" -ne 0 ]; then
+		logger -t qca-nss-ecm -p daemon.err "reload: packet steering failed (status $steering_status)" || :
+	fi
+	if [ "$offload_status" -ne 0 ]; then
+		logger -t qca-nss-ecm -p daemon.err "reload: offload policy failed (status $offload_status)" || :
+	fi
+	[ "$steering_status" -eq 0 ] || return "$steering_status"
+	return "$offload_status"
 }
 
 start_service() {
