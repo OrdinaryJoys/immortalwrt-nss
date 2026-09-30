@@ -163,7 +163,7 @@ Hotfix-by: Sebastian Gottschall https://github.com/mirror/dd-wrt/commit/0c3001a6
  int hostapd_sta_add(struct hostapd_data *hapd,
 --- /dev/null
 +++ b/src/ap/apup.c
-@@ -0,0 +1,176 @@
+@@ -0,0 +1,177 @@
 +/*
 + * hostapd / APuP Access Point Micro Peering
 + *
