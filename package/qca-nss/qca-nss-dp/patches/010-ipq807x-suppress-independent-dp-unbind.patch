@@ -1,0 +1,26 @@
+From: AX6 offline containment candidate
+Subject: [PATCH] ipq807x: suppress independent DP sysfs hot-unbind
+
+Base: exact d8f802f08fd8ff31057ba58edb20bbe448e7b505 plus source2e 001-008
+and frozen 009-ipq807x-fail-closed-data-plane-detach.patch (SHA256
+0de2c7a7c86d44569575a54f33e0089aa5477ddb466b8eae0b70ca86c699350d).
+
+Shrink the ordinary independent sysfs unbind/rebind entry while NSS can
+retain a netdev. Other SoCs are unchanged. This is not a generic platform,
+module teardown or all external-client lifetime proof; it adds no recovery.
+
+diff --git a/nss_dp_main.c b/nss_dp_main.c
+index 5afa313..0712715 100644
+--- a/nss_dp_main.c
++++ b/nss_dp_main.c
+@@ -1424,6 +1424,10 @@ static struct platform_driver nss_dp_drv = {
+ 	.driver = {
+ 		   .name = "nss-dp",
+ 		   .owner = THIS_MODULE,
++#ifdef NSS_DP_IPQ807X
++		   /* No independent sysfs unbind while NSS can retain this netdev. */
++		   .suppress_bind_attrs = true,
++#endif
+ 		   .of_match_table = of_match_ptr(nss_dp_dt_ids),
+ 		  },
+ };

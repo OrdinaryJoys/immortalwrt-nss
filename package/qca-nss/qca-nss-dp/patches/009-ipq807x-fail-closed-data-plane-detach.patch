@@ -1,0 +1,1044 @@
+From: AX6 offline repair review
+Subject: [PATCH 009] nss-dp: isolate IPQ807x on overlay detach
+
+Base: qca-nss-dp d8f802f08fd8ff31057ba58edb20bbe448e7b505,
+fully prepared with exact current 001-008 from source
+2e207fcae4479bc55211fb83395ae2954b39b951.
+
+Use an IPQ807x per-port callback/context reader gate and RTNL-owned
+writers. Block and drain existing readers before installing DP-owned
+permanent quarantine. Never select or reinitialize EDMA on detach;
+never send NSS close/deinit commands on the detached path. Preserve
+other-SoC valid-input dispatch behavior.
+
+No hardware ring/IRQ or firmware configuration is changed. This patch
+is a source-only containment candidate, not hot recovery or a deployment.
+NSS RX registry/netdev lifetime must be drained independently by the
+registry owner before freeing netdev. Generic DP/NSS hot-unbind remains
+outside this candidate's proof.
+
+diff --git a/exports/nss_dp_api_if.h b/exports/nss_dp_api_if.h
+index 802e3e8..94f2f10 100644
+--- a/exports/nss_dp_api_if.h
++++ b/exports/nss_dp_api_if.h
+@@ -157,6 +157,8 @@ void nss_dp_receive(struct net_device *netdev, struct sk_buff *skb,
+  *
+  * @return
+  * bool
++ *
++ * IPQ807x EDMA v1: caller must hold RTNL; quarantined ports report false.
+  */
+ bool nss_dp_is_in_open_state(struct net_device *netdev);
+ 
+@@ -175,6 +177,13 @@ bool nss_dp_is_in_open_state(struct net_device *netdev);
+  *
+  * @return
+  * int
++ *
++ * IPQ807x EDMA v1: caller must hold RTNL. Only the initial host-to-overlay
++ * takeover is supported. Ops and context must stay immutable and valid until
++ * restore returns. Success leaves admission blocked until the overlay
++ * has installed all RX registrations and calls nss_dp_start_data_plane(),
++ * including for an administratively DOWN port. A failed transition or detach
++ * permanently quarantines the port; subsequent override returns -ENODEV.
+  */
+ int nss_dp_override_data_plane(struct net_device *netdev,
+ 			       struct nss_dp_data_plane_ops *dp_ops,
+@@ -190,6 +199,12 @@ int nss_dp_override_data_plane(struct net_device *netdev,
+  *
+  * @param[in] netdev Pointer to netdev structure.
+  * @param[in] dpc Pointer to data plane context.
++ *
++ * IPQ807x EDMA v1: caller must hold RTNL and call this once after every
++ * successful override, only after all RX registrations are ready. The previous
++ * administrative-open state is retained by DP: a previously DOWN port is not
++ * opened. A failed start permanently quarantines the port. No hot recovery is
++ * provided; other platforms retain their existing start semantics.
+  */
+ void nss_dp_start_data_plane(struct net_device *netdev,
+ 			     struct nss_dp_data_plane_ctx *dpc);
+@@ -202,6 +217,16 @@ void nss_dp_start_data_plane(struct net_device *netdev,
+  * net_device
+  *
+  * @param[in] netdev Pointer to netdev structure.
++ *
++ * IPQ807x EDMA v1: caller must hold RTNL and retain its callback/context until
++ * this function returns. DP blocks and drains all admitted callbacks, then
++ * permanently installs DP-owned quarantine ops/context, clears all feature
++ * declarations and disables host TX/RX admission. It does not send NSS close
++ * commands or reinitialize EDMA. Caller still owns NSS firmware/RX-registry
++ * teardown and must independently drain those readers before freeing netdev;
++ * the DP reader gate is not a netdev lifetime reference. Do not call restore
++ * from an admitted callback or while holding a PHY device lock.
++ * Repeated detach is safe; ordinary reopen/reoverride cannot undo quarantine.
+  */
+ void nss_dp_restore_data_plane(struct net_device *netdev);
+ 
+diff --git a/include/nss_dp_dev.h b/include/nss_dp_dev.h
+index d8f9085..9941401 100644
+--- a/include/nss_dp_dev.h
++++ b/include/nss_dp_dev.h
+@@ -28,6 +28,10 @@
+ #include <linux/switch.h>
+ #include <linux/version.h>
+ #include <linux/ethtool.h>
++#ifdef NSS_DP_IPQ807X
++#include <linux/spinlock.h>
++#include <linux/wait.h>
++#endif
+ 
+ #ifdef CONFIG_QCA_MINIDUMP
+ #include <soc/qcom/ctx-save.h>
+@@ -227,6 +231,18 @@ struct nss_dp_dev {
+ 	uint32_t vsi;			/* vsi number */
+ 	unsigned long flags;		/* Status flags */
+ 	unsigned long drv_flags;	/* Driver specific feature flags */
++#ifdef NSS_DP_IPQ807X
++	/* Admission and ops/context publication share this short lock. */
++	spinlock_t plane_lock;
++	wait_queue_head_t plane_wait;
++	unsigned int plane_readers;
++	bool plane_blocked;
++	bool plane_quarantined;
++	bool plane_pending;
++	bool plane_was_open;
++	bool phy_started;		/* RTNL-owned; not inferred from UP. */
++	struct nss_dp_data_plane_ctx quarantine_ctx;
++#endif
+ 
+ 	/* Phy related stuff */
+ 	struct phy_device *phydev;	/* Phy device */
+@@ -359,6 +375,44 @@ enum nss_dp_priv_flags {
+ };
+ #define NSS_DP_PRIV_FLAG(x)	(1 << __NSS_DP_PRIV_FLAG_ ## x)
+ 
++/* A reader retains one matching callback table/context until plane_put(). */
++struct nss_dp_plane_ref {
++	struct nss_dp_data_plane_ops *ops;
++	struct nss_dp_data_plane_ctx *dpc;
++};
++
++#ifdef NSS_DP_IPQ807X
++void nss_dp_plane_init(struct nss_dp_dev *dp);
++bool nss_dp_plane_get(struct nss_dp_dev *dp, struct nss_dp_plane_ref *ref);
++void nss_dp_plane_put(struct nss_dp_dev *dp);
++bool nss_dp_plane_is_quarantined(struct nss_dp_dev *dp);
++void nss_dp_plane_quiesce(struct nss_dp_dev *dp);
++void nss_dp_plane_quarantine(struct nss_dp_dev *dp);
++void nss_dp_plane_resume(struct nss_dp_dev *dp);
++void nss_dp_plane_stop_phy(struct nss_dp_dev *dp);
++
++/* RTNL caller retains a reader, or owns the closed, drained callback pair. */
++int nss_dp_close_data_plane(struct nss_dp_dev *dp,
++			  const struct nss_dp_plane_ref *ref);
++int nss_dp_open_data_plane(struct nss_dp_dev *dp,
++			 const struct nss_dp_plane_ref *ref);
++void nss_dp_activate_data_plane(struct nss_dp_dev *dp);
++#else
++static inline void nss_dp_plane_init(struct nss_dp_dev *dp) {}
++static inline bool nss_dp_plane_get(struct nss_dp_dev *dp,
++				     struct nss_dp_plane_ref *ref)
++{
++	ref->ops = dp->data_plane_ops;
++	ref->dpc = dp->dpc;
++	return true;
++}
++static inline void nss_dp_plane_put(struct nss_dp_dev *dp) {}
++static inline bool nss_dp_plane_is_quarantined(struct nss_dp_dev *dp)
++{
++	return false;
++}
++#endif
++
+ /*
+  * nss_dp_set_ethtool_ops()
+  */
+diff --git a/nss_dp_attach.c b/nss_dp_attach.c
+index 7dae9de..1623395 100644
+--- a/nss_dp_attach.c
++++ b/nss_dp_attach.c
+@@ -18,6 +18,8 @@
+  */
+ 
+ #include <linux/version.h>
++#include <linux/phy.h>
++#include <linux/rtnetlink.h>
+ #include "nss_dp_hal.h"
+ 
+ /*
+@@ -32,6 +34,180 @@ static inline void nss_dp_reset_netdev_features(struct net_device *netdev)
+ 	netdev->wanted_features = 0;
+ }
+ 
++#ifdef NSS_DP_IPQ807X
++/*
++ * IPQ807x EDMA v1 has no Linux checksum-offload fallback implementation.
++ * Detach therefore permanently isolates this port instead of selecting EDMA.
++ * No NSS command, EDMA reinitialization, ring or IRQ change occurs here.
++ */
++static int nss_dp_quarantine_init(struct nss_dp_data_plane_ctx *dpc)
++{
++	return -ENODEV;
++}
++
++static int nss_dp_quarantine_open(struct nss_dp_data_plane_ctx *dpc,
++		uint32_t tx, uint32_t rx, uint32_t mode)
++{
++	return -ENODEV;
++}
++
++static int nss_dp_quarantine_noop(struct nss_dp_data_plane_ctx *dpc)
++{
++	return 0;
++}
++
++static int nss_dp_quarantine_value(struct nss_dp_data_plane_ctx *dpc,
++		uint32_t value)
++{
++	return -ENODEV;
++}
++
++static int nss_dp_quarantine_mac(struct nss_dp_data_plane_ctx *dpc,
++		uint8_t *addr)
++{
++	return -ENODEV;
++}
++
++static netdev_tx_t nss_dp_quarantine_xmit(struct nss_dp_data_plane_ctx *dpc,
++		struct sk_buff *skb)
++{
++	dev_core_stats_tx_dropped_inc(dpc->dev);
++	dev_kfree_skb_any(skb);
++	return NETDEV_TX_OK;
++}
++
++static void nss_dp_quarantine_features(struct nss_dp_data_plane_ctx *dpc)
++{
++	nss_dp_reset_netdev_features(dpc->dev);
++}
++
++static struct nss_dp_data_plane_ops nss_dp_quarantine_ops = {
++	.init = nss_dp_quarantine_init,
++	.open = nss_dp_quarantine_open,
++	.close = nss_dp_quarantine_noop,
++	.link_state = nss_dp_quarantine_value,
++	.mac_addr = nss_dp_quarantine_mac,
++	.change_mtu = nss_dp_quarantine_value,
++	.xmit = nss_dp_quarantine_xmit,
++	.set_features = nss_dp_quarantine_features,
++	.pause_on_off = nss_dp_quarantine_value,
++	.deinit = nss_dp_quarantine_noop,
++};
++
++void nss_dp_plane_init(struct nss_dp_dev *dp)
++{
++	spin_lock_init(&dp->plane_lock);
++	init_waitqueue_head(&dp->plane_wait);
++	dp->plane_readers = 0;
++	dp->plane_blocked = false;
++	dp->plane_quarantined = false;
++	dp->plane_pending = false;
++	dp->plane_was_open = false;
++	dp->phy_started = false;
++	dp->quarantine_ctx.dev = dp->netdev;
++}
++
++bool nss_dp_plane_get(struct nss_dp_dev *dp, struct nss_dp_plane_ref *ref)
++{
++	bool admitted = false;
++
++	spin_lock_bh(&dp->plane_lock);
++	if (!dp->plane_blocked && !dp->plane_quarantined &&
++			dp->data_plane_ops && dp->dpc) {
++		ref->ops = dp->data_plane_ops;
++		ref->dpc = dp->dpc;
++		dp->plane_readers++;
++		admitted = true;
++	}
++	spin_unlock_bh(&dp->plane_lock);
++	return admitted;
++}
++
++void nss_dp_plane_put(struct nss_dp_dev *dp)
++{
++	bool drained;
++
++	spin_lock_bh(&dp->plane_lock);
++	if (WARN_ON_ONCE(!dp->plane_readers)) {
++		spin_unlock_bh(&dp->plane_lock);
++		return;
++	}
++	drained = (--dp->plane_readers == 0);
++	spin_unlock_bh(&dp->plane_lock);
++	if (drained)
++		wake_up_all(&dp->plane_wait);
++}
++
++bool nss_dp_plane_is_quarantined(struct nss_dp_dev *dp)
++{
++	bool quarantined;
++
++	spin_lock_bh(&dp->plane_lock);
++	quarantined = dp->plane_quarantined;
++	spin_unlock_bh(&dp->plane_lock);
++	return quarantined;
++}
++
++void nss_dp_plane_stop_phy(struct nss_dp_dev *dp)
++{
++	ASSERT_RTNL();
++	if (dp->phy_started) {
++		dp->phy_started = false;
++		if (dp->phydev)
++			phy_stop(dp->phydev);
++	}
++}
++
++void nss_dp_plane_quiesce(struct nss_dp_dev *dp)
++{
++	ASSERT_RTNL();
++	might_sleep();
++	spin_lock_bh(&dp->plane_lock);
++	dp->plane_blocked = true;
++	spin_unlock_bh(&dp->plane_lock);
++
++	/* Never call this while retaining a plane_get() reference. */
++	netif_device_detach(dp->netdev);
++	netif_tx_disable(dp->netdev);
++	nss_dp_plane_stop_phy(dp);
++	wait_event(dp->plane_wait, !READ_ONCE(dp->plane_readers));
++
++	/* An old PHY/RX callback may have raised carrier before it exited. */
++	netif_tx_disable(dp->netdev);
++	netif_carrier_off(dp->netdev);
++}
++
++void nss_dp_plane_quarantine(struct nss_dp_dev *dp)
++{
++	ASSERT_RTNL();
++	nss_dp_plane_quiesce(dp);
++	clear_bit(__NSS_DP_UP, &dp->flags);
++	dp->link_state = __NSS_DP_LINK_DOWN;
++	dp->drv_flags &= ~(NSS_DP_PRIV_FLAG(INIT_DONE) |
++			   NSS_DP_PRIV_FLAG(INIT_OVERRIDE));
++	nss_dp_reset_netdev_features(dp->netdev);
++
++	spin_lock_bh(&dp->plane_lock);
++	dp->data_plane_ops = &nss_dp_quarantine_ops;
++	dp->dpc = &dp->quarantine_ctx;
++	dp->plane_pending = false;
++	dp->plane_was_open = false;
++	dp->plane_quarantined = true;
++	spin_unlock_bh(&dp->plane_lock);
++}
++
++void nss_dp_plane_resume(struct nss_dp_dev *dp)
++{
++	ASSERT_RTNL();
++	spin_lock_bh(&dp->plane_lock);
++	if (!dp->plane_quarantined)
++		dp->plane_blocked = false;
++	spin_unlock_bh(&dp->plane_lock);
++	if (!nss_dp_plane_is_quarantined(dp))
++		netif_device_attach(dp->netdev);
++}
++#endif
++
+ /*
+  * nss_dp_receive()
+  *	Called by overlay drivers to deliver packets to nss-dp
+@@ -39,7 +215,21 @@ static inline void nss_dp_reset_netdev_features(struct net_device *netdev)
+ void nss_dp_receive(struct net_device *netdev, struct sk_buff *skb,
+ 					       struct napi_struct *napi)
+ {
+-	struct nss_dp_dev *dp_dev = netdev_priv(netdev);
++	struct nss_dp_dev *dp_dev;
++	struct nss_dp_plane_ref ref;
++
++	if (!netdev || !skb || !napi) {
++		if (skb)
++			dev_kfree_skb_any(skb);
++		return;
++	}
++	dp_dev = netdev_priv(netdev);
++
++	if (!nss_dp_plane_get(dp_dev, &ref)) {
++		dev_core_stats_rx_dropped_inc(netdev);
++		dev_kfree_skb_any(skb);
++		return;
++	}
+ 
+ 	skb->dev = netdev;
+ 	skb->protocol = eth_type_trans(skb, netdev);
+@@ -58,6 +248,7 @@ void nss_dp_receive(struct net_device *netdev, struct sk_buff *skb,
+ #endif
+ 
+ 	napi_gro_receive(napi, skb);
++	nss_dp_plane_put(dp_dev);
+ }
+ EXPORT_SYMBOL(nss_dp_receive);
+ 
+@@ -67,7 +258,16 @@ EXPORT_SYMBOL(nss_dp_receive);
+  */
+ bool nss_dp_is_in_open_state(struct net_device *netdev)
+ {
+-	struct nss_dp_dev *dp_dev = (struct nss_dp_dev *)netdev_priv(netdev);
++	struct nss_dp_dev *dp_dev;
++
++	if (!netdev)
++		return false;
++	dp_dev = netdev_priv(netdev);
++#ifdef NSS_DP_IPQ807X
++	ASSERT_RTNL();
++	if (nss_dp_plane_is_quarantined(dp_dev))
++		return false;
++#endif
+ 
+ 	if (test_bit(__NSS_DP_UP, &dp_dev->flags))
+ 		return true;
+@@ -83,7 +283,15 @@ int nss_dp_override_data_plane(struct net_device *netdev,
+ 				struct nss_dp_data_plane_ops *dp_ops,
+ 				struct nss_dp_data_plane_ctx *dpc)
+ {
+-	struct nss_dp_dev *dp_dev = (struct nss_dp_dev *)netdev_priv(netdev);
++	struct nss_dp_dev *dp_dev;
++#ifdef NSS_DP_IPQ807X
++	struct nss_dp_plane_ref old;
++	bool was_open;
++#endif
++
++	if (!netdev || !dp_ops || !dpc)
++		return -EINVAL;
++	dp_dev = netdev_priv(netdev);
+ 
+ 	if (!dp_ops->open || !dp_ops->close || !dp_ops->link_state
+ 		|| !dp_ops->mac_addr || !dp_ops->change_mtu || !dp_ops->xmit
+@@ -92,6 +300,49 @@ int nss_dp_override_data_plane(struct net_device *netdev,
+ 		return -EINVAL;
+ 	}
+ 
++#ifdef NSS_DP_IPQ807X
++	ASSERT_RTNL();
++	if (!dpc || dpc->dev != netdev)
++		return -EINVAL;
++	if (nss_dp_plane_is_quarantined(dp_dev))
++		return -ENODEV;
++	/* Only the initial EDMA-to-NSS takeover is supported. */
++	if (dp_dev->plane_pending ||
++			(dp_dev->drv_flags & NSS_DP_PRIV_FLAG(INIT_OVERRIDE)))
++		return -EBUSY;
++
++	was_open = test_bit(__NSS_DP_UP, &dp_dev->flags);
++	nss_dp_plane_quiesce(dp_dev);
++	old.ops = dp_dev->data_plane_ops;
++	old.dpc = dp_dev->dpc;
++	/* Writer-owned callbacks do not re-enter the closed reader gate. */
++	if (was_open && nss_dp_close_data_plane(dp_dev, &old))
++		goto quarantine;
++	if ((dp_dev->drv_flags & NSS_DP_PRIV_FLAG(INIT_DONE)) &&
++			old.ops->deinit(old.dpc))
++		goto quarantine;
++	dp_dev->drv_flags &= ~NSS_DP_PRIV_FLAG(INIT_DONE);
++	nss_dp_reset_netdev_features(netdev);
++
++	/* Keep admission closed until RX registration and start complete. */
++	spin_lock_bh(&dp_dev->plane_lock);
++	dp_dev->data_plane_ops = dp_ops;
++	dp_dev->dpc = dpc;
++	spin_unlock_bh(&dp_dev->plane_lock);
++	if (dp_ops->init(dpc))
++		goto quarantine;
++	dp_dev->drv_flags |= NSS_DP_PRIV_FLAG(INIT_OVERRIDE) |
++				NSS_DP_PRIV_FLAG(INIT_DONE);
++	dp_dev->plane_pending = true;
++	dp_dev->plane_was_open = was_open;
++	return 0;
++
++quarantine:
++	nss_dp_plane_quarantine(dp_dev);
++	netdev_err(netdev, "Data plane takeover failed; permanently isolated\n");
++	return -EIO;
++#else
++
+ 	/*
+ 	 * If this data plane is up, close the netdev to force TX/RX stop, and
+ 	 * also reset the features
+@@ -130,6 +381,7 @@ int nss_dp_override_data_plane(struct net_device *netdev,
+ 	dp_dev->drv_flags |= NSS_DP_PRIV_FLAG(INIT_DONE);
+ 
+ 	return 0;
++#endif
+ }
+ EXPORT_SYMBOL(nss_dp_override_data_plane);
+ 
+@@ -140,7 +392,39 @@ EXPORT_SYMBOL(nss_dp_override_data_plane);
+ void nss_dp_start_data_plane(struct net_device *netdev,
+ 			     struct nss_dp_data_plane_ctx *dpc)
+ {
+-	struct nss_dp_dev *dp_dev = (struct nss_dp_dev *)netdev_priv(netdev);
++	struct nss_dp_dev *dp_dev;
++
++#ifdef NSS_DP_IPQ807X
++	struct nss_dp_plane_ref ref;
++	bool was_open;
++#endif
++
++	if (!netdev)
++		return;
++	dp_dev = netdev_priv(netdev);
++#ifdef NSS_DP_IPQ807X
++	ASSERT_RTNL();
++	if (nss_dp_plane_is_quarantined(dp_dev))
++		return;
++	if (!dp_dev->plane_pending || dp_dev->dpc != dpc) {
++		netdev_err(netdev, "Invalid data plane readiness; permanently isolated\n");
++		nss_dp_plane_quarantine(dp_dev);
++		return;
++	}
++	ref.ops = dp_dev->data_plane_ops;
++	ref.dpc = dp_dev->dpc;
++	was_open = dp_dev->plane_was_open;
++	if (was_open && nss_dp_open_data_plane(dp_dev, &ref)) {
++		nss_dp_plane_quarantine(dp_dev);
++		netdev_err(netdev, "Data plane start failed; permanently isolated\n");
++		return;
++	}
++	dp_dev->plane_pending = false;
++	dp_dev->plane_was_open = false;
++	nss_dp_plane_resume(dp_dev);
++	if (was_open)
++		nss_dp_activate_data_plane(dp_dev);
++#else
+ 
+ 	if (test_bit(__NSS_DP_UP, &dp_dev->flags)) {
+ 		netdev_dbg(netdev, "This netdev already up, something is wrong\n");
+@@ -153,6 +437,7 @@ void nss_dp_start_data_plane(struct net_device *netdev,
+ 	}
+ 
+ 	netdev->netdev_ops->ndo_open(dp_dev->netdev);
++#endif
+ }
+ EXPORT_SYMBOL(nss_dp_start_data_plane);
+ 
+@@ -162,7 +447,17 @@ EXPORT_SYMBOL(nss_dp_start_data_plane);
+  */
+ void nss_dp_restore_data_plane(struct net_device *netdev)
+ {
+-	struct nss_dp_dev *dp_dev = (struct nss_dp_dev *)netdev_priv(netdev);
++	struct nss_dp_dev *dp_dev;
++
++	if (!netdev)
++		return;
++	dp_dev = netdev_priv(netdev);
++
++#ifdef NSS_DP_IPQ807X
++	ASSERT_RTNL();
++	/* IRQ/NAPI may already be gone: do not send NSS close/link commands. */
++	nss_dp_plane_quarantine(dp_dev);
++#else
+ 
+ 	/*
+ 	 * If this data plane is up, close the netdev to force TX/RX stop, and
+@@ -179,6 +474,7 @@ void nss_dp_restore_data_plane(struct net_device *netdev)
+ 	/*
+ 	 * TODO: Re-initialize EDMA dataplane
+ 	 */
++#endif
+ }
+ EXPORT_SYMBOL(nss_dp_restore_data_plane);
+ 
+diff --git a/nss_dp_ethtools.c b/nss_dp_ethtools.c
+index a9bd3cc..8f1b337 100644
+--- a/nss_dp_ethtools.c
++++ b/nss_dp_ethtools.c
+@@ -33,13 +33,16 @@ static void nss_dp_get_ethtool_stats(struct net_device *netdev,
+ {
+ 	struct nss_dp_dev *dp_priv = (struct nss_dp_dev *)netdev_priv(netdev);
+ 	struct nss_dp_gmac_stats dp_stats;
++	struct nss_dp_plane_ref ref;
+ 
+ 	/*
+ 	 * Get the DMA Driver statistics from the data plane if available
+ 	 */
+ 	memset(&dp_stats, 0, sizeof(struct nss_dp_gmac_stats));
+-	if (dp_priv->data_plane_ops->get_stats) {
+-		dp_priv->data_plane_ops->get_stats(dp_priv->dpc, &dp_stats);
++	if (nss_dp_plane_get(dp_priv, &ref)) {
++		if (ref.ops->get_stats)
++			ref.ops->get_stats(ref.dpc, &dp_stats);
++		nss_dp_plane_put(dp_priv);
+ 	}
+ 
+ 	/*
+diff --git a/nss_dp_main.c b/nss_dp_main.c
+index 79d7903..5afa313 100644
+--- a/nss_dp_main.c
++++ b/nss_dp_main.c
+@@ -27,6 +27,7 @@
+ #include <linux/of_address.h>
+ #include <linux/of_mdio.h>
+ #include <linux/phy.h>
++#include <linux/rtnetlink.h>
+ 
+ #if defined(NSS_DP_PPE_SUPPORT)
+ #include <fal/fal_vsi.h>
+@@ -219,6 +220,7 @@ static int32_t nss_dp_change_mtu(struct net_device *netdev, int32_t newmtu)
+ {
+ 	int ret = -EINVAL;
+ 	struct nss_dp_dev *dp_priv;
++	struct nss_dp_plane_ref ref;
+ 
+ 	if (!netdev)
+ 		return ret;
+@@ -231,28 +233,33 @@ static int32_t nss_dp_change_mtu(struct net_device *netdev, int32_t newmtu)
+ 	if (!(dp_priv->drv_flags & NSS_DP_PRIV_FLAG(INIT_DONE))) {
+ 		return ret;
+ 	}
++	if (!nss_dp_plane_get(dp_priv, &ref))
++		return -ENODEV;
+ 
+ 	/*
+ 	 * Configure the new MTU value to underlying HW.
+ 	 */
+ 	if (dp_priv->gmac_hal_ops->setmaxframe(dp_priv->gmac_hal_ctx, newmtu)) {
+ 		netdev_dbg(netdev, "GMAC MTU change failed: %d\n", newmtu);
+-		return ret;
++		goto out;
+ 	}
+ 
+ 	/*
+ 	 * Let the underlying data plane decide if the newmtu is applicable.
+ 	 */
+-	if (dp_priv->data_plane_ops->change_mtu(dp_priv->dpc, newmtu)) {
++	if (ref.ops->change_mtu(ref.dpc, newmtu)) {
+ 		netdev_dbg(netdev, "Data plane change mtu failed: %d\n",
+ 								newmtu);
+ 		dp_priv->gmac_hal_ops->setmaxframe(dp_priv->gmac_hal_ctx,
+ 								netdev->mtu);
+-		return ret;
++		goto out;
+ 	}
+ 
+ 	netdev->mtu = newmtu;
+-	return 0;
++	ret = 0;
++out:
++	nss_dp_plane_put(dp_priv);
++	return ret;
+ }
+ 
+ /*
+@@ -262,6 +269,7 @@ static int32_t nss_dp_set_mac_address(struct net_device *netdev, void *macaddr)
+ {
+ 	struct nss_dp_dev *dp_priv;
+ 	struct sockaddr *addr = (struct sockaddr *)macaddr;
++	struct nss_dp_plane_ref ref;
+ 	int ret = 0;
+ 
+ 	if (!netdev)
+@@ -284,9 +292,12 @@ static int32_t nss_dp_set_mac_address(struct net_device *netdev, void *macaddr)
+ 	ret = eth_prepare_mac_addr_change(netdev, addr);
+ 	if (ret)
+ 		return ret;
++	if (!nss_dp_plane_get(dp_priv, &ref))
++		return -ENODEV;
+ 
+-	if (dp_priv->data_plane_ops->mac_addr(dp_priv->dpc, (uint8_t *)addr->sa_data)) {
++	if (ref.ops->mac_addr(ref.dpc, (uint8_t *)addr->sa_data)) {
+ 		netdev_dbg(netdev, "Data plane set MAC address failed\n");
++		nss_dp_plane_put(dp_priv);
+ 		return -EAGAIN;
+ 	}
+ 
+@@ -294,6 +305,7 @@ static int32_t nss_dp_set_mac_address(struct net_device *netdev, void *macaddr)
+ 			(uint8_t *)addr->sa_data);
+ 
+ 	eth_commit_mac_addr_change(netdev, addr);
++	nss_dp_plane_put(dp_priv);
+ 
+ 	return 0;
+ }
+@@ -342,6 +354,8 @@ static void nss_dp_get_stats64(struct net_device *netdev,
+ static netdev_tx_t nss_dp_xmit(struct sk_buff *skb, struct net_device *netdev)
+ {
+ 	struct nss_dp_dev *dp_priv;
++	struct nss_dp_plane_ref ref;
++	netdev_tx_t ret;
+ 
+ 	if (!skb || !netdev)
+ 		return NETDEV_TX_OK;
+@@ -349,9 +363,108 @@ static netdev_tx_t nss_dp_xmit(struct sk_buff *skb, struct net_device *netdev)
+ 	dp_priv = (struct nss_dp_dev *)netdev_priv(netdev);
+ 	netdev_dbg(netdev, "Tx packet, len %d\n", skb->len);
+ 
+-	return dp_priv->data_plane_ops->xmit(dp_priv->dpc, skb);
++	if (!nss_dp_plane_get(dp_priv, &ref)) {
++		dev_core_stats_tx_dropped_inc(netdev);
++		dev_kfree_skb_any(skb);
++		return NETDEV_TX_OK;
++	}
++	ret = ref.ops->xmit(ref.dpc, skb);
++	nss_dp_plane_put(dp_priv);
++	return ret;
+ }
+ 
++#ifdef NSS_DP_IPQ807X
++/*
++ * RTNL serializes these control paths. A normal ndo caller retains a reader;
++ * the initial takeover writer instead owns the closed, drained callback pair.
++ * No helper below acquires admission again, so writer callbacks cannot deadlock
++ * by waiting for their own reference.
++ */
++int nss_dp_close_data_plane(struct nss_dp_dev *dp,
++			  const struct nss_dp_plane_ref *ref)
++{
++	struct net_device *netdev = dp->netdev;
++
++	ASSERT_RTNL();
++	netif_stop_queue(netdev);
++	netif_carrier_off(netdev);
++	nss_dp_plane_stop_phy(dp);
++	clear_bit(__NSS_DP_UP, &dp->flags);
++	dp->link_state = __NSS_DP_LINK_DOWN;
++
++	if (ref->ops->link_state(ref->dpc, 0))
++		return -EAGAIN;
++#if defined(NSS_DP_PPE_SUPPORT)
++	if (ref->ops->vsi_unassign &&
++			ref->ops->vsi_unassign(ref->dpc, dp->vsi))
++		return -EAGAIN;
++#endif
++	if (dp->gmac_hal_ops->stop &&
++			dp->gmac_hal_ops->stop(dp->gmac_hal_ctx))
++		return -EAGAIN;
++	if (ref->ops->close(ref->dpc))
++		return -EAGAIN;
++	return 0;
++}
++
++int nss_dp_open_data_plane(struct nss_dp_dev *dp,
++			 const struct nss_dp_plane_ref *ref)
++{
++	struct net_device *netdev = dp->netdev;
++
++	ASSERT_RTNL();
++	netif_carrier_off(netdev);
++	if (!(dp->drv_flags & NSS_DP_PRIV_FLAG(INIT_DONE))) {
++		if (ref->ops->init(ref->dpc))
++			return -ENOMEM;
++		dp->drv_flags |= NSS_DP_PRIV_FLAG(INIT_DONE);
++	}
++#if defined(NSS_DP_MAC_POLL_SUPPORT)
++	if (!dp_global_ctx.enable_polling_task) {
++		ssdk_mac_sw_sync_work_start(NSS_DP_EDMA_SWITCH_DEV_ID);
++		dp_global_ctx.enable_polling_task = true;
++	}
++#endif
++	ref->ops->set_features(ref->dpc);
++#if defined(NSS_DP_PPE_SUPPORT)
++	if (ref->ops->vsi_assign &&
++			ref->ops->vsi_assign(ref->dpc, dp->vsi))
++		return -EAGAIN;
++#endif
++	if (ref->ops->mac_addr(ref->dpc, (unsigned char *)netdev->dev_addr))
++		return -EAGAIN;
++	if (ref->ops->change_mtu(ref->dpc, netdev->mtu))
++		return -EAGAIN;
++	if (ref->ops->open(ref->dpc, 0, 0, 0))
++		return -EAGAIN;
++	if (dp->gmac_hal_ops->start &&
++			dp->gmac_hal_ops->start(dp->gmac_hal_ctx))
++		return -EAGAIN;
++	if (!dp->phydev && ref->ops->link_state(ref->dpc, 1))
++		return -EAGAIN;
++	/* Publish UP only after the hardware/control operations succeeded. */
++	set_bit(__NSS_DP_UP, &dp->flags);
++	return 0;
++}
++
++void nss_dp_activate_data_plane(struct nss_dp_dev *dp)
++{
++	ASSERT_RTNL();
++	if (dp->phydev) {
++		dp->link_state = __NSS_DP_LINK_DOWN;
++		if (!dp->phy_started) {
++			phy_start(dp->phydev);
++			dp->phy_started = true;
++			phy_start_aneg(dp->phydev);
++		}
++	} else {
++		dp->link_state = __NSS_DP_LINK_UP;
++		netif_carrier_on(dp->netdev);
++	}
++	netif_start_queue(dp->netdev);
++}
++#endif
++
+ /*
+  * nss_dp_close()
+  */
+@@ -359,6 +472,24 @@ static int nss_dp_close(struct net_device *netdev)
+ {
+ 	struct nss_dp_dev *dp_priv = (struct nss_dp_dev *)netdev_priv(netdev);
+ 
++#ifdef NSS_DP_IPQ807X
++	struct nss_dp_plane_ref ref;
++	int ret;
++
++	ASSERT_RTNL();
++	if (!nss_dp_plane_get(dp_priv, &ref)) {
++		/* Quarantine ndo_stop is a host-only, repeatable no-op. */
++		netif_stop_queue(netdev);
++		netif_carrier_off(netdev);
++		return 0;
++	}
++	ret = nss_dp_close_data_plane(dp_priv, &ref);
++	nss_dp_plane_put(dp_priv);
++	if (ret)
++		nss_dp_plane_quarantine(dp_priv);
++	return ret;
++#else
++
+ 	if (!dp_priv)
+ 		return -EINVAL;
+ 
+@@ -411,6 +542,7 @@ static int nss_dp_close(struct net_device *netdev)
+ 	clear_bit(__NSS_DP_UP, &dp_priv->flags);
+ 
+ 	return 0;
++#endif
+ }
+ 
+ /*
+@@ -420,6 +552,22 @@ static int nss_dp_open(struct net_device *netdev)
+ {
+ 	struct nss_dp_dev *dp_priv = (struct nss_dp_dev *)netdev_priv(netdev);
+ 
++#ifdef NSS_DP_IPQ807X
++	struct nss_dp_plane_ref ref;
++	int ret;
++
++	ASSERT_RTNL();
++	if (!nss_dp_plane_get(dp_priv, &ref))
++		return -ENODEV;
++	ret = nss_dp_open_data_plane(dp_priv, &ref);
++	if (!ret)
++		nss_dp_activate_data_plane(dp_priv);
++	nss_dp_plane_put(dp_priv);
++	if (ret)
++		nss_dp_plane_quarantine(dp_priv);
++	return ret;
++#else
++
+ 	if (!dp_priv)
+ 		return -EINVAL;
+ 
+@@ -515,6 +663,7 @@ static int nss_dp_open(struct net_device *netdev)
+ 	}
+ 
+ 	return 0;
++#endif
+ }
+ 
+ #ifdef CONFIG_RFS_ACCEL
+@@ -526,6 +675,7 @@ static int nss_dp_rx_flow_steer(struct net_device *netdev, const struct sk_buff
+ 				uint16_t rxq, uint32_t flow)
+ {
+ 	struct nss_dp_dev *dp_priv;
++	struct nss_dp_plane_ref ref;
+ 	struct netdev_rx_queue *rxqueue;
+ 	struct rps_sock_flow_table *sock_flow_table;
+ 	struct rps_dev_flow_table *flow_table;
+@@ -535,6 +685,7 @@ static int nss_dp_rx_flow_steer(struct net_device *netdev, const struct sk_buff
+ 	uint32_t hash;
+ 	uint32_t rfscpu;
+ 	uint32_t rxcpu;
++	int ret = -EINVAL;
+ 
+ 	if (!netdev)
+ 		return -EINVAL;
+@@ -542,6 +693,8 @@ static int nss_dp_rx_flow_steer(struct net_device *netdev, const struct sk_buff
+ 	dp_priv = (struct nss_dp_dev *)netdev_priv(netdev);
+ 	if (!dp_priv)
+ 		return -EINVAL;
++	if (!nss_dp_plane_get(dp_priv, &ref))
++		return -ENODEV;
+ 
+ 	rxqueue = netdev->_rx;
+ 
+@@ -553,7 +706,7 @@ static int nss_dp_rx_flow_steer(struct net_device *netdev, const struct sk_buff
+ 	flow_table = rcu_dereference(rxqueue->rps_flow_table);
+ 	if (!flow_table) {
+ 		netdev_dbg(netdev, "RX queue RPS flow table not found\n");
+-		return -EINVAL;
++		goto out;
+ 	}
+ 
+ 	hash = skb_get_hash(skb);
+@@ -563,40 +716,47 @@ static int nss_dp_rx_flow_steer(struct net_device *netdev, const struct sk_buff
+ 	sock_flow_table = rcu_dereference(net_hotdata.rps_sock_flow_table);
+ 	if (!sock_flow_table) {
+ 		netdev_dbg(netdev, "Global RPS flow table not found\n");
+-		return -EINVAL;
++		goto out;
+ 	}
+ 
+ 	rfscpu = sock_flow_table->ents[hash & sock_flow_table->mask];
+ 	rfscpu &= net_hotdata.rps_cpu_mask;
+ 
+-	if (rxcpu == rfscpu)
+-		return 0;
++	if (rxcpu == rfscpu) {
++		ret = 0;
++		goto out;
++	}
+ 
+ 	/*
+ 	 * check rx_flow_steer is defined in data plane ops
+ 	 */
+-	if (!dp_priv->data_plane_ops->rx_flow_steer) {
++	if (!ref.ops->rx_flow_steer) {
+ 		netdev_dbg(netdev, "Data plane ops not defined for flow steer\n");
+-		return -EINVAL;
++		goto out;
+ 	}
+ 
+ 	/*
+ 	 * Delete the old flow rule
+ 	 */
+-	if (dp_priv->data_plane_ops->rx_flow_steer(dp_priv->dpc, skb, rxcpu, false)) {
++	if (ref.ops->rx_flow_steer(ref.dpc, skb, rxcpu, false)) {
+ 		netdev_dbg(netdev, "Data plane delete flow rule failed\n");
+-		return -EAGAIN;
++		ret = -EAGAIN;
++		goto out;
+ 	}
+ 
+ 	/*
+ 	 * Add the new flow rule
+ 	 */
+-	if (dp_priv->data_plane_ops->rx_flow_steer(dp_priv->dpc, skb, rfscpu, true)) {
++	if (ref.ops->rx_flow_steer(ref.dpc, skb, rfscpu, true)) {
+ 		netdev_dbg(netdev, "Data plane add flow rule failed\n");
+-		return -EAGAIN;
++		ret = -EAGAIN;
++		goto out;
+ 	}
+ 
+-	return 0;
++	ret = 0;
++out:
++	nss_dp_plane_put(dp_priv);
++	return ret;
+ }
+ #endif
+ 
+@@ -921,35 +1081,42 @@ bool nss_dp_is_phy_dev(struct net_device *dev)
+ static void nss_dp_adjust_link(struct net_device *netdev)
+ {
+ 	struct nss_dp_dev *dp_priv = netdev_priv(netdev);
+-	int current_state = dp_priv->link_state;
++	struct nss_dp_plane_ref ref;
++	int current_state;
+ 
+-	if (!test_bit(__NSS_DP_UP, &dp_priv->flags))
++	if (!nss_dp_plane_get(dp_priv, &ref))
+ 		return;
++	current_state = dp_priv->link_state;
++
++	if (!test_bit(__NSS_DP_UP, &dp_priv->flags))
++		goto out;
+ 
+ 	if (dp_priv->phydev->link && (current_state == __NSS_DP_LINK_UP))
+-		return;
++		goto out;
+ 
+ 	if (!dp_priv->phydev->link && (current_state == __NSS_DP_LINK_DOWN))
+-		return;
++		goto out;
+ 
+ 	if (current_state == __NSS_DP_LINK_DOWN) {
+ 		netdev_info(netdev, "PHY Link up speed: %d\n",
+ 						dp_priv->phydev->speed);
+-		if (dp_priv->data_plane_ops->link_state(dp_priv->dpc, 1)) {
++		if (ref.ops->link_state(ref.dpc, 1)) {
+ 			netdev_dbg(netdev, "Data plane set link up failed\n");
+-			return;
++			goto out;
+ 		}
+ 		dp_priv->link_state = __NSS_DP_LINK_UP;
+ 		netif_carrier_on(netdev);
+ 	} else {
+ 		netdev_info(netdev, "PHY Link is down\n");
+-		if (dp_priv->data_plane_ops->link_state(dp_priv->dpc, 0)) {
++		if (ref.ops->link_state(ref.dpc, 0)) {
+ 			netdev_dbg(netdev, "Data plane set link down failed\n");
+-			return;
++			goto out;
+ 		}
+ 		dp_priv->link_state = __NSS_DP_LINK_DOWN;
+ 		netif_carrier_off(netdev);
+ 	}
++out:
++	nss_dp_plane_put(dp_priv);
+ }
+ 
+ static void nss_dp_phy_disconnect(struct nss_dp_dev *dp_priv)
+@@ -1012,6 +1179,7 @@ static int32_t nss_dp_probe(struct platform_device *pdev)
+ 
+ 	dp_priv->pdev = pdev;
+ 	dp_priv->netdev = netdev;
++	nss_dp_plane_init(dp_priv);
+ 	netdev->watchdog_timeo = 5 * HZ;
+ 	netdev->priv_flags |= IFF_LIVE_ADDR_CHANGE;
+ 	netdev->netdev_ops = &nss_dp_netdev_ops;
+@@ -1180,14 +1348,37 @@ static void nss_dp_remove(struct platform_device *pdev)
+ 	struct nss_dp_dev *dp_priv;
+ 	struct nss_gmac_hal_ops *hal_ops;
+ 	struct nss_dp_data_plane_ops *dp_ops;
++#ifdef NSS_DP_IPQ807X
++	struct nss_dp_data_plane_ctx *old_dpc;
++	bool deinit_host;
++#endif
+ 
+ 	for (i = 0; i < NSS_DP_HAL_MAX_PORTS; i++) {
+ 		dp_priv = dp_global_ctx.nss_dp[i];
+ 		if (!dp_priv)
+ 			continue;
+ 
+-		dp_ops = dp_priv->data_plane_ops;
+ 		hal_ops = dp_priv->gmac_hal_ops;
++#ifdef NSS_DP_IPQ807X
++		/*
++		 * NSS registry readers must already have been independently
++		 * drained by its owner. This gate protects callback/context
++		 * retirement, not the netdev lifetime held by that registry.
++		 */
++		rtnl_lock();
++		dp_ops = dp_priv->data_plane_ops;
++		old_dpc = dp_priv->dpc;
++		deinit_host = !nss_dp_plane_is_quarantined(dp_priv) &&
++			!(dp_priv->drv_flags & NSS_DP_PRIV_FLAG(INIT_OVERRIDE)) &&
++			(dp_priv->drv_flags & NSS_DP_PRIV_FLAG(INIT_DONE));
++		nss_dp_plane_quarantine(dp_priv);
++		/* Preserve initial host-resource cleanup, not NSS commands. */
++		if (deinit_host)
++			dp_ops->deinit(old_dpc);
++		rtnl_unlock();
++#else
++		dp_ops = dp_priv->data_plane_ops;
++#endif
+ 
+ 		nss_dp_phy_disconnect(dp_priv);
+ 
+@@ -1197,7 +1388,9 @@ static void nss_dp_remove(struct platform_device *pdev)
+ 		 */
+ 		fal_port_vsi_set(0, dp_priv->macid, 0xFFFF);
+ #endif
++#ifndef NSS_DP_IPQ807X
+ 		dp_ops->deinit(dp_priv->dpc);
++#endif
+ 
+ #ifdef CONFIG_NET_SWITCHDEV
+ 		nss_dp_switchdev_cleanup(dp_priv->netdev);
+

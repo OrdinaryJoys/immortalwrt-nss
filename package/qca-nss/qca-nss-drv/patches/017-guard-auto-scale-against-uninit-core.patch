@@ -1,40 +1,20 @@
 From: OpenWrt Build System <openwrt@localhost>
 Subject: [PATCH] nss-drv: reject frequency work before core init
 
-The frequency sysctls are registered before probe-gated NSS cores have
-finished booting. A write in that window can queue clock and regulator work
-against uninitialized resources. Reject those requests at both sysctl handlers
-and guard the IPQ60xx and IPQ807x workqueue consumers so every producer is
-covered.
+Mechanical context refresh only against exact DRV
+6aa14c78e097b29c493ff2fef87e4d35906b2b5a plus fixed source
+2e207fcae4479bc55211fb83395ae2954b39b951 preceding patches.
 
-Source: VIKINGYFY/immortalwrt patch 017.
+The original 017 current_freq hunk anticipates pre-012 guard braces.
+This refresh is generated from actual pre/post-017 full trees; its
+core-readiness guards and IPQ60xx/IPQ807x consumers are byte-identical
+to the original relaxed-match output. No new behavior is introduced.
 
---- a/nss_init.c
-+++ b/nss_init.c
-@@ -190,6 +190,10 @@ static int nss_current_freq_handler(cons
- 		return ret;
- 	}
- 
-+	/* Delayed probe can expose this sysctl before the core is ready. */
-+	if (nss_top_main.nss[NSS_CORE_0].state != NSS_CORE_STATE_INITIALIZED)
-+		return ret;
-+
- 	/*
- 	 * Check if frequency exists in frequency Table
- 	 */
-@@ -255,6 +259,9 @@ static int nss_auto_scale_handler(const
- 		return ret;
- 	}
- 
-+	if (nss_top_main.nss[NSS_CORE_0].state != NSS_CORE_STATE_INITIALIZED)
-+		return ret;
-+
- 	if (nss_cmd_buf.auto_scale != 1) {
- 		/*
- 		 * Disable frequency scaling, but keep core stats reporting
+diff --git a/nss_hal/ipq60xx/nss_hal_pvt.c b/nss_hal/ipq60xx/nss_hal_pvt.c
+index fb0683d..093f0ba 100644
 --- a/nss_hal/ipq60xx/nss_hal_pvt.c
 +++ b/nss_hal/ipq60xx/nss_hal_pvt.c
-@@ -141,6 +141,13 @@ void nss_hal_wq_function(struct work_str
+@@ -141,6 +141,13 @@ void nss_hal_wq_function(struct work_struct *work)
  {
  	nss_work_t *my_work = (nss_work_t *)work;
  
@@ -48,9 +28,11 @@ Source: VIKINGYFY/immortalwrt patch 017.
  	mutex_lock(&nss_top_main.wq_lock);
  
  	nss_freq_change(&nss_top_main.nss[NSS_CORE_0], my_work->frequency, my_work->stats_enable, 0);
+diff --git a/nss_hal/ipq807x/nss_hal_pvt.c b/nss_hal/ipq807x/nss_hal_pvt.c
+index d155111..2917ef5 100644
 --- a/nss_hal/ipq807x/nss_hal_pvt.c
 +++ b/nss_hal/ipq807x/nss_hal_pvt.c
-@@ -149,6 +149,13 @@ void nss_hal_wq_function(struct work_str
+@@ -149,6 +149,13 @@ void nss_hal_wq_function(struct work_struct *work)
  {
  	nss_work_t *my_work = (nss_work_t *)work;
  
@@ -64,3 +46,28 @@ Source: VIKINGYFY/immortalwrt patch 017.
  	mutex_lock(&nss_top_main.wq_lock);
  
  	if (my_work->frequency > NSS_FREQ_1497) {
+diff --git a/nss_init.c b/nss_init.c
+index 4dd8e15..497a8e2 100644
+--- a/nss_init.c
++++ b/nss_init.c
+@@ -190,6 +190,10 @@ static int nss_current_freq_handler(const struct ctl_table *ctl, int write, void
+ 
+ 	printk("Frequency Set to %d\n", nss_cmd_buf.current_freq);
+ 
++	/* Delayed probe can expose this sysctl before the core is ready. */
++	if (nss_top_main.nss[NSS_CORE_0].state != NSS_CORE_STATE_INITIALIZED)
++		return ret;
++
+ 	/*
+ 	 * Check if frequency exists in frequency Table
+ 	 */
+@@ -255,6 +259,9 @@ static int nss_auto_scale_handler(const struct ctl_table *ctl, int write, void _
+ 		return ret;
+ 	}
+ 
++	if (nss_top_main.nss[NSS_CORE_0].state != NSS_CORE_STATE_INITIALIZED)
++		return ret;
++
+ 	if (nss_cmd_buf.auto_scale != 1) {
+ 		/*
+ 		 * Disable frequency scaling, but keep core stats reporting

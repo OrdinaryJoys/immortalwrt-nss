@@ -1,0 +1,621 @@
+From: AX6 offline containment candidate
+Subject: [PATCH] ipq807x: contain NSS detach without EDMA hot restore
+
+Base: qca-nss-drv 6aa14c78e097b29c493ff2fef87e4d35906b2b5a
+Prepared with source 2e207fcae4479bc55211fb83395ae2954b39b951 current
+20 patches; 012/017 context-only refreshes preserve the original prepared tree.
+Requires the separately frozen qca-nss-dp 009 fail-closed callback gate.
+
+IPQ807x only: close/cancel registration outside RTNL, quarantine host DP
+with RX/ACK handlers retained, join all core NAPI poll tails before IRQ
+free, then clear physical RX registrations and ndpp under RTNL. Complete
+NAPI ownership after a returning emergency notify, without IRQ rearm or
+changes to notify/panic/firmware policy. Reject late probe/re-register and
+independent sysfs bind/unbind. No firmware, EDMA ring/IRQ parameter or
+hardware reinitialization changes.
+
+This is a permanent host-only containment candidate, not general external
+client/platform/module lifetime safety, general crash recovery, firmware
+recovery, or live acceptance.
+
+diff --git a/nss_core.c b/nss_core.c
+index 8764a92..826824f 100644
+--- a/nss_core.c
++++ b/nss_core.c
+@@ -2549,6 +2549,10 @@ int nss_core_handle_napi_emergency(struct napi_struct *napi, int budget)
+ 				int_ctx->nss_ctx->id, int_ctx->cause);
+ 	nss_fw_coredump_notify(int_ctx->nss_ctx, 0);
+ 
++#ifdef NSS_HAL_IPQ807x_SUPPORT
++	/* A returning notify must release NAPI ownership; never rearm crash IRQ. */
++	napi_complete(napi);
++#endif
+ 	return 0;
+ }
+ 
+diff --git a/nss_data_plane/include/nss_data_plane.h b/nss_data_plane/include/nss_data_plane.h
+index f20d7fa..6851d3f 100644
+--- a/nss_data_plane/include/nss_data_plane.h
++++ b/nss_data_plane/include/nss_data_plane.h
+@@ -45,6 +45,20 @@ int nss_data_plane_init_delay_work(void);
+  */
+ void nss_data_plane_destroy_delay_work(void);
+ 
++#ifdef NSS_HAL_IPQ807x_SUPPORT
++/* Never reset the stop latch during this module lifetime. */
++bool nss_data_plane_registration_stopped(void);
++/* Process context outside RTNL; drains queued/running registration work. */
++void nss_data_plane_stop_registration(void);
++/*
++ * RTNL held; drains DP readers without clearing NSS RX/context metadata.
++ * HAL must call before stopping RX IRQ/NAPI, then drain ALL cores before
++ * data_plane_unregister() clears any RX registry/ndpp.  This is not a
++ * general external-client/platform/module lifetime barrier.
++ */
++void nss_data_plane_quarantine_registered(void);
++#endif
++
+ /*
+  * nss_data_plane_ops defines the API required to support multiple data plane targets
+  */
+diff --git a/nss_data_plane/nss_data_plane.c b/nss_data_plane/nss_data_plane.c
+index a0f3649..fbf62ec 100644
+--- a/nss_data_plane/nss_data_plane.c
++++ b/nss_data_plane/nss_data_plane.c
+@@ -18,11 +18,19 @@
+ #include "nss_core.h"
+ #include "nss_tx_rx_common.h"
+ #include "nss_data_plane_hal.h"
++#ifdef NSS_HAL_IPQ807x_SUPPORT
++#include <linux/rtnetlink.h>
++#endif
+ 
+ /*
+  * nss_data_plane_param
+  */
+ struct nss_data_plane_param nss_data_plane_params[NSS_DP_MAX_INTERFACES];
++#ifdef NSS_HAL_IPQ807x_SUPPORT
++/* RTNL-owned; callback tables are prepared once before their publication. */
++static bool nss_data_plane_ops_prepared;
++static bool nss_data_plane_hal_registered[NSS_MAX_CORES];
++#endif
+ 
+ /*
+  * __nss_data_plane_init()
+@@ -237,9 +245,20 @@ static bool nss_data_plane_register_to_nss_dp(struct nss_ctx_instance *nss_ctx,
+ 	struct nss_data_plane_param *ndpp = &nss_data_plane_params[if_num];
+ 	struct nss_top_instance *nss_top = nss_ctx->nss_top;
+ 	struct net_device *netdev;
++#ifndef NSS_HAL_IPQ807x_SUPPORT
+ 	bool is_open;
++#endif
+ 	int core;
+ 
++#ifdef NSS_HAL_IPQ807x_SUPPORT
++	ASSERT_RTNL();
++	if (nss_data_plane_registration_stopped())
++		return false;
++	/* Reject before modifying the same context an old reader may retain. */
++	if (ndpp->dpc.dev || ndpp->nss_ctx)
++		return false;
++#endif
++
+ 	netdev = nss_dp_get_netdev_by_nss_if_num(if_num);
+ 	if (!netdev) {
+ 		nss_info("%px: Platform don't have data plane%d enabled, \
+@@ -248,7 +267,9 @@ static bool nss_data_plane_register_to_nss_dp(struct nss_ctx_instance *nss_ctx,
+ 		return false;
+ 	}
+ 
++#ifndef NSS_HAL_IPQ807x_SUPPORT
+ 	is_open = nss_dp_is_in_open_state(netdev);
++#endif
+ 	ndpp->dpc.dev = netdev;
+ 	ndpp->nss_ctx = nss_ctx;
+ 	ndpp->if_num = if_num;
+@@ -258,7 +279,9 @@ static bool nss_data_plane_register_to_nss_dp(struct nss_ctx_instance *nss_ctx,
+ 	/*
+ 	 * Add data plane ops applicable to this SoC.
+ 	 */
++#ifndef NSS_HAL_IPQ807x_SUPPORT
+ 	nss_data_plane_hal_add_dp_ops(&dp_ops);
++#endif
+ 
+ 	/*
+ 	 * Check if NSS NW processing to be bypassed for this data plane
+@@ -292,21 +315,44 @@ static bool nss_data_plane_register_to_nss_dp(struct nss_ctx_instance *nss_ctx,
+ 	/*
+ 	 * Now we are registered and our side is ready, if the data plane was opened, ask it to start again
+ 	 */
++#ifdef NSS_HAL_IPQ807x_SUPPORT
++	/* DP retains the old admin state; DOWN ports must commit readiness too. */
++	nss_dp_start_data_plane(netdev, (struct nss_dp_data_plane_ctx *)ndpp);
++#else
+ 	if (is_open) {
+ 		nss_dp_start_data_plane(netdev, (struct nss_dp_data_plane_ctx *)ndpp);
+ 	}
++#endif
+ 	return true;
+ }
+ 
++#ifdef NSS_HAL_IPQ807x_SUPPORT
++void nss_data_plane_quarantine_registered(void)
++{
++	int i;
++
++	ASSERT_RTNL();
++	/* Keep RX/ACK handlers and ndpp valid until already admitted DP calls exit. */
++	for (i = NSS_DP_START_IFNUM; i < NSS_DP_MAX_INTERFACES; i++) {
++		if (nss_data_plane_params[i].dpc.dev)
++			nss_dp_restore_data_plane(nss_data_plane_params[i].dpc.dev);
++	}
++}
++#endif
++
+ /*
+  * nss_data_plane_unregister_from_nss_dp()
+  */
+ static void nss_data_plane_unregister_from_nss_dp(int if_num)
+ {
++#ifdef NSS_HAL_IPQ807x_SUPPORT
++	ASSERT_RTNL();
++#else
+ 	/*
+ 	 * Do any SoC specific un-registrations.
+ 	 */
+ 	nss_data_plane_hal_unregister(nss_data_plane_params[if_num].nss_ctx);
++#endif
+ 
+ 	nss_dp_restore_data_plane(nss_data_plane_params[if_num].dpc.dev);
+ 	nss_data_plane_params[if_num].dpc.dev = NULL;
+@@ -314,6 +360,9 @@ static void nss_data_plane_unregister_from_nss_dp(int if_num)
+ 	nss_data_plane_params[if_num].if_num = 0;
+ 	nss_data_plane_params[if_num].notify_open = 0;
+ 	nss_data_plane_params[if_num].bypass_nw_process = 0;
++#ifdef NSS_HAL_IPQ807x_SUPPORT
++	nss_data_plane_params[if_num].features = 0;
++#endif
+ }
+ 
+ /*
+@@ -323,6 +372,16 @@ static void __nss_data_plane_register(struct nss_ctx_instance *nss_ctx)
+ {
+ 	int i;
+ 
++#ifdef NSS_HAL_IPQ807x_SUPPORT
++	rtnl_lock();
++	if (nss_data_plane_registration_stopped())
++		goto out;
++	if (!nss_data_plane_ops_prepared) {
++		nss_data_plane_hal_add_dp_ops(&dp_ops);
++		nss_data_plane_ops_prepared = true;
++	}
++#endif
++
+ 	for (i = NSS_DP_START_IFNUM; i < NSS_DP_MAX_INTERFACES; i++) {
+ 		if (!nss_data_plane_register_to_nss_dp(nss_ctx, i)) {
+ 			nss_warning("%px: Register data plane failed for data plane %d\n", nss_ctx, i);
+@@ -334,7 +393,17 @@ static void __nss_data_plane_register(struct nss_ctx_instance *nss_ctx)
+ 	/*
+ 	 * Do any SoC specific registrations.
+ 	 */
++#ifdef NSS_HAL_IPQ807x_SUPPORT
++	if (!nss_data_plane_registration_stopped() &&
++			!nss_data_plane_hal_registered[nss_ctx->id]) {
++		nss_data_plane_hal_register(nss_ctx);
++		nss_data_plane_hal_registered[nss_ctx->id] = true;
++	}
++out:
++	rtnl_unlock();
++#else
+ 	nss_data_plane_hal_register(nss_ctx);
++#endif
+ }
+ 
+ /*
+@@ -344,6 +413,29 @@ static void __nss_data_plane_unregister(void)
+ {
+ 	int i, core;
+ 
++#ifdef NSS_HAL_IPQ807x_SUPPORT
++	/* HAL calls only after stop/cancel, DP drain and ALL receive IRQ/NAPI drain. */
++	rtnl_lock();
++	if (WARN_ON_ONCE(!nss_data_plane_registration_stopped()))
++		goto out;
++	for (core = 0; core < NSS_MAX_CORES; core++) {
++		for (i = NSS_DP_START_IFNUM; i < NSS_DP_MAX_INTERFACES; i++) {
++			if (nss_top_main.nss[core].subsys_dp_register[i].ndev)
++				nss_core_unregister_subsys_dp(&nss_top_main.nss[core], i);
++		}
++		if (nss_data_plane_hal_registered[core]) {
++			nss_data_plane_hal_unregister(&nss_top_main.nss[core]);
++			nss_data_plane_hal_registered[core] = false;
++		}
++	}
++	for (i = NSS_DP_START_IFNUM; i < NSS_DP_MAX_INTERFACES; i++) {
++		if (nss_data_plane_params[i].dpc.dev)
++			nss_data_plane_unregister_from_nss_dp(i);
++	}
++out:
++	rtnl_unlock();
++#else
++
+ 	for (core = 0; core < nss_top_main.num_nss; core++) {
+ 		for (i = NSS_DP_START_IFNUM; i < NSS_DP_MAX_INTERFACES; i++) {
+ 			if (nss_top_main.nss[core].subsys_dp_register[i].ndev) {
+@@ -359,6 +451,7 @@ static void __nss_data_plane_unregister(void)
+ 			}
+ 		}
+ 	}
++#endif
+ }
+ 
+ /*
+diff --git a/nss_data_plane/nss_data_plane_common.c b/nss_data_plane/nss_data_plane_common.c
+index 35cf41a..3a59368 100644
+--- a/nss_data_plane/nss_data_plane_common.c
++++ b/nss_data_plane/nss_data_plane_common.c
+@@ -16,9 +16,47 @@
+ 
+ #include "nss_data_plane.h"
+ #include "nss_core.h"
++#ifdef NSS_HAL_IPQ807x_SUPPORT
++#include <linux/mutex.h>
++#include <linux/spinlock.h>
++#endif
+ 
+ static struct delayed_work nss_data_plane_work;
+ static struct workqueue_struct *nss_data_plane_workqueue;
++#ifdef NSS_HAL_IPQ807x_SUPPORT
++/* The worker never acquires this lifecycle mutex. */
++static DEFINE_MUTEX(nss_data_plane_work_lifecycle_lock);
++static DEFINE_SPINLOCK(nss_data_plane_registration_lock);
++static bool nss_data_plane_registration_closing;
++static bool nss_data_plane_work_initialized;
++
++bool nss_data_plane_registration_stopped(void)
++{
++	unsigned long flags;
++	bool stopped;
++
++	spin_lock_irqsave(&nss_data_plane_registration_lock, flags);
++	stopped = nss_data_plane_registration_closing;
++	spin_unlock_irqrestore(&nss_data_plane_registration_lock, flags);
++	return stopped;
++}
++
++/* Process context, outside RTNL: an admitted worker may need RTNL/ACK RX. */
++void nss_data_plane_stop_registration(void)
++{
++	unsigned long flags;
++	bool initialized;
++
++	mutex_lock(&nss_data_plane_work_lifecycle_lock);
++	spin_lock_irqsave(&nss_data_plane_registration_lock, flags);
++	nss_data_plane_registration_closing = true;
++	initialized = nss_data_plane_work_initialized;
++	spin_unlock_irqrestore(&nss_data_plane_registration_lock, flags);
++	if (initialized)
++		cancel_delayed_work_sync(&nss_data_plane_work);
++	mutex_unlock(&nss_data_plane_work_lifecycle_lock);
++}
++#endif
+ 
+ extern bool pn_mq_en;
+ extern uint16_t pn_qlimits[NSS_MAX_NUM_PRI];
+@@ -33,6 +71,11 @@ static void nss_data_plane_work_function(struct work_struct *work)
+ 	struct nss_ctx_instance *nss_ctx = &nss_top_main.nss[NSS_CORE_0];
+ 	struct nss_top_instance *nss_top = nss_ctx->nss_top;
+ 
++#ifdef NSS_HAL_IPQ807x_SUPPORT
++	if (nss_data_plane_registration_stopped())
++		return;
++#endif
++
+ 	/*
+ 	 * The queue config command is a synchronous command and needs to be issued
+ 	 * in process context, before NSS data plane switch.
+@@ -58,6 +101,19 @@ data_plane_reg:
+  */
+ bool nss_data_plane_schedule_registration(void)
+ {
++#ifdef NSS_HAL_IPQ807x_SUPPORT
++	unsigned long flags;
++	bool queued = false;
++
++	/* Closing and queue publication use the same admission lock. */
++	spin_lock_irqsave(&nss_data_plane_registration_lock, flags);
++	if (!nss_data_plane_registration_closing &&
++			nss_data_plane_workqueue)
++		queued = queue_work_on(1, nss_data_plane_workqueue,
++				       &nss_data_plane_work.work);
++	spin_unlock_irqrestore(&nss_data_plane_registration_lock, flags);
++	return queued;
++#else
+ 	if (!queue_work_on(1, nss_data_plane_workqueue, &nss_data_plane_work.work)) {
+ 		nss_warning("Failed to register data plane workqueue on core 1\n");
+ 		return false;
+@@ -65,6 +121,7 @@ bool nss_data_plane_schedule_registration(void)
+ 
+ 	nss_info("Register data plane workqueue on core 1\n");
+ 	return true;
++#endif
+ }
+ 
+ /*
+@@ -72,6 +129,34 @@ bool nss_data_plane_schedule_registration(void)
+  */
+ int nss_data_plane_init_delay_work(void)
+ {
++#ifdef NSS_HAL_IPQ807x_SUPPORT
++	struct workqueue_struct *workqueue;
++	unsigned long flags;
++	int ret = 0;
++
++	mutex_lock(&nss_data_plane_work_lifecycle_lock);
++	spin_lock_irqsave(&nss_data_plane_registration_lock, flags);
++	if (nss_data_plane_registration_closing)
++		ret = -ESHUTDOWN;
++	else if (nss_data_plane_workqueue)
++		ret = -EBUSY;
++	spin_unlock_irqrestore(&nss_data_plane_registration_lock, flags);
++	if (ret)
++		goto out;
++	workqueue = create_singlethread_workqueue("nss_data_plane_workqueue");
++	if (!workqueue) {
++		ret = -ENOMEM;
++		goto out;
++	}
++	INIT_DELAYED_WORK(&nss_data_plane_work, nss_data_plane_work_function);
++	spin_lock_irqsave(&nss_data_plane_registration_lock, flags);
++	nss_data_plane_work_initialized = true;
++	nss_data_plane_workqueue = workqueue;
++	spin_unlock_irqrestore(&nss_data_plane_registration_lock, flags);
++out:
++	mutex_unlock(&nss_data_plane_work_lifecycle_lock);
++	return ret;
++#else
+ 	nss_data_plane_workqueue = create_singlethread_workqueue("nss_data_plane_workqueue");
+ 	if (!nss_data_plane_workqueue) {
+ 		nss_warning("Can't allocate workqueue\n");
+@@ -80,6 +165,7 @@ int nss_data_plane_init_delay_work(void)
+ 
+ 	INIT_DELAYED_WORK(&nss_data_plane_work, nss_data_plane_work_function);
+ 	return 0;
++#endif
+ }
+ 
+ /*
+@@ -87,5 +173,20 @@ int nss_data_plane_init_delay_work(void)
+  */
+ void nss_data_plane_destroy_delay_work(void)
+ {
++#ifdef NSS_HAL_IPQ807x_SUPPORT
++	struct workqueue_struct *workqueue;
++	unsigned long flags;
++
++	nss_data_plane_stop_registration();
++	mutex_lock(&nss_data_plane_work_lifecycle_lock);
++	spin_lock_irqsave(&nss_data_plane_registration_lock, flags);
++	workqueue = nss_data_plane_workqueue;
++	nss_data_plane_workqueue = NULL;
++	spin_unlock_irqrestore(&nss_data_plane_registration_lock, flags);
++	if (workqueue)
++		destroy_workqueue(workqueue);
++	mutex_unlock(&nss_data_plane_work_lifecycle_lock);
++#else
+ 	destroy_workqueue(nss_data_plane_workqueue);
++#endif
+ }
+diff --git a/nss_hal/nss_hal.c b/nss_hal/nss_hal.c
+index 0f6c911..6b12232 100644
+--- a/nss_hal/nss_hal.c
++++ b/nss_hal/nss_hal.c
+@@ -28,6 +28,12 @@
+ #include <linux/of.h>
+ #include <linux/irq.h>
+ #include <linux/ethtool.h>
++#ifdef NSS_HAL_IPQ807x_SUPPORT
++#include <linux/mutex.h>
++#ifdef NSS_DATA_PLANE_GENERIC_SUPPORT
++#include <linux/rtnetlink.h>
++#endif
++#endif
+ 
+ #include "nss_hal.h"
+ #include "nss_core.h"
+@@ -52,6 +58,14 @@
+ #define NSS_AP1_IMAGE "qca-nss1.bin"
+ #define BUFFER_SIZE 8192
+ 
++#ifdef NSS_HAL_IPQ807x_SUPPORT
++/* Probe/remove are process-context writers; registration work never takes this lock. */
++static DEFINE_MUTEX(nss_hal_receive_group_lock);
++static bool nss_hal_receive_group_closing;
++static bool nss_hal_receive_group_stopped;
++static bool nss_hal_core_removed[NSS_MAX_CORES];
++#endif
++
+ // Function to search for the byte sequence in the buffer
+ static unsigned char *search_sequence(const unsigned char *buffer,
+ 				      size_t buffer_size,
+@@ -208,6 +222,15 @@ static void nss_hal_clean_up_irq(struct int_ctx_instance *int_ctx)
+ 	 */
+ 	napi_disable(&int_ctx->napi);
+ 
++#ifdef NSS_HAL_IPQ807x_SUPPORT
++	/*
++	 * IPQ807x poll may still execute enable_irq() after napi_complete().
++	 * Join the complete BH/RCU poll tail before freeing/changing its IRQ.
++	 * The disabled NAPI, int_ctx and dummy netdev remain alive until then.
++	 */
++	netif_napi_del(&int_ctx->napi);
++#endif
++
+ 	/*
+ 	 * Interrupt can be raised here before free_irq() but as napi is
+ 	 * already disabled, it will be never sheduled from hard_irq
+@@ -217,7 +240,9 @@ static void nss_hal_clean_up_irq(struct int_ctx_instance *int_ctx)
+ 	free_irq(int_ctx->irq, int_ctx);
+ 	int_ctx->irq = 0;
+ 
++#ifndef NSS_HAL_IPQ807x_SUPPORT
+ 	netif_napi_del(&int_ctx->napi);
++#endif
+ }
+ 
+ /*
+@@ -251,7 +276,7 @@ static int nss_hal_register_irq(struct nss_ctx_instance *nss_ctx, struct nss_pla
+  * nss_hal_probe()
+  *	HLOS device probe callback
+  */
+-int nss_hal_probe(struct platform_device *nss_dev)
++static int __nss_hal_probe(struct platform_device *nss_dev)
+ {
+ 	struct nss_top_instance *nss_top = &nss_top_main;
+ 	struct nss_ctx_instance *nss_ctx = NULL;
+@@ -881,6 +906,67 @@ out:
+ 	return err;
+ }
+ 
++int nss_hal_probe(struct platform_device *nss_dev)
++{
++#ifdef NSS_HAL_IPQ807x_SUPPORT
++	int ret;
++
++	/* No late probe may recreate a receive IRQ after the first group drain. */
++	mutex_lock(&nss_hal_receive_group_lock);
++	if (nss_hal_receive_group_closing)
++		ret = -ESHUTDOWN;
++	else
++		ret = __nss_hal_probe(nss_dev);
++	mutex_unlock(&nss_hal_receive_group_lock);
++	return ret;
++#else
++	return __nss_hal_probe(nss_dev);
++#endif
++}
++
++#ifdef NSS_HAL_IPQ807x_SUPPORT
++/* Caller holds the group mutex, never RTNL or an admitted DP/NAPI callback. */
++static void nss_hal_quiesce_receive_group(void)
++{
++	struct nss_top_instance *nss_top = &nss_top_main;
++	int core, i;
++
++	if (nss_hal_receive_group_stopped)
++		return;
++	nss_hal_receive_group_closing = true;
++#ifdef NSS_DATA_PLANE_GENERIC_SUPPORT
++	/* An admitted worker may need RTNL and live ACK RX; cancel outside RTNL. */
++	nss_data_plane_stop_registration();
++	rtnl_lock();
++	/* Host-only quarantine: no NSS close/deinit, no registry/ndpp clearing. */
++	nss_data_plane_quarantine_registered();
++	rtnl_unlock();
++#endif
++
++	/*
++	 * A descriptor can select another core's subsys_dp registry.  Stop every
++	 * active receiver before clearing ANY registry or freeing core resources.
++	 */
++	for (core = 0; core < NSS_MAX_CORES; core++) {
++		struct nss_ctx_instance *nss_ctx = &nss_top->nss[core];
++
++		for (i = 0; i < NSS_MAX_IRQ_PER_CORE; i++) {
++			if (!nss_ctx->int_ctx[i].irq)
++				continue;
++			nss_hal_disable_interrupt(nss_ctx,
++					nss_ctx->int_ctx[i].shift_factor,
++					NSS_HAL_SUPPORTED_INTERRUPTS);
++			nss_hal_clean_up_irq(&nss_ctx->int_ctx[i]);
++		}
++	}
++#ifdef NSS_DATA_PLANE_GENERIC_SUPPORT
++	/* The wrapper holds RTNL; all RX readers and DP readers are already gone. */
++	nss_top->data_plane_ops->data_plane_unregister();
++#endif
++	nss_hal_receive_group_stopped = true;
++}
++#endif
++
+ /*
+  * nss_hal_remove()
+  *	HLOS device remove callback
+@@ -888,12 +974,28 @@ out:
+ int nss_hal_remove(struct platform_device *nss_dev)
+ {
+ 	struct nss_top_instance *nss_top = &nss_top_main;
+-	struct nss_ctx_instance *nss_ctx = &nss_top->nss[nss_dev->id];
++	struct nss_ctx_instance *nss_ctx;
++#ifndef NSS_HAL_IPQ807x_SUPPORT
+ 	int i;
++#else
++	if (nss_dev->id < 0 || nss_dev->id >= NSS_MAX_CORES)
++		return -EINVAL;
++	mutex_lock(&nss_hal_receive_group_lock);
++	if (nss_hal_core_removed[nss_dev->id]) {
++		mutex_unlock(&nss_hal_receive_group_lock);
++		return 0;
++	}
++#endif
++	nss_ctx = &nss_top->nss[nss_dev->id];
+ 
+ 	/*
+ 	 * Clean up debugfs
+ 	 */
++#ifdef NSS_HAL_IPQ807x_SUPPORT
++	if (!nss_hal_receive_group_stopped)
++		nss_stats_clean();
++	nss_hal_quiesce_receive_group();
++#else
+ 	nss_stats_clean();
+ 
+ 	/*
+@@ -904,14 +1006,20 @@ int nss_hal_remove(struct platform_device *nss_dev)
+ 					  NSS_HAL_SUPPORTED_INTERRUPTS);
+ 		nss_hal_clean_up_irq(&nss_ctx->int_ctx[i]);
+ 	}
++#endif
+ 
++#ifdef NSS_HAL_IPQ807x_SUPPORT
++	if (nss_ctx->napi_ndev)
++		free_netdev(nss_ctx->napi_ndev);
++#else
+ 	free_netdev(nss_ctx->napi_ndev);
++#endif
+ 	nss_ctx->napi_ndev = NULL;
+ 
+ 	/*
+ 	 * nss-drv is exiting, unregister and restore host data plane
+ 	 */
+-#ifdef NSS_DATA_PLANE_GENERIC_SUPPORT
++#if defined(NSS_DATA_PLANE_GENERIC_SUPPORT) && !defined(NSS_HAL_IPQ807x_SUPPORT)
+ 	nss_top->data_plane_ops->data_plane_unregister();
+ #endif
+ 
+@@ -936,5 +1044,9 @@ int nss_hal_remove(struct platform_device *nss_dev)
+ 	}
+ 
+ 	nss_info("%px: All resources freed for nss core%d", nss_ctx, nss_dev->id);
++#ifdef NSS_HAL_IPQ807x_SUPPORT
++	nss_hal_core_removed[nss_dev->id] = true;
++	mutex_unlock(&nss_hal_receive_group_lock);
++#endif
+ 	return 0;
+ }
+diff --git a/nss_init.c b/nss_init.c
+index 521553c..1ed7eb3 100644
+--- a/nss_init.c
++++ b/nss_init.c
+@@ -151,6 +151,10 @@ struct platform_driver nss_driver = {
+ 	.driver	= {
+ 		.name	= "qca-nss",
+ 		.owner	= THIS_MODULE,
++#ifdef NSS_HAL_IPQ807x_SUPPORT
++		/* No independent sysfs hot-unbind/rebind contract on this NSS train. */
++		.suppress_bind_attrs = true,
++#endif
+ #if (NSS_DT_SUPPORT == 1)
+ 		.of_match_table = of_match_ptr(nss_dt_ids),
+ #endif
