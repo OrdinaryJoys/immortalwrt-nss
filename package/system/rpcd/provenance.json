@@ -1,0 +1,51 @@
+{
+  "schema": 1,
+  "base_commit": "28faf6403792d25b9826043aaf37880624c19568",
+  "upstream_commit": "d99f703e4035d03fbcfbada3cb697db346c2b984",
+  "package_release": 2,
+  "default_checked_support": false,
+  "patches": [
+    {
+      "name": "010-file-resolved-path-acl.patch",
+      "sha256": "ccd7731c4f16043f347ac5bb86ffd198be9bf371624061f8fd349cd4674da6e3"
+    },
+    {
+      "name": "011-file-empty-data.patch",
+      "sha256": "b725c884e0bba41212149bbcbb056a4c059d13dd8c13953755b1c5eaaa605530"
+    },
+    {
+      "name": "012-ucode-switch-default.patch",
+      "sha256": "79b8796ce7903c34a32d2ae13899049bcc6a046e470ca1134c497ef885c767a1"
+    },
+    {
+      "name": "013-session-private-dirname.patch",
+      "sha256": "aa64a59ae58b54d5bdf7603710b04c31b5651f0de41e71fd76551dd8d2a2d455"
+    },
+    {
+      "name": "014-checked-uci-experimental-default-off.patch",
+      "sha256": "e3fc9809e06328f183446c7bd0880ed581b0d33ad56e042c3893558100a92499"
+    }
+  ],
+  "prepared_files": {
+    "CMakeLists.txt": "10ca221453e35e992167ef70acbb7145408764cbc20ad847a8b03750fc7e993e",
+    "examples/ucode/example-plugin.uc": "29db7a00e1f1284351945c76d8ba8af71e0d68f36ee39316bd9eddc89dd50a97",
+    "exec.c": "b13e8145941a607f6d5f6a1d61c93f3626a1f01ab541c88b791d5d423fdfb4de",
+    "file.c": "03aae01e0fd55f7f3562b19adb24e7e413793c648866a4059e039f3e6d90a648",
+    "include/rpcd/exec.h": "e0a8a63d6af02636e067a076b353b687c5aa358ac9fb8671fa872645bf79829a",
+    "include/rpcd/plugin.h": "66caee7f53582767feecd451502004d85fe74df9bcb973196e99b454649c1999",
+    "include/rpcd/rc.h": "d84dbabd3fa6f97787726cb931e9610c0c6d375ecf8de25fd06d0098ebdf856e",
+    "include/rpcd/session.h": "d258c6baf7a512168f1231db8dc428c2c3c70ffb575086be8542eec6efbec0c3",
+    "include/rpcd/uci.h": "73ccf1a7338110b103a7cc768c5451b23d5d8bc61ea33e70a3cdb42e267a41bf",
+    "iwinfo.c": "0fd26292e4239831c08dd042b4322833c04d3334bec07f24fdb9722c0ceafede",
+    "main.c": "032aeb5620cf57a1aa112a0dbe265dc97229cf117b0b3c66675be6feaa43e54d",
+    "plugin.c": "e0dbe9a8d33e2fcf5ec48beefca1682eb01323acdadd63952e11fb42ce4dd034",
+    "rc.c": "86358cab44dcad555f36671c87d2020de85437b4c66a148fbc1efae2f9f4203c",
+    "session.c": "78b8778107847ab5314661038b8b2a85883f380ea840c6e4cc13bd533aaafcd3",
+    "sys.c": "8419e1b1115b5423b5638c74caecbb4abaf2f63692faf2268f0392adf5c081e5",
+    "uci.c": "01ec2bf77d59e3d2388f6035ff18a1af4e38db19f03b06dfb3c1bdcff9da72c0",
+    "ucode.c": "1cfc5a4ab072941a02c21154a4e3361c31956940226a880d43f46791736f9bb0",
+    "unauthenticated.json": "f9ffec0554e0dd2e429f7c1fc843393c6bd97c4af843ba8f4c0d1020a7d22a67"
+  },
+  "exact_files": 18,
+  "claim_boundary": "Four official rpcd backports plus an adapted experimental backend. CHECKED_UCI_SUPPORT is OFF by default. No restart-durable transaction journal, frontend activation or AX6 runtime certification."
+}

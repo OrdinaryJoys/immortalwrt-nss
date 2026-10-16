@@ -1,0 +1,29 @@
+From a6c6b63b47bd8f4f762ef2e6787210cd3e0fb8a0 Mon Sep 17 00:00:00 2001
+From: Felix Fietkau <nbd@nbd.name>
+Date: Fri, 25 Sep 2026 13:12:42 +0200
+Subject: [PATCH] ucode: add compatibility to newer ucode version
+
+It adds STATUS_BREAK for breakpoints. Add a default switch/case fallback
+to avoid running into the unhandled case warning/error.
+
+Signed-off-by: Felix Fietkau <nbd@nbd.name>
+---
+ ucode.c | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/ucode.c b/ucode.c
+index 3518064..aa6025b 100644
+--- a/ucode.c
++++ b/ucode.c
+@@ -1021,6 +1021,9 @@ rpc_ucode_script_execute(struct ubus_context *ctx, const char *path, uc_program_
+ 	case ERROR_RUNTIME:
+ 		fprintf(stderr, "Runtime error while executing ucode script %s\n", path);
+ 		break;
++
++	default:
++		break;
+ 	}
+ 
+ 	uc_vm_free(&script->vm);
+-- 
+2.39.5 (Apple Git-154)

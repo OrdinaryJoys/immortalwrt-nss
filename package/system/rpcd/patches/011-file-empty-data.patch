@@ -1,0 +1,40 @@
+From 4062f666ecd17a03a153a40e76af6904d3eb6a78 Mon Sep 17 00:00:00 2001
+From: Jo-Philipp Wich <jo@mein.io>
+Date: Thu, 17 Sep 2026 15:52:06 +0200
+Subject: [PATCH] file: reply with empty data instead of error for empty files
+
+read() returns 0 for an empty file (st_size 0, e.g. right after touch),
+which previously hit the <= 0 check and replied UBUS_STATUS_NO_DATA (5),
+so 'ubus call file read' on an empty file failed with 'No response'.
+
+Treat a zero-byte read as a successful empty reply: only actual read
+errors (< 0) map to UBUS_STATUS_NO_DATA, while a zero-length read (0)
+replies { "data": "" } with status 0.
+
+Fixes #42
+
+Signed-off-by: Jo-Philipp Wich <jo@mein.io>
+---
+ file.c | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/file.c b/file.c
+index bc3f221..57bb13b 100644
+--- a/file.c
++++ b/file.c
+@@ -459,7 +459,12 @@ rpc_file_read(struct ubus_context *ctx, struct ubus_object *obj,
+ 		goto out;
+ 	}
+ 
+-	if ((len = read(fd, wbuf, s.st_size)) <= 0)
++	len = read(fd, wbuf, s.st_size);
++
++	/* read() returns 0 for an empty file (st_size 0), which must reply
++	 * "data": "" rather than failing; only actual read errors (< 0) map
++	 * to UBUS_STATUS_NO_DATA. */
++	if (len < 0)
+ 	{
+ 		rv = UBUS_STATUS_NO_DATA;
+ 		goto out;
+-- 
+2.39.5 (Apple Git-154)

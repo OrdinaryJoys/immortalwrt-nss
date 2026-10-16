@@ -8,7 +8,7 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=rpcd
-PKG_RELEASE:=1
+PKG_RELEASE:=2
 
 PKG_SOURCE_PROTO:=git
 PKG_SOURCE_URL=$(PROJECT_GIT)/project/rpcd.git
@@ -21,6 +21,7 @@ PKG_LICENSE:=ISC
 PKG_LICENSE_FILES:=
 
 PKG_ASLR_PIE_REGULAR:=1
+PKG_CONFIG_DEPENDS+=CONFIG_RPCD_CHECKED_UCI_SUPPORT
 
 include $(INCLUDE_DIR)/package.mk
 include $(INCLUDE_DIR)/cmake.mk
@@ -46,6 +47,18 @@ define Package/rpcd/description
  This package provides the UBUS RPC backend server to expose various
  functionality to frontend programs via JSON-RPC.
 endef
+
+define Package/rpcd/config
+  config RPCD_CHECKED_UCI_SUPPORT
+    bool "Experimental checked UCI transactions (test only)"
+    depends on PACKAGE_rpcd
+    default n
+    help
+      Build the experimental checked transaction API. Restart durability and
+      frontend integration are not complete. Keep disabled in firmware images.
+endef
+
+CMAKE_OPTIONS += -DCHECKED_UCI_SUPPORT=$(if $(CONFIG_RPCD_CHECKED_UCI_SUPPORT),ON,OFF)
 
 define Package/rpcd/conffiles
 /etc/config/rpcd

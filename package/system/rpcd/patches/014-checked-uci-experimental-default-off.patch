@@ -1,0 +1,775 @@
+Subject: rpcd: isolate experimental checked UCI transactions, default off
+
+Not release ready: restart durability and frontend activation remain incomplete.
+Retains upstream private dirname mapping. Also free a newly allocated session
+when the second entropy read (public SID) fails.
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 56255ca..d4ce290 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -10,6 +10,10 @@ OPTION(FILE_SUPPORT "File plugin support" ON)
+ OPTION(IWINFO_SUPPORT "libiwinfo plugin support" ON)
+ OPTION(RPCSYS_SUPPORT "rpc-sys plugin support" ON)
+ OPTION(UCODE_SUPPORT "ucode plugin support" ON)
++OPTION(CHECKED_UCI_SUPPORT "Experimental checked UCI transactions (not release ready)" OFF)
++IF(CHECKED_UCI_SUPPORT)
++  ADD_DEFINITIONS(-DRPCD_CHECKED_UCI_SUPPORT=1)
++ENDIF()
+ 
+ SET(CMAKE_SHARED_LIBRARY_LINK_C_FLAGS "")
+ 
+diff --git a/include/rpcd/session.h b/include/rpcd/session.h
+index ee80465..d269baf 100644
+--- a/include/rpcd/session.h
++++ b/include/rpcd/session.h
+@@ -75,6 +75,7 @@ int rpc_session_api_init(struct ubus_context *ctx);
+ 
+ bool rpc_session_access(const char *sid, const char *scope,
+                         const char *object, const char *function);
++bool rpc_session_exists(const char *sid);
+ 
+ const char *rpc_session_dirname(const char *sid);
+ 
+diff --git a/session.c b/session.c
+index 894189f..7878dd1 100644
+--- a/session.c
++++ b/session.c
+@@ -357,8 +357,10 @@ rpc_session_create(int timeout)
+ 	if (!ses)
+ 		return NULL;
+ 
+-	if (rpc_random(ses->id))
++	if (rpc_random(ses->id)) {
++		free(ses);
+ 		return NULL;
++	}
+ 
+ 	ses->timeout = timeout;
+ 
+@@ -1434,6 +1436,15 @@ const char *rpc_session_dirname(const char *sid)
+ 	return ses->dirname;
+ }
+ 
++bool rpc_session_exists(const char *sid)
++{
++	struct rpc_session *ses;
++	if (!sid)
++		return false;
++	ses = avl_find_element(&sessions, sid, ses, avl);
++	return ses && (!ses->t.pending || uloop_timeout_remaining64(&ses->t) > 0);
++}
++
+ void rpc_session_create_cb(struct rpc_session_cb *cb)
+ {
+ 	if (cb && cb->cb)
+diff --git a/uci.c b/uci.c
+index 911011b..48d5ec0 100644
+--- a/uci.c
++++ b/uci.c
+@@ -18,6 +18,7 @@
+ 
+ #include <libgen.h>
+ #include <glob.h>
++#include <sys/random.h>
+ 
+ #include <libubox/blobmsg.h>
+ #include <libubox/blobmsg_json.h>
+@@ -26,6 +27,10 @@
+ #include <rpcd/exec.h>
+ #include <rpcd/session.h>
+ 
++#ifndef RPCD_CHECKED_UCI_SUPPORT
++#define RPCD_CHECKED_UCI_SUPPORT 0
++#endif
++
+ static struct blob_buf buf;
+ static struct uci_context *cursor;
+ static struct uloop_timeout apply_timer;
+@@ -33,6 +38,73 @@ static struct ubus_context *apply_ctx;
+ 
+ char apply_sid[RPC_SID_LEN + 1];
+ 
++enum checked_state {
++	CHECKED_NONE, CHECKED_APPLYING, CHECKED_PENDING,
++	CHECKED_CONFIRMED, CHECKED_ROLLED_BACK, CHECKED_UNKNOWN
++};
++
++struct checked_transaction {
++	char id[33];
++	char request[33];
++	char sid[RPC_SID_LEN + 1];
++	enum checked_state state;
++	unsigned int files;
++	bool cleanup_pending;
++};
++
++/* Bounded, process-local outcomes support retries, not crash recovery. */
++static struct checked_transaction checked_current, checked_history[8];
++static unsigned int checked_history_next;
++static bool checked_io_failed;
++
++static bool checked_active(void)
++{
++	return checked_current.state != CHECKED_NONE;
++}
++
++static void checked_finish(enum checked_state state)
++{
++	if (!checked_active())
++		return;
++	checked_current.state = state;
++	checked_history[checked_history_next++ % ARRAY_SIZE(checked_history)] = checked_current;
++	memset(&checked_current, 0, sizeof(checked_current));
++}
++
++static bool checked_hex(const char *value, size_t length)
++{
++	size_t i;
++	if (!value || strlen(value) != length)
++		return false;
++	for (i = 0; i < length; i++)
++		if (!((value[i] >= '0' && value[i] <= '9') ||
++		      (value[i] >= 'a' && value[i] <= 'f')))
++			return false;
++	return true;
++}
++
++static int checked_random(char id[33])
++{
++	unsigned char bytes[16];
++	size_t offset = 0, i;
++	ssize_t n;
++	static const char hex[] = "0123456789abcdef";
++	while (offset < sizeof(bytes)) {
++		n = getrandom(bytes + offset, sizeof(bytes) - offset, 0);
++		if (n < 0 && errno == EINTR)
++			continue;
++		if (n <= 0)
++			return UBUS_STATUS_UNKNOWN_ERROR;
++		offset += n;
++	}
++	for (i = 0; i < sizeof(bytes); i++) {
++		id[2 * i] = hex[bytes[i] >> 4];
++		id[2 * i + 1] = hex[bytes[i] & 15];
++	}
++	id[32] = 0;
++	return 0;
++}
++
+ enum {
+ 	RPC_G_CONFIG,
+ 	RPC_G_SECTION,
+@@ -339,6 +411,9 @@ rpc_uci_read_access(struct blob_attr *sid, struct blob_attr *config)
+ static bool
+ rpc_uci_write_access(struct blob_attr *sid, struct blob_attr *config)
+ {
++	if (checked_active())
++		return false;
++
+ 	rpc_uci_set_savedir(sid);
+ 
+ 	if (!sid)
+@@ -1423,16 +1498,19 @@ out:
+ /*
+  * Remove given delta save directory (if any).
+  */
+-static void
++static int
+ rpc_uci_purge_dir(const char *path)
+ {
+ 	DIR *d;
+ 	struct stat s;
+ 	struct dirent *e;
+ 	char file[PATH_MAX];
++	int ret = 0;
+ 
+-	if (stat(path, &s) || !S_ISDIR(s.st_mode))
+-		return;
++	if (stat(path, &s))
++		return errno == ENOENT ? 0 : UBUS_STATUS_UNKNOWN_ERROR;
++	if (!S_ISDIR(s.st_mode))
++		return UBUS_STATUS_UNKNOWN_ERROR;
+ 
+ 	if ((d = opendir(path)) != NULL)
+ 	{
+@@ -1443,50 +1521,78 @@ rpc_uci_purge_dir(const char *path)
+ 			if (stat(file, &s) || !S_ISREG(s.st_mode))
+ 				continue;
+ 
+-			unlink(file);
++			if (unlink(file))
++				ret = UBUS_STATUS_UNKNOWN_ERROR;
+ 		}
+ 
+-		closedir(d);
++		if (closedir(d))
++			ret = UBUS_STATUS_UNKNOWN_ERROR;
+ 
+-		rmdir(path);
++		if (rmdir(path))
++			ret = UBUS_STATUS_UNKNOWN_ERROR;
+ 	}
++	else
++		ret = UBUS_STATUS_UNKNOWN_ERROR;
++	return ret;
+ }
+ 
+ static int
+ rpc_uci_apply_config(struct ubus_context *ctx, char *config)
+ {
+ 	struct uci_package *p = NULL;
++	int ret;
+ 
+-	if (!uci_load(cursor, config, &p)) {
+-		uci_commit(cursor, &p, false);
++	ret = uci_load(cursor, config, &p);
++	if (!ret) {
++		ret = uci_commit(cursor, &p, false);
+ 		uci_unload(cursor, p);
+ 	}
++	if (ret && checked_active())
++		checked_io_failed = true;
+ 	rpc_uci_trigger_event(ctx, config);
+ 
+-	return 0;
++	return ret ? UBUS_STATUS_UNKNOWN_ERROR : 0;
+ }
+ 
+-static void
++static int
+ rpc_uci_copy_file(const char *src, const char *target, const char *file)
+ {
+-	char tmp[256];
++	char tmp[PATH_MAX];
+ 	FILE *in, *out;
++	size_t len;
++	int ret = UBUS_STATUS_UNKNOWN_ERROR;
+ 
+-	snprintf(tmp, sizeof(tmp), "%s%s", src, file);
++	if (snprintf(tmp, sizeof(tmp), "%s%s", src, file) >= sizeof(tmp))
++		goto failed;
+ 	in = fopen(tmp, "rb");
+-	snprintf(tmp, sizeof(tmp), "%s%s", target, file);
++	if (!in)
++		goto failed;
++	if (snprintf(tmp, sizeof(tmp), "%s%s", target, file) >= sizeof(tmp)) {
++		fclose(in);
++		goto failed;
++	}
+ 	out = fopen(tmp, "wb+");
+-	if (in && out)
+-		while (!feof(in)) {
+-			int len = fread(tmp, 1, sizeof(tmp), in);
+-
+-			if(len > 0)
+-				fwrite(tmp, 1, len, out);
+-		}
+-	if(in)
++	if (!out) {
+ 		fclose(in);
+-	if(out)
+-		fclose(out);
++		goto failed;
++	}
++	for (;;) {
++		len = fread(tmp, 1, sizeof(tmp), in);
++		if (len && fwrite(tmp, 1, len, out) != len)
++			break;
++		if (len < sizeof(tmp) || ferror(in) || feof(in))
++			break;
++	}
++	if (!ferror(in) && feof(in) && !ferror(out))
++		ret = 0;
++	if (fclose(out))
++		ret = UBUS_STATUS_UNKNOWN_ERROR;
++	if (fclose(in))
++		ret = UBUS_STATUS_UNKNOWN_ERROR;
++failed:
++	if (ret && checked_active())
++		checked_io_failed = true;
++	return ret;
+ }
+ 
+ static int
+@@ -1522,6 +1628,12 @@ rpc_uci_do_rollback(struct ubus_context *ctx, glob_t *gl)
+ 	int i, deny;
+ 	char tmp[PATH_MAX];
+ 	const char *dirname;
++	bool guarded = checked_active();
++	unsigned int restored = 0;
++
++	if (guarded) {
++		checked_io_failed = false;
++	}
+ 
+ 	/* Test apply permission to see if the initiator session still exists.
+ 	 * If it does, restore the delta files as well, else just restore the
+@@ -1547,8 +1659,11 @@ rpc_uci_do_rollback(struct ubus_context *ctx, glob_t *gl)
+ 		if (*config == '.')
+ 			continue;
+ 
+-		rpc_uci_copy_file(RPC_SNAPSHOT_FILES, RPC_UCI_DIR, config);
+-		rpc_uci_apply_config(ctx, config);
++		if (rpc_uci_copy_file(RPC_SNAPSHOT_FILES, RPC_UCI_DIR, config) && guarded)
++			break;
++		if (rpc_uci_apply_config(ctx, config) && guarded)
++			break;
++		restored++;
+ 
+ 		if (deny)
+ 			continue;
+@@ -1556,12 +1671,21 @@ rpc_uci_do_rollback(struct ubus_context *ctx, glob_t *gl)
+ 		rpc_uci_copy_file(RPC_SNAPSHOT_DELTA, tmp, config);
+ 	}
+ 
+-	rpc_uci_purge_dir(RPC_SNAPSHOT_FILES);
+-	rpc_uci_purge_dir(RPC_SNAPSHOT_DELTA);
++	if (guarded && (checked_io_failed || restored != checked_current.files)) {
++		/* Keep snapshots and ownership for an explicit recovery retry. */
++		checked_current.state = CHECKED_UNKNOWN;
++		return;
++	}
++
++	if (rpc_uci_purge_dir(RPC_SNAPSHOT_FILES))
++		checked_current.cleanup_pending = true;
++	if (rpc_uci_purge_dir(RPC_SNAPSHOT_DELTA))
++		checked_current.cleanup_pending = true;
+ 
+ 	uloop_timeout_cancel(&apply_timer);
+ 	memset(apply_sid, 0, sizeof(apply_sid));
+ 	apply_ctx = NULL;
++	checked_finish(CHECKED_ROLLED_BACK);
+ }
+ 
+ static void
+@@ -1571,8 +1695,11 @@ rpc_uci_apply_timeout(struct uloop_timeout *t)
+ 	char tmp[PATH_MAX];
+ 
+ 	snprintf(tmp, sizeof(tmp), "%s/*", RPC_SNAPSHOT_FILES);
+-	if (glob(tmp, GLOB_PERIOD, NULL, &gl) < 0)
++	if (glob(tmp, GLOB_PERIOD, NULL, &gl)) {
++		if (checked_active())
++			checked_current.state = CHECKED_UNKNOWN;
+ 		return;
++	}
+ 
+ 	rpc_uci_do_rollback(apply_ctx, &gl);
+ 
+@@ -1580,9 +1707,9 @@ rpc_uci_apply_timeout(struct uloop_timeout *t)
+ }
+ 
+ static int
+-rpc_uci_apply(struct ubus_context *ctx, struct ubus_object *obj,
+-              struct ubus_request_data *req, const char *method,
+-              struct blob_attr *msg)
++rpc_uci_apply_common(struct ubus_context *ctx, struct ubus_object *obj,
++                     struct ubus_request_data *req, const char *method,
++                     struct blob_attr *msg, const char *request_id)
+ {
+ 	struct blob_attr *tb[__RPC_T_MAX];
+ 	int timeout = RPC_APPLY_TIMEOUT;
+@@ -1592,6 +1719,12 @@ rpc_uci_apply(struct ubus_context *ctx, struct ubus_object *obj,
+ 	int ret, i;
+ 	char *sid;
+ 	glob_t gl;
++	bool guarded = request_id != NULL;
++	char id[33];
++	unsigned int files = 0;
++
++	if (checked_active())
++		return UBUS_STATUS_PERMISSION_DENIED;
+ 
+ 	blobmsg_parse(rpc_uci_apply_policy, __RPC_T_MAX, tb,
+ 	              blob_data(msg), blob_len(msg));
+@@ -1610,8 +1743,17 @@ rpc_uci_apply(struct ubus_context *ctx, struct ubus_object *obj,
+ 	if (tb[RPC_T_TIMEOUT])
+ 		timeout = blobmsg_get_u32(tb[RPC_T_TIMEOUT]);
+ 
+-	rpc_uci_purge_dir(RPC_SNAPSHOT_FILES);
+-	rpc_uci_purge_dir(RPC_SNAPSHOT_DELTA);
++	if (guarded) {
++		if (!rollback || timeout <= 0 || timeout > INT_MAX / 1000)
++			return UBUS_STATUS_INVALID_ARGUMENT;
++		ret = checked_random(id);
++		if (ret)
++			return ret;
++	}
++	ret = rpc_uci_purge_dir(RPC_SNAPSHOT_FILES);
++	ret |= rpc_uci_purge_dir(RPC_SNAPSHOT_DELTA);
++	if (ret && guarded)
++		return UBUS_STATUS_UNKNOWN_ERROR;
+ 
+ 	if (!apply_sid[0]) {
+ 		dirname = rpc_session_dirname(sid);
+@@ -1621,11 +1763,13 @@ rpc_uci_apply(struct ubus_context *ctx, struct ubus_object *obj,
+ 
+ 		rpc_uci_set_savedir(tb[RPC_T_SESSION]);
+ 
+-		mkdir(RPC_SNAPSHOT_FILES, 0700);
+-		mkdir(RPC_SNAPSHOT_DELTA, 0700);
++		ret = mkdir(RPC_SNAPSHOT_FILES, 0700);
++		ret |= mkdir(RPC_SNAPSHOT_DELTA, 0700);
++		if (ret && guarded)
++			return UBUS_STATUS_UNKNOWN_ERROR;
+ 
+ 		snprintf(tmp, sizeof(tmp), RPC_UCI_SAVEDIR_PREFIX "%s/*", dirname);
+-		if (glob(tmp, GLOB_PERIOD, NULL, &gl) < 0)
++		if (glob(tmp, GLOB_PERIOD, NULL, &gl))
+ 			return UBUS_STATUS_NOT_FOUND;
+ 
+ 		snprintf(tmp, sizeof(tmp), RPC_UCI_SAVEDIR_PREFIX "%s/", dirname);
+@@ -1636,6 +1780,36 @@ rpc_uci_apply(struct ubus_context *ctx, struct ubus_object *obj,
+ 			return ret;
+ 		}
+ 
++		if (guarded) {
++			checked_io_failed = false;
++			/* Prepare every snapshot before committing the first config. */
++			for (i = 0; i < gl.gl_pathc; i++) {
++				char *config = basename(gl.gl_pathv[i]);
++				struct stat s;
++				if (*config == '.' || stat(gl.gl_pathv[i], &s) || !s.st_size)
++					continue;
++				ret = rpc_uci_copy_file(RPC_UCI_DIR, RPC_SNAPSHOT_FILES, config);
++				ret |= rpc_uci_copy_file(tmp, RPC_SNAPSHOT_DELTA, config);
++				if (ret) {
++					globfree(&gl);
++					rpc_uci_purge_dir(RPC_SNAPSHOT_FILES);
++					rpc_uci_purge_dir(RPC_SNAPSHOT_DELTA);
++					return UBUS_STATUS_UNKNOWN_ERROR;
++				}
++				files++;
++			}
++			if (!files) {
++				globfree(&gl);
++				return UBUS_STATUS_NO_DATA;
++			}
++			memset(&checked_current, 0, sizeof(checked_current));
++			memcpy(checked_current.id, id, sizeof(id));
++			memcpy(checked_current.request, request_id, 33);
++			memcpy(checked_current.sid, sid, RPC_SID_LEN + 1);
++			checked_current.files = files;
++			checked_current.state = CHECKED_APPLYING;
++		}
++
+ 		/* copy SID early because rpc_uci_apply_config() will clobber buf */
+ 		if (rollback)
+ 			strncpy(apply_sid, sid, RPC_SID_LEN);
+@@ -1650,8 +1824,10 @@ rpc_uci_apply(struct ubus_context *ctx, struct ubus_object *obj,
+ 			if (stat(gl.gl_pathv[i], &s) || !s.st_size)
+ 				continue;
+ 
+-			rpc_uci_copy_file(RPC_UCI_DIR, RPC_SNAPSHOT_FILES, config);
+-			rpc_uci_copy_file(tmp, RPC_SNAPSHOT_DELTA, config);
++			if (!guarded) {
++				rpc_uci_copy_file(RPC_UCI_DIR, RPC_SNAPSHOT_FILES, config);
++				rpc_uci_copy_file(tmp, RPC_SNAPSHOT_DELTA, config);
++			}
+ 			rpc_uci_apply_config(ctx, config);
+ 		}
+ 
+@@ -1668,19 +1844,32 @@ rpc_uci_apply(struct ubus_context *ctx, struct ubus_object *obj,
+ 			uloop_timeout_set(&apply_timer, msecs);
+ 			apply_ctx = ctx;
+ 		}
++		if (guarded) {
++			checked_current.state = checked_io_failed ? CHECKED_UNKNOWN : CHECKED_PENDING;
++		}
+ 	}
+ 
+ 	return 0;
+ }
+ 
+ static int
+-rpc_uci_confirm(struct ubus_context *ctx, struct ubus_object *obj,
++rpc_uci_apply(struct ubus_context *ctx, struct ubus_object *obj,
++              struct ubus_request_data *req, const char *method, struct blob_attr *msg)
++{
++	return rpc_uci_apply_common(ctx, obj, req, method, msg, NULL);
++}
++
++static int
++rpc_uci_confirm_common(struct ubus_context *ctx, struct ubus_object *obj,
+                 struct ubus_request_data *req, const char *method,
+-                struct blob_attr *msg)
++                struct blob_attr *msg, bool guarded)
+ {
+ 	struct blob_attr *tb[__RPC_B_MAX];
+ 	char *sid;
+ 
++	if (checked_active() != guarded)
++		return UBUS_STATUS_PERMISSION_DENIED;
++
+ 	blobmsg_parse(rpc_uci_rollback_policy, __RPC_B_MAX, tb,
+ 	              blob_data(msg), blob_len(msg));
+ 
+@@ -1695,26 +1884,39 @@ rpc_uci_confirm(struct ubus_context *ctx, struct ubus_object *obj,
+ 	if (strcmp(apply_sid, sid))
+ 		return UBUS_STATUS_PERMISSION_DENIED;
+ 
+-	rpc_uci_purge_dir(RPC_SNAPSHOT_FILES);
+-	rpc_uci_purge_dir(RPC_SNAPSHOT_DELTA);
++	if (rpc_uci_purge_dir(RPC_SNAPSHOT_FILES))
++		checked_current.cleanup_pending = true;
++	if (rpc_uci_purge_dir(RPC_SNAPSHOT_DELTA))
++		checked_current.cleanup_pending = true;
+ 
+ 	uloop_timeout_cancel(&apply_timer);
+ 	memset(apply_sid, 0, sizeof(apply_sid));
+ 	apply_ctx = NULL;
++	checked_finish(CHECKED_CONFIRMED);
+ 
+ 	return 0;
+ }
+ 
+ static int
+-rpc_uci_rollback(struct ubus_context *ctx, struct ubus_object *obj,
++rpc_uci_confirm(struct ubus_context *ctx, struct ubus_object *obj,
++                struct ubus_request_data *req, const char *method, struct blob_attr *msg)
++{
++	return rpc_uci_confirm_common(ctx, obj, req, method, msg, false);
++}
++
++static int
++rpc_uci_rollback_common(struct ubus_context *ctx, struct ubus_object *obj,
+                  struct ubus_request_data *req, const char *method,
+-                 struct blob_attr *msg)
++                 struct blob_attr *msg, bool guarded)
+ {
+ 	struct blob_attr *tb[__RPC_B_MAX];
+ 	char tmp[PATH_MAX];
+ 	glob_t gl;
+ 	char *sid;
+ 
++	if (checked_active() != guarded)
++		return UBUS_STATUS_PERMISSION_DENIED;
++
+ 	blobmsg_parse(rpc_uci_rollback_policy, __RPC_B_MAX, tb,
+ 	              blob_data(msg), blob_len(msg));
+ 
+@@ -1730,7 +1932,7 @@ rpc_uci_rollback(struct ubus_context *ctx, struct ubus_object *obj,
+ 		return UBUS_STATUS_PERMISSION_DENIED;
+ 
+ 	snprintf(tmp, sizeof(tmp), "%s/*", RPC_SNAPSHOT_FILES);
+-	if (glob(tmp, GLOB_PERIOD, NULL, &gl) < 0)
++	if (glob(tmp, GLOB_PERIOD, NULL, &gl))
+ 		return UBUS_STATUS_NOT_FOUND;
+ 
+ 	rpc_uci_do_rollback(ctx, &gl);
+@@ -1740,6 +1942,197 @@ rpc_uci_rollback(struct ubus_context *ctx, struct ubus_object *obj,
+ 	return 0;
+ }
+ 
++static int
++rpc_uci_rollback(struct ubus_context *ctx, struct ubus_object *obj,
++                 struct ubus_request_data *req, const char *method, struct blob_attr *msg)
++{
++	return rpc_uci_rollback_common(ctx, obj, req, method, msg, false);
++}
++
++enum {
++	CHECK_COMMAND, CHECK_REQUEST, CHECK_TOKEN, CHECK_TIMEOUT, CHECK_SESSION,
++	__CHECK_MAX,
++};
++
++static const struct blobmsg_policy checked_policy[__CHECK_MAX] = {
++	[CHECK_COMMAND] = { .name = "command", .type = BLOBMSG_TYPE_STRING },
++	[CHECK_REQUEST] = { .name = "request", .type = BLOBMSG_TYPE_STRING },
++	[CHECK_TOKEN] = { .name = "token", .type = BLOBMSG_TYPE_STRING },
++	[CHECK_TIMEOUT] = { .name = "timeout", .type = BLOBMSG_TYPE_INT32 },
++	[CHECK_SESSION] = { .name = "ubus_rpc_session", .type = BLOBMSG_TYPE_STRING },
++};
++
++static struct checked_transaction *
++checked_find_request(const char *sid, const char *request)
++{
++	unsigned int i;
++	if (checked_active() && !strcmp(checked_current.sid, sid) &&
++	    !strcmp(checked_current.request, request))
++		return &checked_current;
++	for (i = 0; i < ARRAY_SIZE(checked_history); i++)
++		if (checked_history[i].state != CHECKED_NONE &&
++		    !strcmp(checked_history[i].sid, sid) &&
++		    !strcmp(checked_history[i].request, request))
++			return &checked_history[i];
++	return NULL;
++}
++
++static bool
++checked_token_matches(const struct checked_transaction *txn, const char *token)
++{
++	unsigned int i, difference = 0;
++	if (txn->state == CHECKED_NONE)
++		return false;
++	for (i = 0; i < 32; i++) {
++		difference |= (unsigned char)txn->id[i] ^ (unsigned char)token[i];
++		difference |= (unsigned char)txn->request[i] ^ (unsigned char)token[i + 32];
++	}
++	return difference == 0;
++}
++
++static struct checked_transaction *
++checked_find_token(const char *token)
++{
++	unsigned int i;
++	if (checked_token_matches(&checked_current, token))
++		return &checked_current;
++	for (i = 0; i < ARRAY_SIZE(checked_history); i++)
++		if (checked_token_matches(&checked_history[i], token))
++			return &checked_history[i];
++	return NULL;
++}
++
++static int
++checked_reply(struct ubus_context *ctx, struct ubus_request_data *req,
++              const struct checked_transaction *txn, const char *fallback)
++{
++	static const char * const names[] = {
++		"idle", "applying", "pending", "confirmed", "rolled_back", "unknown"
++	};
++	struct blob_buf reply = {};
++	char token[65];
++	int ret;
++	int64_t remaining = 0;
++	if (blob_buf_init(&reply, 0))
++		return UBUS_STATUS_UNKNOWN_ERROR;
++	if (txn == &checked_current && apply_timer.pending)
++		remaining = uloop_timeout_remaining64(&apply_timer);
++	ret = blobmsg_add_u32(&reply, "protocol", 1);
++	ret |= blobmsg_add_string(&reply, "state", txn ? names[txn->state] : fallback);
++	ret |= blobmsg_add_u32(&reply, "remaining_ms", remaining > 0 ? remaining : 0);
++	ret |= blobmsg_add_u8(&reply, "cleanup_pending", txn && txn->cleanup_pending);
++	if (txn) {
++		snprintf(token, sizeof(token), "%s%s", txn->id, txn->request);
++		ret |= blobmsg_add_string(&reply, "token", token);
++	}
++	if (!ret)
++		ret = ubus_send_reply(ctx, req, reply.head);
++	blob_buf_free(&reply);
++	return ret ? UBUS_STATUS_UNKNOWN_ERROR : 0;
++}
++
++static int
++rpc_uci_checked(struct ubus_context *ctx, struct ubus_object *obj,
++                struct ubus_request_data *req, const char *method,
++                struct blob_attr *msg)
++{
++	struct blob_attr *tb[__CHECK_MAX];
++	struct checked_transaction *txn;
++	struct blob_buf args = {};
++	const char *command, *sid = NULL, *request = NULL, *token = NULL;
++	unsigned int timeout;
++	int ret;
++
++	if (!RPCD_CHECKED_UCI_SUPPORT)
++		return UBUS_STATUS_NOT_SUPPORTED;
++
++	blobmsg_parse(checked_policy, __CHECK_MAX, tb, blob_data(msg), blob_len(msg));
++	if (!tb[CHECK_COMMAND])
++		return UBUS_STATUS_INVALID_ARGUMENT;
++	command = blobmsg_get_string(tb[CHECK_COMMAND]);
++	if (!strcmp(command, "capabilities"))
++		return checked_reply(ctx, req, NULL, "idle");
++	if (strcmp(command, "status") && strcmp(command, "apply") &&
++	    strcmp(command, "confirm") && strcmp(command, "rollback"))
++		return UBUS_STATUS_INVALID_ARGUMENT;
++	if (tb[CHECK_SESSION])
++		sid = blobmsg_get_string(tb[CHECK_SESSION]);
++	if (tb[CHECK_REQUEST]) {
++		request = blobmsg_get_string(tb[CHECK_REQUEST]);
++		if (!checked_hex(request, 32))
++			return UBUS_STATUS_INVALID_ARGUMENT;
++	}
++	if (tb[CHECK_TOKEN]) {
++		token = blobmsg_get_string(tb[CHECK_TOKEN]);
++		if (!checked_hex(token, 64))
++			return UBUS_STATUS_INVALID_ARGUMENT;
++	}
++	if (!strcmp(command, "apply") || (!strcmp(command, "status") && !token)) {
++		if (!sid || !checked_hex(sid, RPC_SID_LEN) ||
++		    !strcmp(sid, "00000000000000000000000000000000") ||
++		    !rpc_session_exists(sid))
++			return UBUS_STATUS_PERMISSION_DENIED;
++		txn = request ? checked_find_request(sid, request) : NULL;
++		if (!strcmp(command, "status")) {
++			if (!request && checked_active() && !strcmp(checked_current.sid, sid))
++				txn = &checked_current;
++			return checked_reply(ctx, req, txn, request ? "unknown" :
++				(apply_sid[0] && !checked_active() && !strcmp(apply_sid, sid) ? "legacy" : "idle"));
++		}
++		if (!request || !tb[CHECK_TIMEOUT] || token)
++			return UBUS_STATUS_INVALID_ARGUMENT;
++		timeout = blobmsg_get_u32(tb[CHECK_TIMEOUT]);
++		if (!timeout || timeout > INT_MAX / 1000)
++			return UBUS_STATUS_INVALID_ARGUMENT;
++		if (txn)
++			return checked_reply(ctx, req, txn, "unknown");
++		if (blob_buf_init(&args, 0))
++			return UBUS_STATUS_UNKNOWN_ERROR;
++		ret = blobmsg_add_string(&args, "ubus_rpc_session", sid);
++		ret |= blobmsg_add_u8(&args, "rollback", true);
++		ret |= blobmsg_add_u32(&args, "timeout", timeout);
++		if (!ret)
++			ret = rpc_uci_apply_common(ctx, obj, req, method, args.head, request);
++		else
++			ret = UBUS_STATUS_UNKNOWN_ERROR;
++		blob_buf_free(&args);
++		if (ret)
++			return ret;
++		return checked_reply(ctx, req, &checked_current, "unknown");
++	}
++	if (!token)
++		return UBUS_STATUS_INVALID_ARGUMENT;
++	txn = checked_find_token(token);
++	if (!txn || !strcmp(command, "status") || txn != &checked_current)
++		return checked_reply(ctx, req, txn, "unknown");
++
++	/* An expired deadline cannot be extended by a queued confirm request. */
++	if (apply_timer.pending && uloop_timeout_remaining64(&apply_timer) <= 0) {
++		rpc_uci_apply_timeout(&apply_timer);
++		txn = checked_find_token(token);
++		if (!txn || txn != &checked_current)
++			return checked_reply(ctx, req, txn, "unknown");
++	}
++	if (!strcmp(command, "confirm") &&
++	    (txn->state != CHECKED_PENDING || !rpc_session_exists(txn->sid)))
++		return checked_reply(ctx, req, txn, "unknown");
++	if (blob_buf_init(&args, 0))
++		return UBUS_STATUS_UNKNOWN_ERROR;
++	ret = blobmsg_add_string(&args, "ubus_rpc_session", txn->sid);
++	if (!ret) {
++		if (!strcmp(command, "confirm"))
++			ret = rpc_uci_confirm_common(ctx, obj, req, method, args.head, true);
++		else
++			ret = rpc_uci_rollback_common(ctx, obj, req, method, args.head, true);
++	}
++	else
++		ret = UBUS_STATUS_UNKNOWN_ERROR;
++	blob_buf_free(&args);
++	if (ret)
++		return ret;
++	return checked_reply(ctx, req, checked_find_token(token), "unknown");
++}
++
+ static int
+ rpc_uci_reload(struct ubus_context *ctx, struct ubus_object *obj,
+                  struct ubus_request_data *req, const char *method,
+@@ -1747,6 +2140,9 @@ rpc_uci_reload(struct ubus_context *ctx, struct ubus_object *obj,
+ {
+ 	char * const cmd[2] = { "/sbin/reload_config", NULL };
+ 
++	if (checked_active())
++		return UBUS_STATUS_PERMISSION_DENIED;
++
+ 	if (!fork()) {
+ 		/* wait for the RPC call to complete */
+ 		sleep(2);
+@@ -1803,6 +2199,7 @@ int rpc_uci_api_init(struct ubus_context *ctx)
+ 		UBUS_METHOD("apply",    rpc_uci_apply,    rpc_uci_apply_policy),
+ 		UBUS_METHOD("confirm",  rpc_uci_confirm,  rpc_uci_rollback_policy),
+ 		UBUS_METHOD("rollback", rpc_uci_rollback, rpc_uci_rollback_policy),
++		UBUS_METHOD("checked",  rpc_uci_checked, checked_policy),
+ 		UBUS_METHOD_NOARG("reload_config", rpc_uci_reload),
+ 	};
+ 
