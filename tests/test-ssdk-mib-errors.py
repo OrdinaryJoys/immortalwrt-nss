@@ -47,7 +47,7 @@ prefix = r'''
 #include <stdio.h>
 #include <string.h>
 typedef uint32_t a_uint32_t;
-typedef uint64_t a_uint64_t;
+typedef unsigned long a_uint64_t;
 typedef uint64_t u64;
 typedef uint32_t fal_port_t;
 typedef int sw_error_t;

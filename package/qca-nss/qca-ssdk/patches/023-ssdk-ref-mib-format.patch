@@ -1,0 +1,409 @@
+--- a/src/ref/ref_mib.c
++++ b/src/ref/ref_mib.c
+@@ -126,145 +126,145 @@
+ 	port);
+ 
+ 	len += snprintf(buf + len, sizeof(priv->buf) - len,
+-	"%-18s: %llu\n", "RxFrame", xgmib_info.RxFrame);
++	"%-18s: %lu\n", "RxFrame", xgmib_info.RxFrame);
+ 
+ 	len += snprintf(buf + len, sizeof(priv->buf) - len,
+-	"%-18s: %llu\n", "RxByte", xgmib_info.RxByte);
++	"%-18s: %lu\n", "RxByte", xgmib_info.RxByte);
+ 
+ 	len += snprintf(buf + len, sizeof(priv->buf) - len,
+-	"%-18s: %llu\n", "RxByteGood", xgmib_info.RxByteGood);
++	"%-18s: %lu\n", "RxByteGood", xgmib_info.RxByteGood);
+ 
+ 	len += snprintf(buf + len, sizeof(priv->buf) - len,
+-	"%-18s: %llu\n", "RxBroadGood", xgmib_info.RxBroadGood);
++	"%-18s: %lu\n", "RxBroadGood", xgmib_info.RxBroadGood);
+ 
+ 	len += snprintf(buf + len, sizeof(priv->buf) - len,
+-	"%-18s: %llu\n", "RxMultiGood", xgmib_info.RxMultiGood);
++	"%-18s: %lu\n", "RxMultiGood", xgmib_info.RxMultiGood);
+ 
+ 	len += snprintf(buf + len, sizeof(priv->buf) - len,
+-	"%-18s: %llu\n", "RxFcsErr", xgmib_info.RxFcsErr);
++	"%-18s: %lu\n", "RxFcsErr", xgmib_info.RxFcsErr);
+ 
+ 	len += snprintf(buf + len, sizeof(priv->buf) - len,
+-	"%-18s: %llu\n", "RxRuntErr", xgmib_info.RxRuntErr );
++	"%-18s: %lu\n", "RxRuntErr", xgmib_info.RxRuntErr );
+ 
+ 	len += snprintf(buf + len, sizeof(priv->buf) - len,
+-	"%-18s: %llu\n", "RxJabberError", xgmib_info.RxJabberError);
++	"%-18s: %lu\n", "RxJabberError", xgmib_info.RxJabberError);
+ 
+ 	len += snprintf(buf + len, sizeof(priv->buf) - len,
+-	"%-18s: %llu\n", "RxUndersizeGood", xgmib_info.RxUndersizeGood);
++	"%-18s: %lu\n", "RxUndersizeGood", xgmib_info.RxUndersizeGood);
+ 
+ 	len += snprintf(buf + len, sizeof(priv->buf) - len,
+-	"%-18s: %llu\n", "RxOversizeGood", xgmib_info.RxOversizeGood);
++	"%-18s: %lu\n", "RxOversizeGood", xgmib_info.RxOversizeGood);
+ 
+ 	len += snprintf(buf + len, sizeof(priv->buf) - len,
+-	"%-18s: %llu\n", "Rx64Byte", xgmib_info.Rx64Byte);
++	"%-18s: %lu\n", "Rx64Byte", xgmib_info.Rx64Byte);
+ 
+ 	len += snprintf(buf + len, sizeof(priv->buf) - len,
+-	"%-18s: %llu\n", "Rx128Byte", xgmib_info.Rx128Byte);
++	"%-18s: %lu\n", "Rx128Byte", xgmib_info.Rx128Byte);
+ 
+ 	len += snprintf(buf + len, sizeof(priv->buf) - len,
+-	"%-18s: %llu\n", "Rx256Byte", xgmib_info.Rx256Byte);
++	"%-18s: %lu\n", "Rx256Byte", xgmib_info.Rx256Byte);
+ 
+ 	len += snprintf(buf + len, sizeof(priv->buf) - len,
+-	"%-18s: %llu\n", "Rx512Byte", xgmib_info.Rx512Byte);
++	"%-18s: %lu\n", "Rx512Byte", xgmib_info.Rx512Byte);
+ 
+ 	len += snprintf(buf + len, sizeof(priv->buf) - len,
+-	"%-18s: %llu\n", "Rx1024Byte", xgmib_info.Rx1024Byte);
++	"%-18s: %lu\n", "Rx1024Byte", xgmib_info.Rx1024Byte);
+ 
+ 	len += snprintf(buf + len, sizeof(priv->buf) - len,
+-	"%-18s: %llu\n", "RxMaxByte", xgmib_info.RxMaxByte);
++	"%-18s: %lu\n", "RxMaxByte", xgmib_info.RxMaxByte);
+ 
+ 	len += snprintf(buf + len, sizeof(priv->buf) - len,
+-	"%-18s: %llu\n", "RxUnicastGood", xgmib_info.RxUnicastGood);
++	"%-18s: %lu\n", "RxUnicastGood", xgmib_info.RxUnicastGood);
+ 
+ 	len += snprintf(buf + len, sizeof(priv->buf) - len,
+-	"%-18s: %llu\n", "RxLengthError", xgmib_info.RxLengthError);
++	"%-18s: %lu\n", "RxLengthError", xgmib_info.RxLengthError);
+ 
+ 	len += snprintf(buf + len, sizeof(priv->buf) - len,
+-	"%-18s: %llu\n", "RxOutOfRangeError", xgmib_info.RxOutOfRangeError);
++	"%-18s: %lu\n", "RxOutOfRangeError", xgmib_info.RxOutOfRangeError);
+ 
+ 	len += snprintf(buf + len, sizeof(priv->buf) - len,
+-	"%-18s: %llu\n", "RxPause", xgmib_info.RxPause);
++	"%-18s: %lu\n", "RxPause", xgmib_info.RxPause);
+ 
+ 	len += snprintf(buf + len, sizeof(priv->buf) - len,
+-	"%-18s: %llu\n", "RxOverFlow", xgmib_info.RxOverFlow);
++	"%-18s: %lu\n", "RxOverFlow", xgmib_info.RxOverFlow);
+ 
+ 	len += snprintf(buf + len, sizeof(priv->buf) - len,
+-	"%-18s: %llu\n", "RxVLANFrameGoodBad", xgmib_info.RxVLANFrameGoodBad);
++	"%-18s: %lu\n", "RxVLANFrameGoodBad", xgmib_info.RxVLANFrameGoodBad);
+ 
+ 	len += snprintf(buf + len, sizeof(priv->buf) - len,
+-	"%-18s: %llu\n", "RxWatchDogError", xgmib_info.RxWatchDogError);
++	"%-18s: %lu\n", "RxWatchDogError", xgmib_info.RxWatchDogError);
+ 
+ 	len += snprintf(buf + len, sizeof(priv->buf) - len,
+-	"%-18s: %llu\n", "RxLPIUsec", xgmib_info.RxLPIUsec);
++	"%-18s: %lu\n", "RxLPIUsec", xgmib_info.RxLPIUsec);
+ 
+ 	len += snprintf(buf + len, sizeof(priv->buf) - len,
+-	"%-18s: %llu\n", "RxLPITran", xgmib_info.RxLPITran);
++	"%-18s: %lu\n", "RxLPITran", xgmib_info.RxLPITran);
+ 
+ 	len += snprintf(buf + len, sizeof(priv->buf) - len,
+-	"%-18s: %llu\n", "RxDropFrameGoodBad", xgmib_info.RxDropFrameGoodBad);
++	"%-18s: %lu\n", "RxDropFrameGoodBad", xgmib_info.RxDropFrameGoodBad);
+ 
+ 	len += snprintf(buf + len, sizeof(priv->buf) - len,
+-	"%-18s: %llu\n", "RxDropByteGoodBad", xgmib_info.RxDropByteGoodBad);
++	"%-18s: %lu\n", "RxDropByteGoodBad", xgmib_info.RxDropByteGoodBad);
+ 
+ 	len += snprintf(buf + len, sizeof(priv->buf) - len,
+-	"%-18s: %llu\n", "TxByte", xgmib_info.TxByte);
++	"%-18s: %lu\n", "TxByte", xgmib_info.TxByte);
+ 
+ 	len += snprintf(buf + len, sizeof(priv->buf) - len,
+-	"%-18s: %llu\n", "TxFrame", xgmib_info.TxFrame);
++	"%-18s: %lu\n", "TxFrame", xgmib_info.TxFrame);
+ 
+ 	len += snprintf(buf + len, sizeof(priv->buf) - len,
+-	"%-18s: %llu\n", "TxBroadGood", xgmib_info.TxBroadGood);
++	"%-18s: %lu\n", "TxBroadGood", xgmib_info.TxBroadGood);
+ 
+ 	len += snprintf(buf + len, sizeof(priv->buf) - len,
+-	"%-18s: %llu\n", "TxMultiGood", xgmib_info.TxMultiGood);
++	"%-18s: %lu\n", "TxMultiGood", xgmib_info.TxMultiGood);
+ 
+ 	len += snprintf(buf + len, sizeof(priv->buf) - len,
+-	"%-18s: %llu\n", "Tx64Byte", xgmib_info.Tx64Byte);
++	"%-18s: %lu\n", "Tx64Byte", xgmib_info.Tx64Byte);
+ 
+ 	len += snprintf(buf + len, sizeof(priv->buf) - len,
+-	"%-18s: %llu\n", "Tx128Byte", xgmib_info.Tx128Byte);
++	"%-18s: %lu\n", "Tx128Byte", xgmib_info.Tx128Byte);
+ 
+ 	len += snprintf(buf + len, sizeof(priv->buf) - len,
+-	"%-18s: %llu\n", "Tx256Byte", xgmib_info.Tx256Byte);
++	"%-18s: %lu\n", "Tx256Byte", xgmib_info.Tx256Byte);
+ 
+ 	len += snprintf(buf + len, sizeof(priv->buf) - len,
+-	"%-18s: %llu\n", "Tx512Byte", xgmib_info.Tx512Byte);
++	"%-18s: %lu\n", "Tx512Byte", xgmib_info.Tx512Byte);
+ 
+ 	len += snprintf(buf + len, sizeof(priv->buf) - len,
+-	"%-18s: %llu\n", "Tx1024Byte", xgmib_info.Tx1024Byte);
++	"%-18s: %lu\n", "Tx1024Byte", xgmib_info.Tx1024Byte);
+ 
+ 	len += snprintf(buf + len, sizeof(priv->buf) - len,
+-	"%-18s: %llu\n", "TxMaxByte", xgmib_info.TxMaxByte);
++	"%-18s: %lu\n", "TxMaxByte", xgmib_info.TxMaxByte);
+ 
+ 	len += snprintf(buf + len, sizeof(priv->buf) - len,
+-	"%-18s: %llu\n", "TxUnicast", xgmib_info.TxUnicast);
++	"%-18s: %lu\n", "TxUnicast", xgmib_info.TxUnicast);
+ 
+ 	len += snprintf(buf + len, sizeof(priv->buf) - len,
+-	"%-18s: %llu\n", "TxMulti", xgmib_info.TxMulti);
++	"%-18s: %lu\n", "TxMulti", xgmib_info.TxMulti);
+ 
+ 	len += snprintf(buf + len, sizeof(priv->buf) - len,
+-	"%-18s: %llu\n", "TxBroad", xgmib_info.TxBroad);
++	"%-18s: %lu\n", "TxBroad", xgmib_info.TxBroad);
+ 
+ 	len += snprintf(buf + len, sizeof(priv->buf) - len,
+-	"%-18s: %llu\n", "TxUnderFlowError", xgmib_info.TxUnderFlowError);
++	"%-18s: %lu\n", "TxUnderFlowError", xgmib_info.TxUnderFlowError);
+ 
+ 	len += snprintf(buf + len, sizeof(priv->buf) - len,
+-	"%-18s: %llu\n", "TxByteGood", xgmib_info.TxByteGood);
++	"%-18s: %lu\n", "TxByteGood", xgmib_info.TxByteGood);
+ 
+ 	len += snprintf(buf + len, sizeof(priv->buf) - len,
+-	"%-18s: %llu\n", "TxByteGood", xgmib_info.TxByteGood);
++	"%-18s: %lu\n", "TxByteGood", xgmib_info.TxByteGood);
+ 
+ 	len += snprintf(buf + len, sizeof(priv->buf) - len,
+-	"%-18s: %llu\n", "TxPause", xgmib_info.TxPause);
++	"%-18s: %lu\n", "TxPause", xgmib_info.TxPause);
+ 
+ 	len += snprintf(buf + len, sizeof(priv->buf) - len,
+-	"%-18s: %llu\n", "TxVLANFrameGood", xgmib_info.TxVLANFrameGood);
++	"%-18s: %lu\n", "TxVLANFrameGood", xgmib_info.TxVLANFrameGood);
+ 
+ 	len += snprintf(buf + len, sizeof(priv->buf) - len,
+-	"%-18s: %llu\n", "TxLPIUsec", xgmib_info.TxLPIUsec);
++	"%-18s: %lu\n", "TxLPIUsec", xgmib_info.TxLPIUsec);
+ 
+ 	len += snprintf(buf + len, sizeof(priv->buf) - len,
+-	"%-18s: %llu\n", "TxLPITran", xgmib_info.TxLPITran);
++	"%-18s: %lu\n", "TxLPITran", xgmib_info.TxLPITran);
+ 
+ 	mutex_unlock(&priv->mib_lock);
+ 
+@@ -311,171 +311,171 @@
+                             port);
+ 
+     len += snprintf(buf + len, sizeof(priv->buf) - len,
+-                            "%-12s: %llu\n",
++                            "%-12s: %lu\n",
+                             "RxBroad",
+                             port_counters[pos++]);
+     len += snprintf(buf + len, sizeof(priv->buf) - len,
+-                            "%-12s: %llu\n",
++                            "%-12s: %lu\n",
+                             "RxPause",
+                             port_counters[pos++]);
+     len += snprintf(buf + len, sizeof(priv->buf) - len,
+-                            "%-12s: %llu\n",
++                            "%-12s: %lu\n",
+                             "RxMulti",
+                             port_counters[pos++]);
+     len += snprintf(buf + len, sizeof(priv->buf) - len,
+-                            "%-12s: %llu\n",
++                            "%-12s: %lu\n",
+                             "RxFcsErr",
+                             port_counters[pos++]);
+     len += snprintf(buf + len, sizeof(priv->buf) - len,
+-                            "%-12s: %llu\n",
++                            "%-12s: %lu\n",
+                             "RxAlignErr",
+                             port_counters[pos++]);
+     len += snprintf(buf + len, sizeof(priv->buf) - len,
+-                            "%-12s: %llu\n",
++                            "%-12s: %lu\n",
+                             "RxRunt",
+                             port_counters[pos++]);
+     len += snprintf(buf + len, sizeof(priv->buf) - len,
+-                            "%-12s: %llu\n",
++                            "%-12s: %lu\n",
+                             "RxFragment",
+                             port_counters[pos++]);
+     len += snprintf(buf + len, sizeof(priv->buf) - len,
+-                            "%-12s: %llu\n",
++                            "%-12s: %lu\n",
+                             "Rx64Byte",
+                             port_counters[pos++]);
+     len += snprintf(buf + len, sizeof(priv->buf) - len,
+-                            "%-12s: %llu\n",
++                            "%-12s: %lu\n",
+                             "Rx128Byte",
+                             port_counters[pos++]);
+     len += snprintf(buf + len, sizeof(priv->buf) - len,
+-                            "%-12s: %llu\n",
++                            "%-12s: %lu\n",
+                             "Rx256Byte",
+                             port_counters[pos++]);
+     len += snprintf(buf + len, sizeof(priv->buf) - len,
+-                            "%-12s: %llu\n",
++                            "%-12s: %lu\n",
+                             "Rx512Byte",
+                             port_counters[pos++]);
+     len += snprintf(buf + len, sizeof(priv->buf) - len,
+-                            "%-12s: %llu\n",
++                            "%-12s: %lu\n",
+                             "Rx1024Byte",
+                             port_counters[pos++]);
+     len += snprintf(buf + len, sizeof(priv->buf) - len,
+-                            "%-12s: %llu\n",
++                            "%-12s: %lu\n",
+                             "Rx1518Byte",
+                             port_counters[pos++]);
+     len += snprintf(buf + len, sizeof(priv->buf) - len,
+-                            "%-12s: %llu\n",
++                            "%-12s: %lu\n",
+                             "RxMaxByte",
+                             port_counters[pos++]);
+     len += snprintf(buf + len, sizeof(priv->buf) - len,
+-                            "%-12s: %llu\n",
++                            "%-12s: %lu\n",
+                             "RxTooLong",
+                             port_counters[pos++]);
+     len += snprintf(buf + len, sizeof(priv->buf) - len,
+-                            "%-12s: %llu\n",
++                            "%-12s: %lu\n",
+                             "RxGoodByte",
+                             port_counters[pos++]);
+     len += snprintf(buf + len, sizeof(priv->buf) - len,
+-                            "%-12s: %llu\n",
++                            "%-12s: %lu\n",
+                             "RxBadByte",
+                             port_counters[pos++]);
+     len += snprintf(buf + len, sizeof(priv->buf) - len,
+-                            "%-12s: %llu\n",
++                            "%-12s: %lu\n",
+                             "RxOverFlow",
+                             port_counters[pos++]);
+     len += snprintf(buf + len, sizeof(priv->buf) - len,
+-                            "%-12s: %llu\n",
++                            "%-12s: %lu\n",
+                             "Filtered",
+                             port_counters[pos++]);
+     len += snprintf(buf + len, sizeof(priv->buf) - len,
+-                            "%-12s: %llu\n",
++                            "%-12s: %lu\n",
+                             "TxBroad",
+                             port_counters[pos++]);
+     len += snprintf(buf + len, sizeof(priv->buf) - len,
+-                            "%-12s: %llu\n",
++                            "%-12s: %lu\n",
+                             "TxPause",
+                             port_counters[pos++]);
+     len += snprintf(buf + len, sizeof(priv->buf) - len,
+-                            "%-12s: %llu\n",
++                            "%-12s: %lu\n",
+                             "TxMulti",
+                             port_counters[pos++]);
+     len += snprintf(buf + len, sizeof(priv->buf) - len,
+-                            "%-12s: %llu\n",
++                            "%-12s: %lu\n",
+                             "TxUnderRun",
+                             port_counters[pos++]);
+     len += snprintf(buf + len, sizeof(priv->buf) - len,
+-                            "%-12s: %llu\n",
++                            "%-12s: %lu\n",
+                             "Tx64Byte",
+                             port_counters[pos++]);
+     len += snprintf(buf + len, sizeof(priv->buf) - len,
+-                            "%-12s: %llu\n",
++                            "%-12s: %lu\n",
+                             "Tx128Byte",
+                             port_counters[pos++]);
+     len += snprintf(buf + len, sizeof(priv->buf) - len,
+-                            "%-12s: %llu\n",
++                            "%-12s: %lu\n",
+                             "Tx256Byte",
+                             port_counters[pos++]);
+     len += snprintf(buf + len, sizeof(priv->buf) - len,
+-                            "%-12s: %llu\n",
++                            "%-12s: %lu\n",
+                             "Tx512Byte",
+                             port_counters[pos++]);
+     len += snprintf(buf + len, sizeof(priv->buf) - len,
+-                            "%-12s: %llu\n",
++                            "%-12s: %lu\n",
+                             "Tx1024Byte",
+                             port_counters[pos++]);
+     len += snprintf(buf + len, sizeof(priv->buf) - len,
+-                            "%-12s: %llu\n",
++                            "%-12s: %lu\n",
+                             "Tx1518Byte",
+                             port_counters[pos++]);
+     len += snprintf(buf + len, sizeof(priv->buf) - len,
+-                            "%-12s: %llu\n",
++                            "%-12s: %lu\n",
+                             "TxMaxByte",
+                             port_counters[pos++]);
+     len += snprintf(buf + len, sizeof(priv->buf) - len,
+-                            "%-12s: %llu\n",
++                            "%-12s: %lu\n",
+                             "TxOverSize",
+                             port_counters[pos++]);
+     len += snprintf(buf + len, sizeof(priv->buf) - len,
+-                            "%-12s: %llu\n",
++                            "%-12s: %lu\n",
+                             "TxByte",
+                             port_counters[pos++]);
+     len += snprintf(buf + len, sizeof(priv->buf) - len,
+-                            "%-12s: %llu\n",
++                            "%-12s: %lu\n",
+                             "TxCollision",
+                             port_counters[pos++]);
+     len += snprintf(buf + len, sizeof(priv->buf) - len,
+-                            "%-12s: %llu\n",
++                            "%-12s: %lu\n",
+                             "TxAbortCol",
+                             port_counters[pos++]);
+     len += snprintf(buf + len, sizeof(priv->buf) - len,
+-                            "%-12s: %llu\n",
++                            "%-12s: %lu\n",
+                             "TxMultiCol",
+                             port_counters[pos++]);
+     len += snprintf(buf + len, sizeof(priv->buf) - len,
+-                            "%-12s: %llu\n",
++                            "%-12s: %lu\n",
+                             "TxSingleCol",
+                             port_counters[pos++]);
+     len += snprintf(buf + len, sizeof(priv->buf) - len,
+-                            "%-12s: %llu\n",
++                            "%-12s: %lu\n",
+                             "TxExcDefer",
+                             port_counters[pos++]);
+     len += snprintf(buf + len, sizeof(priv->buf) - len,
+-                            "%-12s: %llu\n",
++                            "%-12s: %lu\n",
+                             "TxDefer",
+                             port_counters[pos++]);
+     len += snprintf(buf + len, sizeof(priv->buf) - len,
+-                            "%-12s: %llu\n",
++                            "%-12s: %lu\n",
+                             "TxLateCol",
+                             port_counters[pos++]);
+     len += snprintf(buf + len, sizeof(priv->buf) - len,
+-                            "%-12s: %llu\n",
++                            "%-12s: %lu\n",
+                             "RxUniCast",
+                             port_counters[pos++]);
+     len += snprintf(buf + len, sizeof(priv->buf) - len,
+-                            "%-12s: %llu\n",
++                            "%-12s: %lu\n",
+                             "TxUniCast",
+                             port_counters[pos++]);
+     len += snprintf(buf + len, sizeof(priv->buf) - len,
+-                    "%-18s: %llu\n%-18s: %llu\n%-18s: %llu\n%-18s: %llu\n%-18s: %llu\n",
++                    "%-18s: %lu\n%-18s: %lu\n%-18s: %lu\n%-18s: %lu\n%-18s: %lu\n",
+                     "RxJumboFcsErr", snapshot.RxJumboFcsErr,
+                     "RxJumboAligenErr", snapshot.RxJumboAligenErr,
+                     "Rx14To63", snapshot.Rx14To63,
