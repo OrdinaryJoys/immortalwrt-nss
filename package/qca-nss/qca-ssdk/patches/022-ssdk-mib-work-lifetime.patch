@@ -1,0 +1,211 @@
+--- a/include/fal/fal_mib.h
++++ b/include/fal/fal_mib.h
+@@ -232,6 +232,9 @@
+ fal_mib_counter_alloc(a_uint32_t dev_id, a_uint64_t **p_mibcounter);
+ 
+ sw_error_t
++fal_mib_counter_free(a_uint32_t dev_id, a_uint64_t **p_mibcounter);
++
++sw_error_t
+ fal_mib_counter_get(a_uint32_t dev_id, fal_port_t port_id,
+ 				fal_mib_counter_t *mib_counter);
+ 
+--- a/include/init/ssdk_plat.h
++++ b/include/init/ssdk_plat.h
+@@ -285,6 +285,12 @@
+ 	FDB_SYNC_POLLING,
+ } fdb_sync_t;
+ 
++enum qca_mib_work_state {
++	QCA_MIB_STOPPED = 0,
++	QCA_MIB_RUNNING,
++	QCA_MIB_PAUSED,
++};
++
+ struct qca_phy_priv {
+ 	struct phy_device *phy;
+ #if defined(IN_SWCONFIG)
+@@ -311,6 +317,9 @@
+ 	struct mutex reg_mutex;
+ 	struct mutex mib_lock;
+ 	struct delayed_work mib_dwork;
++	a_uint32_t mib_state;
++	a_bool_t mib_lock_initialized;
++	a_bool_t mib_work_initialized;
+ 	/*qm_err_check*/
+ 	struct mutex 	qm_lock;
+ 	a_uint32_t port_link_down[SW_MAX_NR_PORT];
+--- a/src/fal/fal_mib.c
++++ b/src/fal/fal_mib.c
+@@ -278,6 +278,12 @@
+ sw_error_t
+ fal_mib_counter_alloc(a_uint32_t dev_id, a_uint64_t **p_mibcounter)
+ {
++	if ((p_mibcounter == NULL) || (dev_id >= SW_MAX_NR_DEV))
++		return SW_BAD_PARAM;
++
++	*p_mibcounter = NULL;
++	g_mibcounter[dev_id] = NULL;
++
+ 	*p_mibcounter = kzalloc(SW_MAX_NR_PORT * sizeof(fal_mib_counter_t),
+ 			GFP_KERNEL);
+ 
+@@ -289,6 +295,21 @@
+ 	return SW_OK;
+ }
+ 
++sw_error_t
++fal_mib_counter_free(a_uint32_t dev_id, a_uint64_t **p_mibcounter)
++{
++	if ((p_mibcounter == NULL) || (dev_id >= SW_MAX_NR_DEV))
++		return SW_BAD_PARAM;
++
++	if (*p_mibcounter != NULL) {
++		kfree(*p_mibcounter);
++		*p_mibcounter = NULL;
++	}
++
++	g_mibcounter[dev_id] = NULL;
++	return SW_OK;
++}
++
+ static void _fal_rx_mib_update(a_uint32_t dev_id, fal_port_t port_value,
+                  fal_mib_info_t * mib_Info)
+ {
+--- a/src/init/ssdk_init.c
++++ b/src/init/ssdk_init.c
+@@ -836,38 +836,55 @@
+ qca_phy_mib_work_task(struct work_struct *work)
+ {
+ 	struct qca_phy_priv *priv = container_of(work, struct qca_phy_priv,
+-                                            mib_dwork.work);
++							mib_dwork.work);
+ 
+ 	mutex_lock(&priv->mib_lock);
+-
+-    qca_phy_mib_task(priv);
++	if (priv->mib_state != QCA_MIB_RUNNING) {
++		mutex_unlock(&priv->mib_lock);
++		return;
++	}
+ 
+-	mutex_unlock(&priv->mib_lock);
+-#ifndef SSDK_MIB_CHANGE_WQ
+-	schedule_delayed_work(&priv->mib_dwork,
+-			      msecs_to_jiffies(QCA_PHY_MIB_WORK_DELAY));
+-#else
+-	queue_delayed_work_on(0, system_long_wq, &priv->mib_dwork,
++	qca_phy_mib_task(priv);
++#ifdef SSDK_MIB_CHANGE_WQ
++	if (priv->mib_state == QCA_MIB_RUNNING)
++		queue_delayed_work_on(0, system_long_wq, &priv->mib_dwork,
+ 					msecs_to_jiffies(QCA_PHY_MIB_WORK_DELAY));
++#else
++	if (priv->mib_state == QCA_MIB_RUNNING)
++		schedule_delayed_work(&priv->mib_dwork,
++				      msecs_to_jiffies(QCA_PHY_MIB_WORK_DELAY));
+ #endif
++	mutex_unlock(&priv->mib_lock);
+ }
+ 
+ int
+ qca_phy_mib_work_start(struct qca_phy_priv *priv)
+ {
+-	mutex_init(&priv->mib_lock);
++	if (!priv)
++		return -EINVAL;
++
++	if (priv->mib_state != QCA_MIB_STOPPED)
++		return -EBUSY;
++
++	if (!priv->mib_lock_initialized) {
++		mutex_init(&priv->mib_lock);
++		priv->mib_lock_initialized = A_TRUE;
++	}
++
+ 	if(SW_OK != fal_mib_counter_alloc(priv->device_id, &priv->mib_counters)){
+ 		SSDK_ERROR("Memory allocation fail\n");
+ 		return -ENOMEM;
+ 	}
+ 
+ 	INIT_DELAYED_WORK(&priv->mib_dwork, qca_phy_mib_work_task);
+-#ifndef SSDK_MIB_CHANGE_WQ
+-	schedule_delayed_work(&priv->mib_dwork,
+-			               msecs_to_jiffies(QCA_PHY_MIB_WORK_DELAY));
+-#else
++	priv->mib_work_initialized = A_TRUE;
++	priv->mib_state = QCA_MIB_RUNNING;
++#ifdef SSDK_MIB_CHANGE_WQ
+ 	queue_delayed_work_on(0, system_long_wq, &priv->mib_dwork,
+-					msecs_to_jiffies(QCA_PHY_MIB_WORK_DELAY));
++				msecs_to_jiffies(QCA_PHY_MIB_WORK_DELAY));
++#else
++	schedule_delayed_work(&priv->mib_dwork,
++			      msecs_to_jiffies(QCA_PHY_MIB_WORK_DELAY));
+ #endif
+ 
+ 	return 0;
+@@ -876,31 +893,53 @@
+ void
+ qca_phy_mib_work_stop(struct qca_phy_priv *priv)
+ {
+-	if(!priv)
++	if (!priv || !priv->mib_lock_initialized)
+ 		return;
+-	if(priv->mib_counters)
+-		kfree(priv->mib_counters);
+-	cancel_delayed_work_sync(&priv->mib_dwork);
++
++	mutex_lock(&priv->mib_lock);
++	priv->mib_state = QCA_MIB_STOPPED;
++	mutex_unlock(&priv->mib_lock);
++
++	if (priv->mib_work_initialized)
++		cancel_delayed_work_sync(&priv->mib_dwork);
++
++	mutex_lock(&priv->mib_lock);
++	fal_mib_counter_free(priv->device_id, &priv->mib_counters);
++	mutex_unlock(&priv->mib_lock);
+ }
+ 
+ void
+ qca_phy_mib_work_pause(struct qca_phy_priv *priv)
+ {
+-	if(!priv)
++	if (!priv || !priv->mib_work_initialized)
+ 		return;
++
++	mutex_lock(&priv->mib_lock);
++	if (priv->mib_state == QCA_MIB_RUNNING)
++		priv->mib_state = QCA_MIB_PAUSED;
++	mutex_unlock(&priv->mib_lock);
++
+ 	cancel_delayed_work_sync(&priv->mib_dwork);
+ }
+ 
+ int
+ qca_phy_mib_work_resume(struct qca_phy_priv *priv)
+ {
+-#ifndef SSDK_MIB_CHANGE_WQ
+-	schedule_delayed_work(&priv->mib_dwork,
+-			               msecs_to_jiffies(QCA_PHY_MIB_WORK_DELAY));
+-#else
+-	queue_delayed_work_on(0, system_long_wq, &priv->mib_dwork,
++	if (!priv || !priv->mib_work_initialized)
++		return -EINVAL;
++
++	mutex_lock(&priv->mib_lock);
++	if (priv->mib_state == QCA_MIB_PAUSED) {
++		priv->mib_state = QCA_MIB_RUNNING;
++#ifdef SSDK_MIB_CHANGE_WQ
++		queue_delayed_work_on(0, system_long_wq, &priv->mib_dwork,
+ 					msecs_to_jiffies(QCA_PHY_MIB_WORK_DELAY));
++#else
++		schedule_delayed_work(&priv->mib_dwork,
++				      msecs_to_jiffies(QCA_PHY_MIB_WORK_DELAY));
+ #endif
++	}
++	mutex_unlock(&priv->mib_lock);
+ 	return 0;
+ }
+ 
