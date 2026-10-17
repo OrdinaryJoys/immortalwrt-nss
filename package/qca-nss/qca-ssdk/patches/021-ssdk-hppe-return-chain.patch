@@ -1,0 +1,542 @@
+--- a/src/adpt/hppe/adpt_hppe_mib.c
++++ b/src/adpt/hppe/adpt_hppe_mib.c
+@@ -29,6 +29,12 @@
+ 
+ #include "hppe_init.h"
+ #include "adpt_hppe.h"
++
++#define HPPE_MIB_GET(_fn, _port, _field) do { \
++	rv = _fn(dev_id, (_port), (void *)&mib_info->_field); \
++	if (rv != SW_OK) \
++		return rv; \
++} while (0)
+ #ifdef CPPE
+ #include "adpt_cppe_mib.h"
+ #endif
+@@ -43,21 +49,10 @@
+ 	ADPT_NULL_POINT_CHECK(enable);
+ 
+ 	rv = hppe_mac_mib_ctrl_mib_rd_clr_get(dev_id, port_id, &status);
+-
+-	if (status == A_TRUE)
+-	{
+-		*enable = A_FALSE;
+-	}
+-	else
+-	{
+-		*enable = A_TRUE;
+-	}
+-
+-	if( rv != SW_OK )
+-	{
++	if (rv != SW_OK)
+ 		return rv;
+-	}
+ 
++	*enable = (status == A_TRUE) ? A_FALSE : A_TRUE;
+ 	return SW_OK;
+ }
+ 
+@@ -65,7 +60,7 @@
+ adpt_ppe_mib_cpukeep_set(a_uint32_t dev_id, a_bool_t enable)
+ {
+ 	a_uint32_t port_id = 0, g_port_id = 0;
+-	sw_error_t rv = SW_OK;
++	sw_error_t rv = SW_OK, tmp = SW_OK;
+ 
+ 	ADPT_DEV_ID_CHECK(dev_id);
+ 
+@@ -75,13 +70,16 @@
+ 		if (adpt_ppe_type_get(dev_id) == CPPE_TYPE &&
+ 			port_id == SSDK_PHYSICAL_PORT6)
+ 		{
+-			rv = adpt_cppe_lpbk_mib_cpukeep_set(dev_id, port_id, enable);
+-			SW_RTN_ON_ERROR(rv);
++			tmp = adpt_cppe_lpbk_mib_cpukeep_set(dev_id, port_id, enable);
++			if (tmp != SW_OK && rv == SW_OK)
++				rv = tmp;
+ 			continue;
+ 		}
+ #endif
+ 		g_port_id = HPPE_TO_GMAC_PORT_ID(port_id);
+-		hppe_mac_mib_ctrl_mib_rd_clr_set(dev_id, g_port_id, (a_uint32_t)(!enable));
++		tmp = hppe_mac_mib_ctrl_mib_rd_clr_set(dev_id, g_port_id, (a_uint32_t)(!enable));
++		if (tmp != SW_OK && rv == SW_OK)
++			rv = tmp;
+ 	}
+ 
+ 	return rv;
+@@ -91,82 +89,55 @@
+ adpt_hppe_get_mib_info(a_uint32_t dev_id, fal_port_t port_id,
+                      fal_mib_info_t * mib_info )
+ {
++	sw_error_t rv = SW_OK;
+ 	ADPT_DEV_ID_CHECK(dev_id);
+ 	ADPT_NULL_POINT_CHECK(mib_info);
+ 	memset(mib_info, 0, sizeof(fal_mib_info_t));
+ 
+ 	port_id = HPPE_TO_GMAC_PORT_ID(port_id);
+-	hppe_rxbroad_get(dev_id, (a_uint32_t)port_id, (union rxbroad_u *)&mib_info->RxBroad);
+-	hppe_rxpause_get(dev_id, (a_uint32_t)port_id, (union rxpause_u *)&mib_info->RxPause);
+-	hppe_rxmulti_get(dev_id, (a_uint32_t)port_id, (union rxmulti_u *)&mib_info->RxMulti);
+-	hppe_rxfcserr_get(dev_id, (a_uint32_t)port_id, (union rxfcserr_u *)&mib_info->RxFcsErr);
+-	hppe_rxalignerr_get(dev_id, (a_uint32_t)port_id,
+-		(union rxalignerr_u *)&mib_info->RxAllignErr);
+-	hppe_rxrunt_get(dev_id, (a_uint32_t)port_id, (union rxrunt_u *)&mib_info->RxRunt);
+-	hppe_rxfrag_get(dev_id, (a_uint32_t)port_id, (union rxfrag_u *)&mib_info->RxFragment);
+-	hppe_rxjumbofcserr_get(dev_id, (a_uint32_t)port_id,
+-		(union rxjumbofcserr_u *)&mib_info->RxJumboFcsErr);
+-	hppe_rxjumboalignerr_get(dev_id, (a_uint32_t)port_id,
+-		(union rxjumboalignerr_u *)&mib_info->RxJumboAligenErr);
+-	hppe_rxpkt64_get(dev_id, (a_uint32_t)port_id, (union rxpkt64_u *)&mib_info->Rx64Byte);
+-	hppe_rxpkt65to127_get(dev_id, (a_uint32_t)port_id,
+-		(union rxpkt65to127_u *)&mib_info->Rx128Byte);
+-	hppe_rxpkt128to255_get(dev_id, (a_uint32_t)port_id,
+-		(union rxpkt128to255_u *)&mib_info->Rx256Byte);
+-	hppe_rxpkt256to511_get(dev_id, (a_uint32_t)port_id,
+-		(union rxpkt256to511_u *)&mib_info->Rx512Byte);
+-	hppe_rxpkt512to1023_get(dev_id, (a_uint32_t)port_id,
+-		(union rxpkt512to1023_u *)&mib_info->Rx1024Byte);
+-	hppe_rxpkt1024to1518_get(dev_id, (a_uint32_t)port_id,
+-		(union rxpkt1024to1518_u *)&mib_info->Rx1518Byte);
+-	hppe_rxpkt1519tox_get(dev_id, (a_uint32_t)port_id,
+-		(union rxpkt1519tox_u *)&mib_info->RxMaxByte);
+-	hppe_rxtoolong_get(dev_id, (a_uint32_t)port_id,
+-		(union rxtoolong_u *)&mib_info->RxTooLong);
+-	hppe_rxgoodbyte_l_get(dev_id, (a_uint32_t)port_id,
+-		(union rxgoodbyte_l_u *)&mib_info->RxGoodByte_lo);
+-	hppe_rxgoodbyte_h_get(dev_id, (a_uint32_t)port_id,
+-		(union rxgoodbyte_h_u *)&mib_info->RxGoodByte_hi);
+-	hppe_rxbadbyte_l_get(dev_id, (a_uint32_t)port_id,
+-		(union rxbadbyte_l_u *)&mib_info->RxBadByte_lo);
+-	hppe_rxbadbyte_h_get(dev_id, (a_uint32_t)port_id,
+-		(union rxbadbyte_h_u *)&mib_info->RxBadByte_hi);
+-	hppe_rxuni_get(dev_id, (a_uint32_t)port_id, (union rxuni_u *)&mib_info->RxUniCast);
+-	hppe_txbroad_get(dev_id, (a_uint32_t)port_id, (union txbroad_u *)&mib_info->TxBroad);
+-	hppe_txpause_get(dev_id, (a_uint32_t)port_id, (union txpause_u *)&mib_info->TxPause);
+-	hppe_txmulti_get(dev_id, (a_uint32_t)port_id, (union txmulti_u *)&mib_info->TxMulti);
+-	hppe_txunderrun_get(dev_id, (a_uint32_t)port_id,
+-		(union txunderrun_u *)&mib_info->TxUnderRun);
+-	hppe_txpkt64_get(dev_id, (a_uint32_t)port_id, (union txpkt64_u *)&mib_info->Tx64Byte);
+-	hppe_txpkt65to127_get(dev_id, (a_uint32_t)port_id,
+-		(union txpkt65to127_u *)&mib_info->Tx128Byte);
+-	hppe_txpkt128to255_get(dev_id, (a_uint32_t)port_id,
+-		(union txpkt128to255_u *)&mib_info->Tx256Byte);
+-	hppe_txpkt256to511_get(dev_id, (a_uint32_t)port_id,
+-		(union txpkt256to511_u *)&mib_info->Tx512Byte);
+-	hppe_txpkt512to1023_get(dev_id, (a_uint32_t)port_id,
+-		(union txpkt512to1023_u *)&mib_info->Tx1024Byte);
+-	hppe_txpkt1024to1518_get(dev_id, (a_uint32_t)port_id,
+-		(union txpkt1024to1518_u *)&mib_info->Tx1518Byte);
+-	hppe_txpkt1519tox_get(dev_id, (a_uint32_t)port_id,
+-		(union txpkt1519tox_u *)&mib_info->TxMaxByte);
+-	hppe_txbyte_l_get(dev_id, (a_uint32_t)port_id,
+-		(union txbyte_l_u *)&mib_info->TxByte_lo);
+-	hppe_txbyte_h_get(dev_id, (a_uint32_t)port_id,
+-		(union txbyte_h_u *)&mib_info->TxByte_hi);
+-	hppe_txcollisions_get(dev_id, (a_uint32_t)port_id,
+-		(union txcollisions_u *)&mib_info->TxCollision);
+-	hppe_txabortcol_get(dev_id, (a_uint32_t)port_id,
+-		(union txabortcol_u *)&mib_info->TxAbortCol);
+-	hppe_txmulticol_get(dev_id, (a_uint32_t)port_id,
+-		(union txmulticol_u *)&mib_info->TxMultiCol);
+-	hppe_txsinglecol_get(dev_id, (a_uint32_t)port_id,
+-		(union txsinglecol_u *)&mib_info->TxSingalCol);
+-	hppe_txexcessivedefer_get(dev_id, (a_uint32_t)port_id,
+-		(union txexcessivedefer_u *)&mib_info->TxExcDefer);
+-	hppe_txdefer_get(dev_id, (a_uint32_t)port_id, (union txdefer_u *)&mib_info->TxDefer);
+-	hppe_txlatecol_get(dev_id, (a_uint32_t)port_id, (union txlatecol_u *)&mib_info->TxLateCol);
+-	hppe_txuni_get(dev_id, (a_uint32_t)port_id, (union txuni_u *)&mib_info->TxUniCast);
++	HPPE_MIB_GET(hppe_rxbroad_get, (a_uint32_t)port_id, RxBroad);
++	HPPE_MIB_GET(hppe_rxpause_get, (a_uint32_t)port_id, RxPause);
++	HPPE_MIB_GET(hppe_rxmulti_get, (a_uint32_t)port_id, RxMulti);
++	HPPE_MIB_GET(hppe_rxfcserr_get, (a_uint32_t)port_id, RxFcsErr);
++	HPPE_MIB_GET(hppe_rxalignerr_get, (a_uint32_t)port_id, RxAllignErr);
++	HPPE_MIB_GET(hppe_rxrunt_get, (a_uint32_t)port_id, RxRunt);
++	HPPE_MIB_GET(hppe_rxfrag_get, (a_uint32_t)port_id, RxFragment);
++	HPPE_MIB_GET(hppe_rxjumbofcserr_get, (a_uint32_t)port_id, RxJumboFcsErr);
++	HPPE_MIB_GET(hppe_rxjumboalignerr_get, (a_uint32_t)port_id, RxJumboAligenErr);
++	HPPE_MIB_GET(hppe_rxpkt64_get, (a_uint32_t)port_id, Rx64Byte);
++	HPPE_MIB_GET(hppe_rxpkt65to127_get, (a_uint32_t)port_id, Rx128Byte);
++	HPPE_MIB_GET(hppe_rxpkt128to255_get, (a_uint32_t)port_id, Rx256Byte);
++	HPPE_MIB_GET(hppe_rxpkt256to511_get, (a_uint32_t)port_id, Rx512Byte);
++	HPPE_MIB_GET(hppe_rxpkt512to1023_get, (a_uint32_t)port_id, Rx1024Byte);
++	HPPE_MIB_GET(hppe_rxpkt1024to1518_get, (a_uint32_t)port_id, Rx1518Byte);
++	HPPE_MIB_GET(hppe_rxpkt1519tox_get, (a_uint32_t)port_id, RxMaxByte);
++	HPPE_MIB_GET(hppe_rxtoolong_get, (a_uint32_t)port_id, RxTooLong);
++	HPPE_MIB_GET(hppe_rxgoodbyte_l_get, (a_uint32_t)port_id, RxGoodByte_lo);
++	HPPE_MIB_GET(hppe_rxgoodbyte_h_get, (a_uint32_t)port_id, RxGoodByte_hi);
++	HPPE_MIB_GET(hppe_rxbadbyte_l_get, (a_uint32_t)port_id, RxBadByte_lo);
++	HPPE_MIB_GET(hppe_rxbadbyte_h_get, (a_uint32_t)port_id, RxBadByte_hi);
++	HPPE_MIB_GET(hppe_rxuni_get, (a_uint32_t)port_id, RxUniCast);
++	HPPE_MIB_GET(hppe_txbroad_get, (a_uint32_t)port_id, TxBroad);
++	HPPE_MIB_GET(hppe_txpause_get, (a_uint32_t)port_id, TxPause);
++	HPPE_MIB_GET(hppe_txmulti_get, (a_uint32_t)port_id, TxMulti);
++	HPPE_MIB_GET(hppe_txunderrun_get, (a_uint32_t)port_id, TxUnderRun);
++	HPPE_MIB_GET(hppe_txpkt64_get, (a_uint32_t)port_id, Tx64Byte);
++	HPPE_MIB_GET(hppe_txpkt65to127_get, (a_uint32_t)port_id, Tx128Byte);
++	HPPE_MIB_GET(hppe_txpkt128to255_get, (a_uint32_t)port_id, Tx256Byte);
++	HPPE_MIB_GET(hppe_txpkt256to511_get, (a_uint32_t)port_id, Tx512Byte);
++	HPPE_MIB_GET(hppe_txpkt512to1023_get, (a_uint32_t)port_id, Tx1024Byte);
++	HPPE_MIB_GET(hppe_txpkt1024to1518_get, (a_uint32_t)port_id, Tx1518Byte);
++	HPPE_MIB_GET(hppe_txpkt1519tox_get, (a_uint32_t)port_id, TxMaxByte);
++	HPPE_MIB_GET(hppe_txbyte_l_get, (a_uint32_t)port_id, TxByte_lo);
++	HPPE_MIB_GET(hppe_txbyte_h_get, (a_uint32_t)port_id, TxByte_hi);
++	HPPE_MIB_GET(hppe_txcollisions_get, (a_uint32_t)port_id, TxCollision);
++	HPPE_MIB_GET(hppe_txabortcol_get, (a_uint32_t)port_id, TxAbortCol);
++	HPPE_MIB_GET(hppe_txmulticol_get, (a_uint32_t)port_id, TxMultiCol);
++	HPPE_MIB_GET(hppe_txsinglecol_get, (a_uint32_t)port_id, TxSingalCol);
++	HPPE_MIB_GET(hppe_txexcessivedefer_get, (a_uint32_t)port_id, TxExcDefer);
++	HPPE_MIB_GET(hppe_txdefer_get, (a_uint32_t)port_id, TxDefer);
++	HPPE_MIB_GET(hppe_txlatecol_get, (a_uint32_t)port_id, TxLateCol);
++	HPPE_MIB_GET(hppe_txuni_get, (a_uint32_t)port_id, TxUniCast);
+ 
+ 	return SW_OK;
+ }
+@@ -191,45 +162,33 @@
+ adpt_hppe_get_tx_mib_info(a_uint32_t dev_id, fal_port_t port_id,
+                      fal_mib_info_t * mib_info )
+ {
++	sw_error_t rv = SW_OK;
+ 	ADPT_DEV_ID_CHECK(dev_id);
+ 	ADPT_NULL_POINT_CHECK(mib_info);
+ 	memset(mib_info, 0, sizeof(fal_mib_info_t));
+ 
+ 	port_id = HPPE_TO_GMAC_PORT_ID(port_id);
+-	hppe_txbroad_get(dev_id, (a_uint32_t)port_id, (union txbroad_u *)&mib_info->TxBroad);
+-	hppe_txpause_get(dev_id, (a_uint32_t)port_id, (union txpause_u *)&mib_info->TxPause);
+-	hppe_txmulti_get(dev_id, (a_uint32_t)port_id, (union txmulti_u *)&mib_info->TxMulti);
+-	hppe_txunderrun_get(dev_id, (a_uint32_t)port_id,
+-		(union txunderrun_u *)&mib_info->TxUnderRun);
+-	hppe_txpkt64_get(dev_id, (a_uint32_t)port_id, (union txpkt64_u *)&mib_info->Tx64Byte);
+-	hppe_txpkt65to127_get(dev_id, (a_uint32_t)port_id,
+-		(union txpkt65to127_u *)&mib_info->Tx128Byte);
+-	hppe_txpkt128to255_get(dev_id, (a_uint32_t)port_id,
+-		(union txpkt128to255_u *)&mib_info->Tx256Byte);
+-	hppe_txpkt256to511_get(dev_id, (a_uint32_t)port_id,
+-		(union txpkt256to511_u *)&mib_info->Tx512Byte);
+-	hppe_txpkt512to1023_get(dev_id, (a_uint32_t)port_id,
+-		(union txpkt512to1023_u *)&mib_info->Tx1024Byte);
+-	hppe_txpkt1024to1518_get(dev_id, (a_uint32_t)port_id,
+-		(union txpkt1024to1518_u *)&mib_info->Tx1518Byte);
+-	hppe_txpkt1519tox_get(dev_id, (a_uint32_t)port_id,
+-		(union txpkt1519tox_u *)&mib_info->TxMaxByte);
+-	hppe_txbyte_l_get(dev_id, (a_uint32_t)port_id, (union txbyte_l_u *)&mib_info->TxByte_lo);
+-	hppe_txbyte_h_get(dev_id, (a_uint32_t)port_id, (union txbyte_h_u *)&mib_info->TxByte_hi);
+-	hppe_txcollisions_get(dev_id, (a_uint32_t)port_id,
+-		(union txcollisions_u *)&mib_info->TxCollision);
+-	hppe_txabortcol_get(dev_id, (a_uint32_t)port_id,
+-		(union txabortcol_u *)&mib_info->TxAbortCol);
+-	hppe_txmulticol_get(dev_id, (a_uint32_t)port_id,
+-		(union txmulticol_u *)&mib_info->TxMultiCol);
+-	hppe_txsinglecol_get(dev_id, (a_uint32_t)port_id,
+-		(union txsinglecol_u *)&mib_info->TxSingalCol);
+-	hppe_txexcessivedefer_get(dev_id, (a_uint32_t)port_id,
+-		(union txexcessivedefer_u *)&mib_info->TxExcDefer);
+-	hppe_txdefer_get(dev_id, (a_uint32_t)port_id, (union txdefer_u *)&mib_info->TxDefer);
+-	hppe_txlatecol_get(dev_id, (a_uint32_t)port_id,
+-		(union txlatecol_u *)&mib_info->TxLateCol);
+-	hppe_txuni_get(dev_id, (a_uint32_t)port_id, (union txuni_u *)&mib_info->TxUniCast);
++	HPPE_MIB_GET(hppe_txbroad_get, (a_uint32_t)port_id, TxBroad);
++	HPPE_MIB_GET(hppe_txpause_get, (a_uint32_t)port_id, TxPause);
++	HPPE_MIB_GET(hppe_txmulti_get, (a_uint32_t)port_id, TxMulti);
++	HPPE_MIB_GET(hppe_txunderrun_get, (a_uint32_t)port_id, TxUnderRun);
++	HPPE_MIB_GET(hppe_txpkt64_get, (a_uint32_t)port_id, Tx64Byte);
++	HPPE_MIB_GET(hppe_txpkt65to127_get, (a_uint32_t)port_id, Tx128Byte);
++	HPPE_MIB_GET(hppe_txpkt128to255_get, (a_uint32_t)port_id, Tx256Byte);
++	HPPE_MIB_GET(hppe_txpkt256to511_get, (a_uint32_t)port_id, Tx512Byte);
++	HPPE_MIB_GET(hppe_txpkt512to1023_get, (a_uint32_t)port_id, Tx1024Byte);
++	HPPE_MIB_GET(hppe_txpkt1024to1518_get, (a_uint32_t)port_id, Tx1518Byte);
++	HPPE_MIB_GET(hppe_txpkt1519tox_get, (a_uint32_t)port_id, TxMaxByte);
++	HPPE_MIB_GET(hppe_txbyte_l_get, (a_uint32_t)port_id, TxByte_lo);
++	HPPE_MIB_GET(hppe_txbyte_h_get, (a_uint32_t)port_id, TxByte_hi);
++	HPPE_MIB_GET(hppe_txcollisions_get, (a_uint32_t)port_id, TxCollision);
++	HPPE_MIB_GET(hppe_txabortcol_get, (a_uint32_t)port_id, TxAbortCol);
++	HPPE_MIB_GET(hppe_txmulticol_get, (a_uint32_t)port_id, TxMultiCol);
++	HPPE_MIB_GET(hppe_txsinglecol_get, (a_uint32_t)port_id, TxSingalCol);
++	HPPE_MIB_GET(hppe_txexcessivedefer_get, (a_uint32_t)port_id, TxExcDefer);
++	HPPE_MIB_GET(hppe_txdefer_get, (a_uint32_t)port_id, TxDefer);
++	HPPE_MIB_GET(hppe_txlatecol_get, (a_uint32_t)port_id, TxLateCol);
++	HPPE_MIB_GET(hppe_txuni_get, (a_uint32_t)port_id, TxUniCast);
+ 
+ 	return SW_OK;
+ }
+@@ -241,7 +200,7 @@
+ 	a_uint32_t port_num = SSDK_PHYSICAL_PORT6;
+ 	union mmc_control_u mmc_control;
+ 	a_uint32_t xg_port_index = SSDK_PHYSICAL_PORT5;
+-	sw_error_t rv = SW_OK;
++	sw_error_t rv = SW_OK, tmp = SW_OK;
+ 
+ 	memset(&mmc_control, 0, sizeof(mmc_control));
+ 	ADPT_DEV_ID_CHECK(dev_id);
+@@ -249,13 +208,16 @@
+ 	if (adpt_ppe_type_get(dev_id) == CPPE_TYPE)
+ 	{
+ 		port_num = SSDK_PHYSICAL_PORT5;
+-		rv = adpt_cppe_lpbk_mib_status_set(dev_id, SSDK_PHYSICAL_PORT6, enable);
+-		SW_RTN_ON_ERROR(rv);
++		tmp = adpt_cppe_lpbk_mib_status_set(dev_id, SSDK_PHYSICAL_PORT6, enable);
++		if (tmp != SW_OK && rv == SW_OK)
++			rv = tmp;
+ 	}
+ #endif
+ 	for (port_id = SSDK_PHYSICAL_PORT1; port_id <= port_num; port_id++) {
+ 		g_port_id = HPPE_TO_GMAC_PORT_ID(port_id);
+-		hppe_mac_mib_ctrl_mib_en_set(dev_id, g_port_id, (a_uint32_t)enable);
++		tmp = hppe_mac_mib_ctrl_mib_en_set(dev_id, g_port_id, (a_uint32_t)enable);
++		if (tmp != SW_OK && rv == SW_OK)
++			rv = tmp;
+ 	}
+ 
+ #ifdef APPE
+@@ -267,14 +229,21 @@
+ #endif
+ 	for (port_id = xg_port_index; port_id <= port_num; port_id++) {
+ 		xg_port_id = HPPE_TO_XGMAC_PORT_ID(port_id);
+-		hppe_mmc_control_get(dev_id, xg_port_id, &mmc_control);
++		tmp = hppe_mmc_control_get(dev_id, xg_port_id, &mmc_control);
++		if (tmp != SW_OK) {
++			if (rv == SW_OK)
++				rv = tmp;
++			continue;
++		}
+ 
+ 		if(A_TRUE == enable)
+ 			mmc_control.bf.mcf = 0;
+ 		else
+ 			mmc_control.bf.mcf = 1;
+ 
+-		hppe_mmc_control_set(dev_id, xg_port_id, &mmc_control);
++		tmp = hppe_mmc_control_set(dev_id, xg_port_id, &mmc_control);
++		if (tmp != SW_OK && rv == SW_OK)
++			rv = tmp;
+ 	}
+ 
+ 	return rv;
+@@ -284,6 +253,7 @@
+ adpt_hppe_mib_port_flush_counters(a_uint32_t dev_id, fal_port_t port_id)
+ {
+ 	union mmc_control_u mmc_control;
++	sw_error_t rv = SW_OK, tmp = SW_OK;
+ 
+ 	memset(&mmc_control, 0, sizeof(mmc_control));
+ 	ADPT_DEV_ID_CHECK(dev_id);
+@@ -294,19 +264,27 @@
+ 	if(!hppe_xgmac_port_check(dev_id, port_id))
+ 	{
+ 		port_id = HPPE_TO_GMAC_PORT_ID(port_id);
+-		hppe_mac_mib_ctrl_mib_reset_set(dev_id, port_id, A_TRUE);
+-		hppe_mac_mib_ctrl_mib_reset_set(dev_id, port_id, A_FALSE);
++		tmp = hppe_mac_mib_ctrl_mib_reset_set(dev_id, port_id, A_TRUE);
++		if (tmp != SW_OK && rv == SW_OK)
++			rv = tmp;
++		tmp = hppe_mac_mib_ctrl_mib_reset_set(dev_id, port_id, A_FALSE);
++		if (tmp != SW_OK && rv == SW_OK)
++			rv = tmp;
+ 	}
+ 	/*XGMAC*/
+ 	else
+ 	{
+ 		port_id = HPPE_TO_XGMAC_PORT_ID(port_id);
+-		hppe_mmc_control_get(dev_id, port_id, &mmc_control);
++		tmp = hppe_mmc_control_get(dev_id, port_id, &mmc_control);
++		if (tmp != SW_OK)
++			return tmp;
+ 		mmc_control.bf.cntrst = 1;
+-		hppe_mmc_control_set(dev_id, port_id, &mmc_control);
++		tmp = hppe_mmc_control_set(dev_id, port_id, &mmc_control);
++		if (tmp != SW_OK)
++			return tmp;
+ 	}
+ 
+-	return SW_OK;
++	return rv;
+ }
+ 
+ sw_error_t
+@@ -332,11 +310,10 @@
+ 	ADPT_NULL_POINT_CHECK(enable);
+ 
+ 	rv = hppe_mac_mib_ctrl_mib_en_get(dev_id, port_id, &status);
+-	*enable = status;
+-
+-	if( rv != SW_OK )
++	if (rv != SW_OK)
+ 		return rv;
+ 
++	*enable = status;
+ 	return SW_OK;
+ }
+ 
+@@ -344,47 +321,34 @@
+ adpt_hppe_get_rx_mib_info(a_uint32_t dev_id, fal_port_t port_id,
+                      fal_mib_info_t * mib_info )
+ {
++	sw_error_t rv = SW_OK;
+ 	ADPT_DEV_ID_CHECK(dev_id);
+ 	ADPT_NULL_POINT_CHECK(mib_info);
+ 	memset(mib_info, 0, sizeof(fal_mib_info_t));
+ 
+ 	port_id = HPPE_TO_GMAC_PORT_ID(port_id);
+-	hppe_rxbroad_get(dev_id, (a_uint32_t)port_id, (union rxbroad_u *)&mib_info->RxBroad);
+-	hppe_rxpause_get(dev_id, (a_uint32_t)port_id, (union rxpause_u *)&mib_info->RxPause);
+-	hppe_rxmulti_get(dev_id, (a_uint32_t)port_id, (union rxmulti_u *)&mib_info->RxMulti);
+-	hppe_rxfcserr_get(dev_id, (a_uint32_t)port_id, (union rxfcserr_u *)&mib_info->RxFcsErr);
+-	hppe_rxalignerr_get(dev_id, (a_uint32_t)port_id,
+-		(union rxalignerr_u *)&mib_info->RxAllignErr);
+-	hppe_rxrunt_get(dev_id, (a_uint32_t)port_id, (union rxrunt_u *)&mib_info->RxRunt);
+-	hppe_rxfrag_get(dev_id, (a_uint32_t)port_id, (union rxfrag_u *)&mib_info->RxFragment);
+-	hppe_rxjumbofcserr_get(dev_id, (a_uint32_t)port_id,
+-		(union rxjumbofcserr_u *)&mib_info->RxJumboFcsErr);
+-	hppe_rxjumboalignerr_get(dev_id, (a_uint32_t)port_id,
+-		(union rxjumboalignerr_u *)&mib_info->RxJumboAligenErr);
+-	hppe_rxpkt64_get(dev_id, (a_uint32_t)port_id, (union rxpkt64_u *)&mib_info->Rx64Byte);
+-	hppe_rxpkt65to127_get(dev_id, (a_uint32_t)port_id,
+-		(union rxpkt65to127_u *)&mib_info->Rx128Byte);
+-	hppe_rxpkt128to255_get(dev_id, (a_uint32_t)port_id,
+-		(union rxpkt128to255_u *)&mib_info->Rx256Byte);
+-	hppe_rxpkt256to511_get(dev_id, (a_uint32_t)port_id,
+-		(union rxpkt256to511_u *)&mib_info->Rx512Byte);
+-	hppe_rxpkt512to1023_get(dev_id, (a_uint32_t)port_id,
+-		(union rxpkt512to1023_u *)&mib_info->Rx1024Byte);
+-	hppe_rxpkt1024to1518_get(dev_id, (a_uint32_t)port_id,
+-		(union rxpkt1024to1518_u *)&mib_info->Rx1518Byte);
+-	hppe_rxpkt1519tox_get(dev_id, (a_uint32_t)port_id,
+-		(union rxpkt1519tox_u *)&mib_info->RxMaxByte);
+-	hppe_rxtoolong_get(dev_id, (a_uint32_t)port_id,
+-		(union rxtoolong_u *)&mib_info->RxTooLong);
+-	hppe_rxgoodbyte_l_get(dev_id, (a_uint32_t)port_id,
+-		(union rxgoodbyte_l_u *)&mib_info->RxGoodByte_lo);
+-	hppe_rxgoodbyte_h_get(dev_id, (a_uint32_t)port_id,
+-		(union rxgoodbyte_h_u *)&mib_info->RxGoodByte_hi);
+-	hppe_rxbadbyte_l_get(dev_id, (a_uint32_t)port_id,
+-		(union rxbadbyte_l_u *)&mib_info->RxBadByte_lo);
+-	hppe_rxbadbyte_h_get(dev_id, (a_uint32_t)port_id,
+-		(union rxbadbyte_h_u *)&mib_info->RxBadByte_hi);
+-	hppe_rxuni_get(dev_id, (a_uint32_t)port_id, (union rxuni_u *)&mib_info->RxUniCast);
++	HPPE_MIB_GET(hppe_rxbroad_get, (a_uint32_t)port_id, RxBroad);
++	HPPE_MIB_GET(hppe_rxpause_get, (a_uint32_t)port_id, RxPause);
++	HPPE_MIB_GET(hppe_rxmulti_get, (a_uint32_t)port_id, RxMulti);
++	HPPE_MIB_GET(hppe_rxfcserr_get, (a_uint32_t)port_id, RxFcsErr);
++	HPPE_MIB_GET(hppe_rxalignerr_get, (a_uint32_t)port_id, RxAllignErr);
++	HPPE_MIB_GET(hppe_rxrunt_get, (a_uint32_t)port_id, RxRunt);
++	HPPE_MIB_GET(hppe_rxfrag_get, (a_uint32_t)port_id, RxFragment);
++	HPPE_MIB_GET(hppe_rxjumbofcserr_get, (a_uint32_t)port_id, RxJumboFcsErr);
++	HPPE_MIB_GET(hppe_rxjumboalignerr_get, (a_uint32_t)port_id, RxJumboAligenErr);
++	HPPE_MIB_GET(hppe_rxpkt64_get, (a_uint32_t)port_id, Rx64Byte);
++	HPPE_MIB_GET(hppe_rxpkt65to127_get, (a_uint32_t)port_id, Rx128Byte);
++	HPPE_MIB_GET(hppe_rxpkt128to255_get, (a_uint32_t)port_id, Rx256Byte);
++	HPPE_MIB_GET(hppe_rxpkt256to511_get, (a_uint32_t)port_id, Rx512Byte);
++	HPPE_MIB_GET(hppe_rxpkt512to1023_get, (a_uint32_t)port_id, Rx1024Byte);
++	HPPE_MIB_GET(hppe_rxpkt1024to1518_get, (a_uint32_t)port_id, Rx1518Byte);
++	HPPE_MIB_GET(hppe_rxpkt1519tox_get, (a_uint32_t)port_id, RxMaxByte);
++	HPPE_MIB_GET(hppe_rxtoolong_get, (a_uint32_t)port_id, RxTooLong);
++	HPPE_MIB_GET(hppe_rxgoodbyte_l_get, (a_uint32_t)port_id, RxGoodByte_lo);
++	HPPE_MIB_GET(hppe_rxgoodbyte_h_get, (a_uint32_t)port_id, RxGoodByte_hi);
++	HPPE_MIB_GET(hppe_rxbadbyte_l_get, (a_uint32_t)port_id, RxBadByte_lo);
++	HPPE_MIB_GET(hppe_rxbadbyte_h_get, (a_uint32_t)port_id, RxBadByte_hi);
++	HPPE_MIB_GET(hppe_rxuni_get, (a_uint32_t)port_id, RxUniCast);
+ 
+ 	return SW_OK;
+ }
+--- a/src/hsl/hppe/hppe_reg_access.c
++++ b/src/hsl/hppe/hppe_reg_access.c
+@@ -35,43 +35,53 @@
+ 
+ sw_error_t hppe_reg_get(a_uint32_t dev_id, a_uint32_t reg_addr, a_uint32_t *val)
+ {
+-	qca_switch_reg_read(dev_id, reg_addr, (a_uint8_t *)val, 4);
+-	return SW_OK;
++	if (val == NULL)
++		return SW_BAD_PTR;
++
++	return qca_switch_reg_read(dev_id, reg_addr, (a_uint8_t *)val, 4);
+ }
+ 
+-sw_error_t hppe_reg_set(a_uint32_t dev_id, a_uint32_t reg_addr, a_uint32_t val) 
++sw_error_t hppe_reg_set(a_uint32_t dev_id, a_uint32_t reg_addr, a_uint32_t val)
+ {
+-	qca_switch_reg_write(dev_id, reg_addr, (a_uint8_t *)&val, 4);
+-	return SW_OK; 
++	return qca_switch_reg_write(dev_id, reg_addr, (a_uint8_t *)&val, 4);
+ }
+ 
+-sw_error_t hppe_reg_tbl_get(a_uint32_t dev_id, a_uint32_t reg_addr, a_uint32_t *val, a_uint32_t num)   
++sw_error_t hppe_reg_tbl_get(a_uint32_t dev_id, a_uint32_t reg_addr, a_uint32_t *val, a_uint32_t num)
+ {
+ 	a_uint32_t i = 0;
++	sw_error_t rv = SW_OK;
++
+ 	for(i = 0; i < num; i++) {
+-		hppe_reg_get(dev_id, (reg_addr + i *4), &val[i]);
++		rv = hppe_reg_get(dev_id, (reg_addr + i * 4), &val[i]);
++		if (rv != SW_OK)
++			return rv;
+ 	}
+ 	return SW_OK;
+ }
+ 
+-sw_error_t hppe_reg_tbl_set(a_uint32_t dev_id, a_uint32_t reg_addr, a_uint32_t *val, a_uint32_t num)   
++sw_error_t hppe_reg_tbl_set(a_uint32_t dev_id, a_uint32_t reg_addr, a_uint32_t *val, a_uint32_t num)
+ {
+ 	a_uint32_t i = 0;
++	sw_error_t rv = SW_OK;
++
+ 	for(i = 0; i < num; i++) {
+-		hppe_reg_set(dev_id, (reg_addr + i *4), val[i]);
++		rv = hppe_reg_set(dev_id, (reg_addr + i * 4), val[i]);
++		if (rv != SW_OK)
++			return rv;
+ 	}
+-	return SW_OK;   
++	return SW_OK;
+ } 
+ 
+ sw_error_t hppe_uniphy_reg_get(a_uint32_t dev_id, a_uint32_t reg_addr, a_uint32_t index, a_uint32_t *val)
+ {
+-	qca_uniphy_reg_read(dev_id, index, reg_addr, (a_uint8_t *)val, 4);
+-	return SW_OK;
++	if (val == NULL)
++		return SW_BAD_PTR;
++
++	return qca_uniphy_reg_read(dev_id, index, reg_addr, (a_uint8_t *)val, 4);
+ }
+ 
+ sw_error_t hppe_uniphy_reg_set(a_uint32_t dev_id, a_uint32_t reg_addr, a_uint32_t index, a_uint32_t val)
+ {
+-	qca_uniphy_reg_write(dev_id, index, reg_addr, (a_uint8_t *)&val, 4);
+-	return SW_OK;
++	return qca_uniphy_reg_write(dev_id, index, reg_addr, (a_uint8_t *)&val, 4);
+ }
+ 
+--- a/src/init/ssdk_plat.c
++++ b/src/init/ssdk_plat.c
+@@ -516,6 +516,13 @@
+ qca_switch_reg_read(a_uint32_t dev_id, a_uint32_t reg_addr, a_uint8_t * reg_data, a_uint32_t len)
+ {
+ 	uint32_t reg_val = 0;
++
++	if (dev_id >= SW_MAX_NR_DEV)
++		return SW_BAD_PARAM;
++	if (reg_data == NULL)
++		return SW_BAD_PTR;
++	if (qca_phy_priv_global[dev_id] == NULL)
++		return SW_BAD_PTR;
+ 
+ 	if (len != sizeof (a_uint32_t))
+         return SW_BAD_LEN;
+@@ -539,6 +546,13 @@
+ qca_switch_reg_write(a_uint32_t dev_id, a_uint32_t reg_addr, a_uint8_t * reg_data, a_uint32_t len)
+ {
+ 	uint32_t reg_val = 0;
++
++	if (dev_id >= SW_MAX_NR_DEV)
++		return SW_BAD_PARAM;
++	if (reg_data == NULL)
++		return SW_BAD_PTR;
++	if (qca_phy_priv_global[dev_id] == NULL)
++		return SW_BAD_PTR;
+ 	if (len != sizeof (a_uint32_t))
+         return SW_BAD_LEN;
+ 
