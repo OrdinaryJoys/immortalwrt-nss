@@ -100,7 +100,7 @@ for name in ('fal_get_mib_info', 'fal_get_rx_mib_info', 'fal_get_tx_mib_info',
 prefix += r'''
 struct switch_attr { int unused; };
 struct switch_val {int port_vlan; union {char *s;} value; int len;};
-struct qca_phy_priv {unsigned device_id, mib_loop_cnt, ports; int mib_lock, reg_mutex;
+struct qca_phy_priv {unsigned device_id, mib_loop_cnt, ports; int mib_lock, reg_mutex, version;
     a_uint64_t *mib_counters; char buf[TARGET_MIB_BUFFER_SIZE]; uint64_t canary;};
 struct switch_dev {int ports; struct qca_phy_priv *priv;};
 static struct qca_phy_priv *qca_phy_priv_get(struct switch_dev *d) {return d->priv;}
@@ -108,6 +108,16 @@ static void mutex_lock(int *m) {(void)m; assert(mutexes++ == 0);}
 static void mutex_unlock(int *m) {(void)m; assert(mutexes-- == 1);}
 #define pr_warn_ratelimited(...) ((void)warnings++)
 #define QCA_MIB_ITEM_NUMBER (sizeof(fal_mib_counter_t)/sizeof(a_uint64_t))
+#ifdef HPPE
+#define QCA_VER_HPPE 1
+#define QCA_VER_APPE 2
+#define QCA_VER_MRPPE 3
+#define PORT_XGMAC_TYPE 1
+static int qca_hppe_port_mac_type_get(unsigned dev, int port) {(void)dev; (void)port; return 0;}
+static int qca_ar8327_sw_print_xgport_mib(struct switch_dev *d, const struct switch_attr *a, struct switch_val *v) {
+    (void)d; (void)a; (void)v; assert(!"XGMAC is not modeled by this GMAC regression"); return -EIO;
+}
+#endif
 '''
 for name in ('_qca_ar8327_sw_capture_port_counter', '_qca_ar8327_sw_capture_port_rx_counter',
              '_qca_ar8327_sw_capture_port_tx_counter', 'qca_ar8327_sw_get_port_mib',
@@ -147,7 +157,7 @@ int main(void) {
     check(fal_mib_port_flush_counters(0,1)==-9,"flush returns error");
     check(counters[1].RxFcsErr==15,"failed flush preserves cumulative state");
     flush_status=0; check(fal_mib_port_flush_counters(0,1)==0 && !counters[1].RxFcsErr,"successful flush resets");
-    struct qca_phy_priv priv={.ports=2,.mib_counters=(a_uint64_t*)counters};
+    struct qca_phy_priv priv={.ports=2,.mib_counters=(a_uint64_t*)counters,.version=1};
     struct switch_dev dev={.ports=2,.priv=&priv};
     struct switch_val val={.port_vlan=1,.len=123};
     reset(); io_status=-5;
@@ -178,12 +188,15 @@ with tempfile.TemporaryDirectory(prefix='ssdk-mib-') as directory:
     c = Path(directory) / 'test.c'
     binary = c.with_suffix('')
     c.write_text('#define TARGET_MIB_BUFFER_SIZE '+buffer_sizes[0]+'\n'+prefix + tests)
-    subprocess.run(['cc', '-std=c11', '-Wall', '-Wextra', '-Werror', '-Wno-unused-parameter', str(c), '-o', str(binary)], check=True)
-    result = subprocess.run([str(binary)], capture_output=True, text=True)
-    print(result.stdout, end='')
-    print(json.dumps({'hardware_mocked': True, 'target_built': False,
-                      'fal_sha256': hashlib.sha256(fal.encode()).hexdigest(),
-                      'ref_sha256': hashlib.sha256(ref.encode()).hexdigest(),
-                      'returncode': result.returncode}))
-    if result.returncode != (1 if args.expect_failure else 0):
-        raise SystemExit('unexpected result: ' + result.stderr)
+    for hppe in (False, True):
+        options = ['-DHPPE=1'] if hppe else []
+        subprocess.run(['cc', '-std=c11', '-Wall', '-Wextra', '-Werror', '-Wno-unused-parameter',
+                        *options, str(c), '-o', str(binary)], check=True)
+        result = subprocess.run([str(binary)], capture_output=True, text=True)
+        print(result.stdout, end='')
+        print(json.dumps({'hardware_mocked': True, 'target_built': False, 'hppe_gmac_dispatch': hppe,
+                          'fal_sha256': hashlib.sha256(fal.encode()).hexdigest(),
+                          'ref_sha256': hashlib.sha256(ref.encode()).hexdigest(),
+                          'returncode': result.returncode}))
+        if result.returncode != (1 if args.expect_failure else 0):
+            raise SystemExit('unexpected result: ' + result.stderr)
