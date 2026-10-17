@@ -1,0 +1,505 @@
+Subject: [PATCH] ssdk: preserve MIB error state and complete cumulative diagnostics
+
+Keep the hardware read, software accumulation and counter output under the
+existing FAL lock without recursively entering a public getter. Preserve
+counters on failed reads/flushes, include both jumbo error fields, and return
+GMAC swconfig read/reset failures instead of reporting stale values as health.
+Periodic failures are rate limited; this changes diagnostics, not forwarding.
+
+Based on QSDK 13.1.r2 d9a196497ecee2530722d906e0efe1b7408b6ef6.
+XGMAC combined-read semantics and actual hardware validation remain separate.
+
+--- a/src/fal/fal_mib.c
++++ b/src/fal/fal_mib.c
+@@ -326,6 +326,8 @@
+ 	g_mibcounter[dev_id][port_id].RxRuntByte +=
+ 		(((u64)mib_Info->RxRuntByte_hi) << 32) | mib_Info->RxRuntByte_lo;
+ 	g_mibcounter[dev_id][port_id].Rx14To63 += mib_Info->Rx14To63;
++	g_mibcounter[dev_id][port_id].RxJumboFcsErr += mib_Info->RxJumboFcsErr;
++	g_mibcounter[dev_id][port_id].RxJumboAligenErr += mib_Info->RxJumboAligenErr;
+ 
+ 	return;
+ }
+@@ -382,8 +384,10 @@
+ 
+     FAL_API_LOCK;
+     rv = _fal_get_mib_info(dev_id, port_id, mib_Info);
+-    _fal_rx_mib_update(dev_id, port_id, mib_Info);
+-    _fal_tx_mib_update(dev_id, port_id, mib_Info);
++    if (rv == SW_OK) {
++        _fal_rx_mib_update(dev_id, port_id, mib_Info);
++        _fal_tx_mib_update(dev_id, port_id, mib_Info);
++    }
+     FAL_API_UNLOCK;
+     return rv;
+ }
+@@ -394,60 +398,26 @@
+ {
+ 	sw_error_t rv;
+ 	fal_mib_info_t mib_info = {0};
++	a_uint32_t port_index = FAL_PORT_ID_VALUE(port_id);
+ 
+-	if(NULL == g_mibcounter[dev_id])
++	if (dev_id >= SW_MAX_NR_DEV || port_index >= SW_MAX_NR_PORT)
++		return SW_BAD_PARAM;
++	if (!mib_counter || !g_mibcounter[dev_id])
+ 		return SW_BAD_PTR;
+ 
+-	rv = fal_get_mib_info(dev_id, port_id, &mib_info);
+-
+-	if(rv != SW_OK)
++	/* Keep the hardware read, accumulation and output in one FAL snapshot. */
++	FAL_API_LOCK;
++	rv = _fal_get_mib_info(dev_id, port_id, &mib_info);
++	if (rv != SW_OK) {
++		FAL_API_UNLOCK;
+ 		return rv;
++	}
++	_fal_rx_mib_update(dev_id, port_id, &mib_info);
++	_fal_tx_mib_update(dev_id, port_id, &mib_info);
+ 
+-	mib_counter->RxBroad        = g_mibcounter[dev_id][port_id].RxBroad;
+-	mib_counter->RxPause        = g_mibcounter[dev_id][port_id].RxPause;
+-	mib_counter->RxMulti        = g_mibcounter[dev_id][port_id].RxMulti;
+-	mib_counter->RxFcsErr       = g_mibcounter[dev_id][port_id].RxFcsErr;
+-	mib_counter->RxAllignErr    = g_mibcounter[dev_id][port_id].RxAllignErr;
+-	mib_counter->RxRunt         = g_mibcounter[dev_id][port_id].RxRunt;
+-	mib_counter->RxFragment     = g_mibcounter[dev_id][port_id].RxFragment ;
+-	mib_counter->Rx64Byte       = g_mibcounter[dev_id][port_id].Rx64Byte ;
+-	mib_counter->Rx128Byte      = g_mibcounter[dev_id][port_id].Rx128Byte;
+-	mib_counter->Rx256Byte      = g_mibcounter[dev_id][port_id].Rx256Byte;
+-	mib_counter->Rx512Byte      = g_mibcounter[dev_id][port_id].Rx512Byte;
+-	mib_counter->Rx1024Byte     = g_mibcounter[dev_id][port_id].Rx1024Byte;
+-	mib_counter->Rx1518Byte     = g_mibcounter[dev_id][port_id].Rx1518Byte;
+-	mib_counter->RxMaxByte      = g_mibcounter[dev_id][port_id].RxMaxByte;
+-	mib_counter->RxTooLong      = g_mibcounter[dev_id][port_id].RxTooLong;
+-	mib_counter->RxGoodByte     = g_mibcounter[dev_id][port_id].RxGoodByte;
+-	mib_counter->RxBadByte      = g_mibcounter[dev_id][port_id].RxBadByte;
+-	mib_counter->RxOverFlow     = g_mibcounter[dev_id][port_id].RxOverFlow;
+-	mib_counter->Filtered       = g_mibcounter[dev_id][port_id].Filtered;
+-	mib_counter->TxBroad        = g_mibcounter[dev_id][port_id].TxBroad;
+-	mib_counter->TxPause        = g_mibcounter[dev_id][port_id].TxPause;
+-	mib_counter->TxMulti        = g_mibcounter[dev_id][port_id].TxMulti;
+-	mib_counter->TxUnderRun     = g_mibcounter[dev_id][port_id].TxUnderRun;
+-	mib_counter->Tx64Byte       = g_mibcounter[dev_id][port_id].Tx64Byte;
+-	mib_counter->Tx128Byte      = g_mibcounter[dev_id][port_id].Tx128Byte;
+-	mib_counter->Tx256Byte      = g_mibcounter[dev_id][port_id].Tx256Byte;
+-	mib_counter->Tx512Byte      = g_mibcounter[dev_id][port_id].Tx512Byte;
+-	mib_counter->Tx1024Byte     = g_mibcounter[dev_id][port_id].Tx1024Byte;
+-	mib_counter->Tx1518Byte     = g_mibcounter[dev_id][port_id].Tx1518Byte;
+-	mib_counter->TxMaxByte      = g_mibcounter[dev_id][port_id].TxMaxByte;
+-	mib_counter->TxOverSize     = g_mibcounter[dev_id][port_id].TxOverSize;
+-	mib_counter->TxByte         = g_mibcounter[dev_id][port_id].TxByte;
+-	mib_counter->TxCollision    = g_mibcounter[dev_id][port_id].TxCollision;
+-	mib_counter->TxAbortCol     = g_mibcounter[dev_id][port_id].TxAbortCol;
+-	mib_counter->TxMultiCol     = g_mibcounter[dev_id][port_id].TxMultiCol;
+-	mib_counter->TxSingalCol    = g_mibcounter[dev_id][port_id].TxSingalCol;
+-	mib_counter->TxExcDefer     = g_mibcounter[dev_id][port_id].TxExcDefer;
+-	mib_counter->TxDefer        = g_mibcounter[dev_id][port_id].TxDefer;
+-	mib_counter->TxLateCol      = g_mibcounter[dev_id][port_id].TxLateCol;
+-	mib_counter->RxUniCast      = g_mibcounter[dev_id][port_id].RxUniCast;
+-	mib_counter->TxUniCast      = g_mibcounter[dev_id][port_id].TxUniCast;
+-	mib_counter->Rx14To63       = g_mibcounter[dev_id][port_id].Rx14To63;
+-	mib_counter->RxTooLongByte  = g_mibcounter[dev_id][port_id].RxTooLongByte;
+-	mib_counter->RxRuntByte     = g_mibcounter[dev_id][port_id].RxRuntByte;
++	*mib_counter = g_mibcounter[dev_id][port_index];
+ 
++	FAL_API_UNLOCK;
+ 	return SW_OK;
+ }
+ 
+@@ -466,7 +436,8 @@
+ 
+     FAL_API_LOCK;
+     rv = _fal_get_rx_mib_info(dev_id, port_id, mib_Info);
+-    _fal_rx_mib_update(dev_id, port_id, mib_Info);
++    if (rv == SW_OK)
++        _fal_rx_mib_update(dev_id, port_id, mib_Info);
+     FAL_API_UNLOCK;
+ 
+     return rv;
+@@ -487,7 +458,8 @@
+ 
+     FAL_API_LOCK;
+     rv = _fal_get_tx_mib_info(dev_id, port_id, mib_Info);
+-    _fal_tx_mib_update(dev_id, port_id, mib_Info);
++    if (rv == SW_OK)
++        _fal_tx_mib_update(dev_id, port_id, mib_Info);
+     FAL_API_UNLOCK;
+ 
+     return rv;
+@@ -538,9 +510,13 @@
+ {
+     sw_error_t rv;
+ 
++    if (dev_id >= SW_MAX_NR_DEV || FAL_PORT_ID_VALUE(port_id) >= SW_MAX_NR_PORT)
++        return SW_BAD_PARAM;
+     FAL_API_LOCK;
+     rv = _fal_mib_port_flush_counters(dev_id, port_id);
+-    memset(&g_mibcounter[dev_id][port_id], 0, sizeof(fal_mib_counter_t));
++    if (rv == SW_OK && g_mibcounter[dev_id])
++        memset(&g_mibcounter[dev_id][FAL_PORT_ID_VALUE(port_id)], 0,
++               sizeof(fal_mib_counter_t));
+     FAL_API_UNLOCK;
+     return rv;
+ }
+
+--- a/src/ref/ref_mib.c
++++ b/src/ref/ref_mib.c
+@@ -44,6 +44,7 @@
+ #include <linux/delay.h>
+ #include <linux/phy.h>
+ #include <linux/netdevice.h>
++#include <linux/ratelimit.h>
+ #include "ssdk_plat.h"
+ #include "ref_vlan.h"
+ 
+@@ -59,9 +60,7 @@
+     struct qca_phy_priv *priv = qca_phy_priv_get(dev);
+ 
+     memset(&mib_Info, 0, sizeof(mib_Info));
+-    fal_get_mib_info(priv->device_id, port, &mib_Info);
+-
+-    return 0;
++    return fal_get_mib_info(priv->device_id, port, &mib_Info) == SW_OK ? 0 : -EIO;
+ }
+ 
+ int
+@@ -70,22 +69,18 @@
+ 			 						struct switch_val *val)
+ {
+     int i = 0;
+-    int len = 0;
++    int ret = 0;
+     struct qca_phy_priv *priv = qca_phy_priv_get(dev);
+-    fal_mib_info_t mib_Info;
+-    len = dev->ports * QCA_MIB_ITEM_NUMBER *
+-             sizeof(*priv->mib_counters);
+ 
+     mutex_lock(&priv->mib_lock);
+-    memset(priv->mib_counters, '\0', len);
+     for (i = 0; i < dev->ports; i++)
+     {
+-        fal_get_mib_info(priv->device_id, i, &mib_Info);
+-        fal_mib_port_flush_counters(priv->device_id, i);
++        if (fal_mib_port_flush_counters(priv->device_id, i) != SW_OK)
++            ret = -EIO;
+     }
+     mutex_unlock(&priv->mib_lock);
+ 
+-    return 0;
++    return ret;
+ }
+ 
+ int
+@@ -93,20 +88,18 @@
+ 			     					const struct switch_attr *attr,
+ 			     					struct switch_val *val)
+ {
+-    int len = 0;
++    int ret;
+     struct qca_phy_priv *priv = qca_phy_priv_get(dev);
+-    fal_mib_info_t mib_Info;
+-    len = QCA_MIB_ITEM_NUMBER * sizeof(*priv->mib_counters);
+ 
++    if (val->port_vlan < 0 || val->port_vlan >= dev->ports)
++        return -EINVAL;
++
+     mutex_lock(&priv->mib_lock);
+ 
+-    memset(priv->mib_counters + (val->port_vlan * QCA_MIB_ITEM_NUMBER), '\0', len);
+-
+-    fal_get_mib_info(priv->device_id, val->port_vlan, &mib_Info);
+-    fal_mib_port_flush_counters(priv->device_id, val->port_vlan);
++    ret = fal_mib_port_flush_counters(priv->device_id, val->port_vlan);
+     mutex_unlock(&priv->mib_lock);
+ 
+-    return 0;
++    return ret == SW_OK ? 0 : -EIO;
+ }
+ 
+ #ifdef HPPE
+@@ -290,12 +283,14 @@
+     int port = 0;
+     int len = 0;
+     int pos = 0;
++    fal_mib_counter_t snapshot;
++    const a_uint64_t *port_counters = (const a_uint64_t *)&snapshot;
+ 
+     struct qca_phy_priv *priv = qca_phy_priv_get(dev);
+     char *buf = (char *)(priv->buf);
+ 
+     port = val->port_vlan;
+-    if (port >= dev->ports)
++    if (port < 0 || port >= dev->ports)
+         return -EINVAL;
+ #ifdef HPPE
+     if ((priv->version == QCA_VER_HPPE || priv->version == QCA_VER_APPE ||
+@@ -307,8 +302,10 @@
+     }
+ #endif
+     mutex_lock(&priv->mib_lock);
+-    _qca_ar8327_sw_capture_port_counter(dev, port);
+-    pos = port * (sizeof(fal_mib_counter_t)/sizeof(a_uint64_t));
++    if (fal_mib_counter_get(priv->device_id, port, &snapshot) != SW_OK) {
++        mutex_unlock(&priv->mib_lock);
++        return -EIO;
++    }
+     len += snprintf(buf + len, sizeof(priv->buf) - len,
+                             "Port %d MIB counters\n",
+                             port);
+@@ -316,167 +313,174 @@
+     len += snprintf(buf + len, sizeof(priv->buf) - len,
+                             "%-12s: %llu\n",
+                             "RxBroad",
+-                            priv->mib_counters[pos++]);
++                            port_counters[pos++]);
+     len += snprintf(buf + len, sizeof(priv->buf) - len,
+                             "%-12s: %llu\n",
+                             "RxPause",
+-                            priv->mib_counters[pos++]);
++                            port_counters[pos++]);
+     len += snprintf(buf + len, sizeof(priv->buf) - len,
+                             "%-12s: %llu\n",
+                             "RxMulti",
+-                            priv->mib_counters[pos++]);
++                            port_counters[pos++]);
+     len += snprintf(buf + len, sizeof(priv->buf) - len,
+                             "%-12s: %llu\n",
+                             "RxFcsErr",
+-                            priv->mib_counters[pos++]);
++                            port_counters[pos++]);
+     len += snprintf(buf + len, sizeof(priv->buf) - len,
+                             "%-12s: %llu\n",
+                             "RxAlignErr",
+-                            priv->mib_counters[pos++]);
++                            port_counters[pos++]);
+     len += snprintf(buf + len, sizeof(priv->buf) - len,
+                             "%-12s: %llu\n",
+                             "RxRunt",
+-                            priv->mib_counters[pos++]);
++                            port_counters[pos++]);
+     len += snprintf(buf + len, sizeof(priv->buf) - len,
+                             "%-12s: %llu\n",
+                             "RxFragment",
+-                            priv->mib_counters[pos++]);
++                            port_counters[pos++]);
+     len += snprintf(buf + len, sizeof(priv->buf) - len,
+                             "%-12s: %llu\n",
+                             "Rx64Byte",
+-                            priv->mib_counters[pos++]);
++                            port_counters[pos++]);
+     len += snprintf(buf + len, sizeof(priv->buf) - len,
+                             "%-12s: %llu\n",
+                             "Rx128Byte",
+-                            priv->mib_counters[pos++]);
++                            port_counters[pos++]);
+     len += snprintf(buf + len, sizeof(priv->buf) - len,
+                             "%-12s: %llu\n",
+                             "Rx256Byte",
+-                            priv->mib_counters[pos++]);
++                            port_counters[pos++]);
+     len += snprintf(buf + len, sizeof(priv->buf) - len,
+                             "%-12s: %llu\n",
+                             "Rx512Byte",
+-                            priv->mib_counters[pos++]);
++                            port_counters[pos++]);
+     len += snprintf(buf + len, sizeof(priv->buf) - len,
+                             "%-12s: %llu\n",
+                             "Rx1024Byte",
+-                            priv->mib_counters[pos++]);
++                            port_counters[pos++]);
+     len += snprintf(buf + len, sizeof(priv->buf) - len,
+                             "%-12s: %llu\n",
+                             "Rx1518Byte",
+-                            priv->mib_counters[pos++]);
++                            port_counters[pos++]);
+     len += snprintf(buf + len, sizeof(priv->buf) - len,
+                             "%-12s: %llu\n",
+                             "RxMaxByte",
+-                            priv->mib_counters[pos++]);
++                            port_counters[pos++]);
+     len += snprintf(buf + len, sizeof(priv->buf) - len,
+                             "%-12s: %llu\n",
+                             "RxTooLong",
+-                            priv->mib_counters[pos++]);
++                            port_counters[pos++]);
+     len += snprintf(buf + len, sizeof(priv->buf) - len,
+                             "%-12s: %llu\n",
+                             "RxGoodByte",
+-                            priv->mib_counters[pos++]);
++                            port_counters[pos++]);
+     len += snprintf(buf + len, sizeof(priv->buf) - len,
+                             "%-12s: %llu\n",
+                             "RxBadByte",
+-                            priv->mib_counters[pos++]);
++                            port_counters[pos++]);
+     len += snprintf(buf + len, sizeof(priv->buf) - len,
+                             "%-12s: %llu\n",
+                             "RxOverFlow",
+-                            priv->mib_counters[pos++]);
++                            port_counters[pos++]);
+     len += snprintf(buf + len, sizeof(priv->buf) - len,
+                             "%-12s: %llu\n",
+                             "Filtered",
+-                            priv->mib_counters[pos++]);
++                            port_counters[pos++]);
+     len += snprintf(buf + len, sizeof(priv->buf) - len,
+                             "%-12s: %llu\n",
+                             "TxBroad",
+-                            priv->mib_counters[pos++]);
++                            port_counters[pos++]);
+     len += snprintf(buf + len, sizeof(priv->buf) - len,
+                             "%-12s: %llu\n",
+                             "TxPause",
+-                            priv->mib_counters[pos++]);
++                            port_counters[pos++]);
+     len += snprintf(buf + len, sizeof(priv->buf) - len,
+                             "%-12s: %llu\n",
+                             "TxMulti",
+-                            priv->mib_counters[pos++]);
++                            port_counters[pos++]);
+     len += snprintf(buf + len, sizeof(priv->buf) - len,
+                             "%-12s: %llu\n",
+                             "TxUnderRun",
+-                            priv->mib_counters[pos++]);
++                            port_counters[pos++]);
+     len += snprintf(buf + len, sizeof(priv->buf) - len,
+                             "%-12s: %llu\n",
+                             "Tx64Byte",
+-                            priv->mib_counters[pos++]);
++                            port_counters[pos++]);
+     len += snprintf(buf + len, sizeof(priv->buf) - len,
+                             "%-12s: %llu\n",
+                             "Tx128Byte",
+-                            priv->mib_counters[pos++]);
++                            port_counters[pos++]);
+     len += snprintf(buf + len, sizeof(priv->buf) - len,
+                             "%-12s: %llu\n",
+                             "Tx256Byte",
+-                            priv->mib_counters[pos++]);
++                            port_counters[pos++]);
+     len += snprintf(buf + len, sizeof(priv->buf) - len,
+                             "%-12s: %llu\n",
+                             "Tx512Byte",
+-                            priv->mib_counters[pos++]);
++                            port_counters[pos++]);
+     len += snprintf(buf + len, sizeof(priv->buf) - len,
+                             "%-12s: %llu\n",
+                             "Tx1024Byte",
+-                            priv->mib_counters[pos++]);
++                            port_counters[pos++]);
+     len += snprintf(buf + len, sizeof(priv->buf) - len,
+                             "%-12s: %llu\n",
+                             "Tx1518Byte",
+-                            priv->mib_counters[pos++]);
++                            port_counters[pos++]);
+     len += snprintf(buf + len, sizeof(priv->buf) - len,
+                             "%-12s: %llu\n",
+                             "TxMaxByte",
+-                            priv->mib_counters[pos++]);
++                            port_counters[pos++]);
+     len += snprintf(buf + len, sizeof(priv->buf) - len,
+                             "%-12s: %llu\n",
+                             "TxOverSize",
+-                            priv->mib_counters[pos++]);
++                            port_counters[pos++]);
+     len += snprintf(buf + len, sizeof(priv->buf) - len,
+                             "%-12s: %llu\n",
+                             "TxByte",
+-                            priv->mib_counters[pos++]);
++                            port_counters[pos++]);
+     len += snprintf(buf + len, sizeof(priv->buf) - len,
+                             "%-12s: %llu\n",
+                             "TxCollision",
+-                            priv->mib_counters[pos++]);
++                            port_counters[pos++]);
+     len += snprintf(buf + len, sizeof(priv->buf) - len,
+                             "%-12s: %llu\n",
+                             "TxAbortCol",
+-                            priv->mib_counters[pos++]);
++                            port_counters[pos++]);
+     len += snprintf(buf + len, sizeof(priv->buf) - len,
+                             "%-12s: %llu\n",
+                             "TxMultiCol",
+-                            priv->mib_counters[pos++]);
++                            port_counters[pos++]);
+     len += snprintf(buf + len, sizeof(priv->buf) - len,
+                             "%-12s: %llu\n",
+                             "TxSingleCol",
+-                            priv->mib_counters[pos++]);
++                            port_counters[pos++]);
+     len += snprintf(buf + len, sizeof(priv->buf) - len,
+                             "%-12s: %llu\n",
+                             "TxExcDefer",
+-                            priv->mib_counters[pos++]);
++                            port_counters[pos++]);
+     len += snprintf(buf + len, sizeof(priv->buf) - len,
+                             "%-12s: %llu\n",
+                             "TxDefer",
+-                            priv->mib_counters[pos++]);
++                            port_counters[pos++]);
+     len += snprintf(buf + len, sizeof(priv->buf) - len,
+                             "%-12s: %llu\n",
+                             "TxLateCol",
+-                            priv->mib_counters[pos++]);
++                            port_counters[pos++]);
+     len += snprintf(buf + len, sizeof(priv->buf) - len,
+                             "%-12s: %llu\n",
+                             "RxUniCast",
+-                            priv->mib_counters[pos++]);
++                            port_counters[pos++]);
+     len += snprintf(buf + len, sizeof(priv->buf) - len,
+                             "%-12s: %llu\n",
+                             "TxUniCast",
+-                            priv->mib_counters[pos++]);
++                            port_counters[pos++]);
++    len += snprintf(buf + len, sizeof(priv->buf) - len,
++                    "%-18s: %llu\n%-18s: %llu\n%-18s: %llu\n%-18s: %llu\n%-18s: %llu\n",
++                    "RxJumboFcsErr", snapshot.RxJumboFcsErr,
++                    "RxJumboAligenErr", snapshot.RxJumboAligenErr,
++                    "Rx14To63", snapshot.Rx14To63,
++                    "RxTooLongByte", snapshot.RxTooLongByte,
++                    "RxRuntByte", snapshot.RxRuntByte);
+     mutex_unlock(&priv->mib_lock);
+ 
+     val->value.s = buf;
+@@ -492,9 +496,7 @@
+     fal_mib_info_t  mib_Info;
+ 
+     memset(&mib_Info, 0, sizeof(fal_mib_info_t));
+-    fal_get_tx_mib_info(dev_id, port, &mib_Info);
+-
+-    return 0;
++    return fal_get_tx_mib_info(dev_id, port, &mib_Info);
+ }
+ 
+ static int
+@@ -503,18 +505,23 @@
+     fal_mib_info_t  mib_Info;
+ 
+     memset(&mib_Info, 0, sizeof(fal_mib_info_t));
+-    fal_get_rx_mib_info(dev_id, port, &mib_Info);
+-    return 0;
++    return fal_get_rx_mib_info(dev_id, port, &mib_Info);
+ }
+ 
+ void
+ qca_ar8327_sw_mib_task(struct qca_phy_priv *priv)
+ {
++	int ret;
++
+ 	mutex_lock(&priv->reg_mutex);
+ 	if ((priv->mib_loop_cnt % 2) == 0)
+-		_qca_ar8327_sw_capture_port_rx_counter(priv->device_id, priv->mib_loop_cnt/2);
++		ret = _qca_ar8327_sw_capture_port_rx_counter(priv->device_id, priv->mib_loop_cnt/2);
+ 	else
+-		_qca_ar8327_sw_capture_port_tx_counter(priv->device_id, priv->mib_loop_cnt/2);
++		ret = _qca_ar8327_sw_capture_port_tx_counter(priv->device_id, priv->mib_loop_cnt/2);
++	if (ret != SW_OK)
++		pr_warn_ratelimited("qca-ssdk: MIB sample failed dev=%u port=%u direction=%s error=%d\n",
++			priv->device_id, priv->mib_loop_cnt/2,
++			(priv->mib_loop_cnt % 2) ? "tx" : "rx", ret);
+ 
+ 	if(++priv->mib_loop_cnt == (2 * (priv->ports))) {
+ 		priv->mib_loop_cnt = 0;
