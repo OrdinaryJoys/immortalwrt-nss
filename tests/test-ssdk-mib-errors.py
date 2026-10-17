@@ -15,6 +15,10 @@ args = parser.parse_args()
 fal = (args.prepared / 'src/fal/fal_mib.c').read_text()
 ref = (args.prepared / 'src/ref/ref_mib.c').read_text()
 header = (args.prepared / 'include/fal/fal_mib.h').read_text()
+platform = (args.prepared / 'include/init/ssdk_plat.h').read_text()
+buffer_sizes = re.findall(r'a_uint8_t\s+buf\[(\d+)\]', platform)
+if len(buffer_sizes) != 1:
+    raise RuntimeError('ambiguous target diagnostic buffer size')
 
 
 def function(text, name):
@@ -97,7 +101,7 @@ prefix += r'''
 struct switch_attr { int unused; };
 struct switch_val {int port_vlan; union {char *s;} value; int len;};
 struct qca_phy_priv {unsigned device_id, mib_loop_cnt, ports; int mib_lock, reg_mutex;
-    a_uint64_t *mib_counters; char buf[8192];};
+    a_uint64_t *mib_counters; char buf[TARGET_MIB_BUFFER_SIZE]; uint64_t canary;};
 struct switch_dev {int ports; struct qca_phy_priv *priv;};
 static struct qca_phy_priv *qca_phy_priv_get(struct switch_dev *d) {return d->priv;}
 static void mutex_lock(int *m) {(void)m; assert(mutexes++ == 0);}
@@ -161,6 +165,11 @@ int main(void) {
     check(qca_ar8327_sw_set_reset_mibs(&dev,NULL,&val)==-EIO,"all port reset error propagated");
     check(counters[1].RxFcsErr==15,"all port reset failure preserves data");
     check(!fal_locks && !mutexes,"locks balanced including error paths");
+    reset(); memset(counters,0xff,sizeof(counters)); priv.canary=0x123456789abcdef0ULL;
+    check(qca_ar8327_sw_get_port_mib(&dev,NULL,&val)==0,"maximum counters formatted");
+    check(val.len>0 && (unsigned)val.len<sizeof(priv.buf),"maximum output fits actual target buffer");
+    check(priv.buf[val.len]=='\0' && (unsigned)val.len==strlen(priv.buf),"maximum output not truncated");
+    check(priv.canary==0x123456789abcdef0ULL,"diagnostic buffer canary preserved");
     printf("checks=%u failures=%u\n",checks,failures);
     return failures ? 1 : 0;
 }
@@ -168,7 +177,7 @@ int main(void) {
 with tempfile.TemporaryDirectory(prefix='ssdk-mib-') as directory:
     c = Path(directory) / 'test.c'
     binary = c.with_suffix('')
-    c.write_text(prefix + tests)
+    c.write_text('#define TARGET_MIB_BUFFER_SIZE '+buffer_sizes[0]+'\n'+prefix + tests)
     subprocess.run(['cc', '-std=c11', '-Wall', '-Wextra', '-Werror', '-Wno-unused-parameter', str(c), '-o', str(binary)], check=True)
     result = subprocess.run([str(binary)], capture_output=True, text=True)
     print(result.stdout, end='')
