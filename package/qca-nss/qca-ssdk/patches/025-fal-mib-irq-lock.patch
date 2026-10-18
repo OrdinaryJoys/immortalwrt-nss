@@ -1,0 +1,206 @@
+--- a/src/fal/fal_mib.c
++++ b/src/fal/fal_mib.c
+@@ -27,6 +27,7 @@
+ 
+ #include <linux/kernel.h>
+ #include <linux/module.h>
++#include <linux/spinlock.h>
+ 
+ 
+ static sw_error_t
+@@ -276,6 +277,14 @@
+ static fal_mib_counter_t *g_mibcounter[SW_MAX_NR_DEV];
+ static a_bool_t g_mibcounter_invalid[SW_MAX_NR_DEV][SW_MAX_NR_PORT];
+ 
++/*
++ * MIB-specific lock domain.  FAL_API_LOCK is empty in the target build.
++ * The DP ndo_get_stats64 path calls fal_mib_counter_get() and cannot sleep;
++ * every read-clear/accumulate/reset/free path must share one irqsave domain.
++ * This does not enable the global FAL API lock.
++ */
++static DEFINE_SPINLOCK(fal_mib_lock);
++
+ /* A failed read-clear sample cannot be repaired by the next good sample. */
+ static void _fal_mib_counter_invalidate(a_uint32_t dev_id, fal_port_t port_id)
+ {
+@@ -289,39 +298,49 @@
+ sw_error_t
+ fal_mib_counter_alloc(a_uint32_t dev_id, a_uint64_t **p_mibcounter)
+ {
++	fal_mib_counter_t *new_counter;
++	fal_mib_counter_t *old_counter;
++	unsigned long flags;
++
+ 	if ((p_mibcounter == NULL) || (dev_id >= SW_MAX_NR_DEV))
+ 		return SW_BAD_PARAM;
+ 
+-	*p_mibcounter = NULL;
+-	g_mibcounter[dev_id] = NULL;
+-	memset(g_mibcounter_invalid[dev_id], 0,
+-	       sizeof(g_mibcounter_invalid[dev_id]));
+-
+-	*p_mibcounter = kzalloc(SW_MAX_NR_PORT * sizeof(fal_mib_counter_t),
++	/* Allocation may sleep; never do it under the IRQ-safe MIB lock. */
++	new_counter = kzalloc(SW_MAX_NR_PORT * sizeof(fal_mib_counter_t),
+ 			GFP_KERNEL);
+-
+-	if(NULL == *p_mibcounter)
++	if (new_counter == NULL)
+ 		return SW_OUT_OF_MEM;
+ 
+-	g_mibcounter[dev_id] = (fal_mib_counter_t*)*p_mibcounter;
++	spin_lock_irqsave(&fal_mib_lock, flags);
++	old_counter = g_mibcounter[dev_id];
++	g_mibcounter[dev_id] = new_counter;
++	memset(g_mibcounter_invalid[dev_id], 0,
++	       sizeof(g_mibcounter_invalid[dev_id]));
++	spin_unlock_irqrestore(&fal_mib_lock, flags);
+ 
++	kfree(old_counter);
++	*p_mibcounter = (a_uint64_t *)new_counter;
+ 	return SW_OK;
+ }
+ 
+ sw_error_t
+ fal_mib_counter_free(a_uint32_t dev_id, a_uint64_t **p_mibcounter)
+ {
++	fal_mib_counter_t *old_counter;
++	unsigned long flags;
++
+ 	if ((p_mibcounter == NULL) || (dev_id >= SW_MAX_NR_DEV))
+ 		return SW_BAD_PARAM;
+ 
+-	if (*p_mibcounter != NULL) {
+-		kfree(*p_mibcounter);
+-		*p_mibcounter = NULL;
+-	}
+-
++	spin_lock_irqsave(&fal_mib_lock, flags);
++	old_counter = g_mibcounter[dev_id];
+ 	g_mibcounter[dev_id] = NULL;
+ 	memset(g_mibcounter_invalid[dev_id], 0,
+ 	       sizeof(g_mibcounter_invalid[dev_id]));
++	spin_unlock_irqrestore(&fal_mib_lock, flags);
++
++	kfree(old_counter);
++	*p_mibcounter = NULL;
+ 	return SW_OK;
+ }
+ 
+@@ -418,14 +437,16 @@
+ {
+     sw_error_t rv;
+ 
+-    FAL_API_LOCK;
++    unsigned long flags;
++
++    spin_lock_irqsave(&fal_mib_lock, flags);
+     rv = _fal_get_mib_info(dev_id, port_id, mib_Info);
+     if (rv == SW_OK) {
+         _fal_rx_mib_update(dev_id, port_id, mib_Info);
+         _fal_tx_mib_update(dev_id, port_id, mib_Info);
+     } else if (mib_Info)
+         _fal_mib_counter_invalidate(dev_id, port_id);
+-    FAL_API_UNLOCK;
++    spin_unlock_irqrestore(&fal_mib_lock, flags);
+     return rv;
+ }
+ 
+@@ -436,22 +457,24 @@
+ 	sw_error_t rv;
+ 	fal_mib_info_t mib_info = {0};
+ 	a_uint32_t port_index = FAL_PORT_ID_VALUE(port_id);
++	unsigned long flags;
+ 
+ 	if (dev_id >= SW_MAX_NR_DEV || port_index >= SW_MAX_NR_PORT)
+ 		return SW_BAD_PARAM;
+-	if (!mib_counter || !g_mibcounter[dev_id])
+-		return SW_BAD_PTR;
+ 
+-	/* Keep the hardware read, accumulation and output in one FAL snapshot. */
+-	FAL_API_LOCK;
++	spin_lock_irqsave(&fal_mib_lock, flags);
++	if (!mib_counter || !g_mibcounter[dev_id]) {
++		spin_unlock_irqrestore(&fal_mib_lock, flags);
++		return SW_BAD_PTR;
++	}
+ 	if (g_mibcounter_invalid[dev_id][port_index]) {
+-		FAL_API_UNLOCK;
++		spin_unlock_irqrestore(&fal_mib_lock, flags);
+ 		return SW_READ_ERROR;
+ 	}
+ 	rv = _fal_get_mib_info(dev_id, port_id, &mib_info);
+ 	if (rv != SW_OK) {
+ 		_fal_mib_counter_invalidate(dev_id, port_id);
+-		FAL_API_UNLOCK;
++		spin_unlock_irqrestore(&fal_mib_lock, flags);
+ 		return rv;
+ 	}
+ 	_fal_rx_mib_update(dev_id, port_id, &mib_info);
+@@ -459,7 +482,7 @@
+ 
+ 	*mib_counter = g_mibcounter[dev_id][port_index];
+ 
+-	FAL_API_UNLOCK;
++	spin_unlock_irqrestore(&fal_mib_lock, flags);
+ 	return SW_OK;
+ }
+ 
+@@ -476,13 +499,15 @@
+ {
+     sw_error_t rv;
+ 
+-    FAL_API_LOCK;
++    unsigned long flags;
++
++    spin_lock_irqsave(&fal_mib_lock, flags);
+     rv = _fal_get_rx_mib_info(dev_id, port_id, mib_Info);
+     if (rv == SW_OK)
+         _fal_rx_mib_update(dev_id, port_id, mib_Info);
+     else if (mib_Info)
+         _fal_mib_counter_invalidate(dev_id, port_id);
+-    FAL_API_UNLOCK;
++    spin_unlock_irqrestore(&fal_mib_lock, flags);
+ 
+     return rv;
+ }
+@@ -500,13 +525,15 @@
+ {
+     sw_error_t rv;
+ 
+-    FAL_API_LOCK;
++    unsigned long flags;
++
++    spin_lock_irqsave(&fal_mib_lock, flags);
+     rv = _fal_get_tx_mib_info(dev_id, port_id, mib_Info);
+     if (rv == SW_OK)
+         _fal_tx_mib_update(dev_id, port_id, mib_Info);
+     else if (mib_Info)
+         _fal_mib_counter_invalidate(dev_id, port_id);
+-    FAL_API_UNLOCK;
++    spin_unlock_irqrestore(&fal_mib_lock, flags);
+ 
+     return rv;
+ }
+@@ -556,9 +583,11 @@
+ {
+     sw_error_t rv;
+ 
++    unsigned long flags;
++
+     if (dev_id >= SW_MAX_NR_DEV || FAL_PORT_ID_VALUE(port_id) >= SW_MAX_NR_PORT)
+         return SW_BAD_PARAM;
+-    FAL_API_LOCK;
++    spin_lock_irqsave(&fal_mib_lock, flags);
+     rv = _fal_mib_port_flush_counters(dev_id, port_id);
+     if (rv == SW_OK && g_mibcounter[dev_id]) {
+         memset(&g_mibcounter[dev_id][FAL_PORT_ID_VALUE(port_id)], 0,
+@@ -566,7 +595,7 @@
+         g_mibcounter_invalid[dev_id][FAL_PORT_ID_VALUE(port_id)] = A_FALSE;
+     } else if (rv != SW_OK)
+         _fal_mib_counter_invalidate(dev_id, port_id);
+-    FAL_API_UNLOCK;
++    spin_unlock_irqrestore(&fal_mib_lock, flags);
+     return rv;
+ }
+ 
