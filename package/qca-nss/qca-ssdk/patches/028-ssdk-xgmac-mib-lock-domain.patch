@@ -1,0 +1,125 @@
+--- a/src/fal/fal_mib.c
++++ b/src/fal/fal_mib.c
+@@ -450,40 +450,44 @@
+     return rv;
+ }
+ 
+-sw_error_t
+-fal_mib_counter_get(a_uint32_t dev_id, fal_port_t port_id,
++/* Caller must hold fal_mib_lock. */
++static sw_error_t
++__fal_mib_counter_get_locked(a_uint32_t dev_id, fal_port_t port_id,
+ 				fal_mib_counter_t *mib_counter)
+ {
+ 	sw_error_t rv;
+ 	fal_mib_info_t mib_info = {0};
+ 	a_uint32_t port_index = FAL_PORT_ID_VALUE(port_id);
+-	unsigned long flags;
+ 
+ 	if (dev_id >= SW_MAX_NR_DEV || port_index >= SW_MAX_NR_PORT)
+ 		return SW_BAD_PARAM;
+-
+-	spin_lock_irqsave(&fal_mib_lock, flags);
+-	if (!mib_counter || !g_mibcounter[dev_id]) {
+-		spin_unlock_irqrestore(&fal_mib_lock, flags);
++	if (!mib_counter || !g_mibcounter[dev_id])
+ 		return SW_BAD_PTR;
+-	}
+-	if (g_mibcounter_invalid[dev_id][port_index]) {
+-		spin_unlock_irqrestore(&fal_mib_lock, flags);
++	if (g_mibcounter_invalid[dev_id][port_index])
+ 		return SW_READ_ERROR;
+-	}
++
+ 	rv = _fal_get_mib_info(dev_id, port_id, &mib_info);
+ 	if (rv != SW_OK) {
+ 		_fal_mib_counter_invalidate(dev_id, port_id);
+-		spin_unlock_irqrestore(&fal_mib_lock, flags);
+ 		return rv;
+ 	}
+ 	_fal_rx_mib_update(dev_id, port_id, &mib_info);
+ 	_fal_tx_mib_update(dev_id, port_id, &mib_info);
+-
+ 	*mib_counter = g_mibcounter[dev_id][port_index];
++	return SW_OK;
++}
+ 
++sw_error_t
++fal_mib_counter_get(a_uint32_t dev_id, fal_port_t port_id,
++				fal_mib_counter_t *mib_counter)
++{
++	sw_error_t rv;
++	unsigned long flags;
++
++	spin_lock_irqsave(&fal_mib_lock, flags);
++	rv = __fal_mib_counter_get_locked(dev_id, port_id, mib_counter);
+ 	spin_unlock_irqrestore(&fal_mib_lock, flags);
+-	return SW_OK;
++	return rv;
+ }
+ 
+ /**
+@@ -646,16 +650,20 @@
+ {
+     sw_error_t rv;
+     fal_mib_counter_t gmac_mib = { 0 };
++    unsigned long flags;
+ 
+-    FAL_API_LOCK;
++    spin_lock_irqsave(&fal_mib_lock, flags);
+     rv = _fal_get_xgmib_info(dev_id, port_id, mib_Info);
+-    FAL_API_UNLOCK;
+-	if (rv != SW_OK)
++    if (rv != SW_OK) {
++		spin_unlock_irqrestore(&fal_mib_lock, flags);
+ 		return rv;
++    }
+ 
+-    rv = fal_mib_counter_get(dev_id, port_id, &gmac_mib);
+-	if (rv != SW_OK)
++    rv = __fal_mib_counter_get_locked(dev_id, port_id, &gmac_mib);
++    if (rv != SW_OK) {
++		spin_unlock_irqrestore(&fal_mib_lock, flags);
+ 		return rv;
++    }
+ 
+     mib_Info->RxFrame += (gmac_mib.RxBroad +
+ 				gmac_mib.RxMulti + gmac_mib.RxUniCast);
+@@ -695,7 +703,8 @@
+ 				gmac_mib.TxMulti + gmac_mib.TxUniCast);
+     mib_Info->TxPause += gmac_mib.TxPause;
+ 
+-	return SW_OK;
++    spin_unlock_irqrestore(&fal_mib_lock, flags);
++    return SW_OK;
+ }
+ 
+ /**
+@@ -710,10 +719,11 @@
+                  fal_xgmib_info_t * mib_Info)
+ {
+     sw_error_t rv;
++    unsigned long flags;
+ 
+-    FAL_API_LOCK;
++    spin_lock_irqsave(&fal_mib_lock, flags);
+     rv = _fal_get_rx_xgmib_info(dev_id, port_id, mib_Info);
+-    FAL_API_UNLOCK;
++    spin_unlock_irqrestore(&fal_mib_lock, flags);
+     return rv;
+ }
+ 
+@@ -729,10 +739,11 @@
+                  fal_xgmib_info_t * mib_Info)
+ {
+     sw_error_t rv;
++    unsigned long flags;
+ 
+-    FAL_API_LOCK;
++    spin_lock_irqsave(&fal_mib_lock, flags);
+     rv = _fal_get_tx_xgmib_info(dev_id, port_id, mib_Info);
+-    FAL_API_UNLOCK;
++    spin_unlock_irqrestore(&fal_mib_lock, flags);
+     return rv;
+ }
+ 
