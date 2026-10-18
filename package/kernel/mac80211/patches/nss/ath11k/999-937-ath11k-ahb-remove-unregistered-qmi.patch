@@ -1,0 +1,29 @@
+--- a/drivers/net/wireless/ath/ath11k/ahb.c
++++ b/drivers/net/wireless/ath/ath11k/ahb.c
+@@ -1388,10 +1388,13 @@
+ {
+ 	struct ath11k_base *ab = platform_get_drvdata(pdev);
+ 
+-	if (test_bit(ATH11K_FLAG_QMI_FAIL, &ab->dev_flags)) {
++	if (test_bit(ATH11K_FLAG_QMI_FAIL, &ab->dev_flags) ||
++	    !test_bit(ATH11K_FLAG_REGISTERED, &ab->dev_flags)) {
++		ath11k_ahb_remove_prepare(ab);
+ 		ath11k_ahb_power_down(ab, false);
+ 		ath11k_debugfs_soc_destroy(ab);
+ 		ath11k_qmi_deinit_service(ab);
++		ath11k_core_pm_notifier_unregister(ab);
+ 		goto qmi_fail;
+ 	}
+ 
+@@ -1413,8 +1416,10 @@
+ 	 */
+ 	ath11k_ahb_remove_prepare(ab);
+ 
+-	if (!(test_bit(ATH11K_FLAG_REGISTERED, &ab->dev_flags)))
++	if (!(test_bit(ATH11K_FLAG_REGISTERED, &ab->dev_flags))) {
++		ath11k_core_pm_notifier_unregister(ab);
+ 		goto free_resources;
++	}
+ 
+ 	ath11k_core_deinit(ab);
+ 
