@@ -1,0 +1,94 @@
+--- a/src/fal/fal_mib.c
++++ b/src/fal/fal_mib.c
+@@ -274,6 +274,17 @@ _fal_get_tx_xgmib_info(a_uint32_t dev_id, fal_port_t port_id,
+ }
+ 
+ static fal_mib_counter_t *g_mibcounter[SW_MAX_NR_DEV];
++static a_bool_t g_mibcounter_invalid[SW_MAX_NR_DEV][SW_MAX_NR_PORT];
++
++/* A failed read-clear sample cannot be repaired by the next good sample. */
++static void _fal_mib_counter_invalidate(a_uint32_t dev_id, fal_port_t port_id)
++{
++	a_uint32_t port_index = FAL_PORT_ID_VALUE(port_id);
++
++	if (dev_id < SW_MAX_NR_DEV && port_index < SW_MAX_NR_PORT &&
++	    g_mibcounter[dev_id])
++		g_mibcounter_invalid[dev_id][port_index] = A_TRUE;
++}
+ 
+ sw_error_t
+ fal_mib_counter_alloc(a_uint32_t dev_id, a_uint64_t **p_mibcounter)
+@@ -283,6 +294,8 @@ fal_mib_counter_alloc(a_uint32_t dev_id, a_uint64_t **p_mibcounter)
+ 
+ 	*p_mibcounter = NULL;
+ 	g_mibcounter[dev_id] = NULL;
++	memset(g_mibcounter_invalid[dev_id], 0,
++	       sizeof(g_mibcounter_invalid[dev_id]));
+ 
+ 	*p_mibcounter = kzalloc(SW_MAX_NR_PORT * sizeof(fal_mib_counter_t),
+ 			GFP_KERNEL);
+@@ -307,6 +320,8 @@ fal_mib_counter_free(a_uint32_t dev_id, a_uint64_t **p_mibcounter)
+ 	}
+ 
+ 	g_mibcounter[dev_id] = NULL;
++	memset(g_mibcounter_invalid[dev_id], 0,
++	       sizeof(g_mibcounter_invalid[dev_id]));
+ 	return SW_OK;
+ }
+ 
+@@ -408,7 +423,8 @@ fal_get_mib_info(a_uint32_t dev_id, fal_port_t port_id,
+     if (rv == SW_OK) {
+         _fal_rx_mib_update(dev_id, port_id, mib_Info);
+         _fal_tx_mib_update(dev_id, port_id, mib_Info);
+-    }
++    } else if (mib_Info)
++        _fal_mib_counter_invalidate(dev_id, port_id);
+     FAL_API_UNLOCK;
+     return rv;
+ }
+@@ -428,8 +444,13 @@ fal_mib_counter_get(a_uint32_t dev_id, fal_port_t port_id,
+ 
+ 	/* Keep the hardware read, accumulation and output in one FAL snapshot. */
+ 	FAL_API_LOCK;
++	if (g_mibcounter_invalid[dev_id][port_index]) {
++		FAL_API_UNLOCK;
++		return SW_READ_ERROR;
++	}
+ 	rv = _fal_get_mib_info(dev_id, port_id, &mib_info);
+ 	if (rv != SW_OK) {
++		_fal_mib_counter_invalidate(dev_id, port_id);
+ 		FAL_API_UNLOCK;
+ 		return rv;
+ 	}
+@@ -459,6 +480,8 @@ fal_get_rx_mib_info(a_uint32_t dev_id, fal_port_t port_id,
+     rv = _fal_get_rx_mib_info(dev_id, port_id, mib_Info);
+     if (rv == SW_OK)
+         _fal_rx_mib_update(dev_id, port_id, mib_Info);
++    else if (mib_Info)
++        _fal_mib_counter_invalidate(dev_id, port_id);
+     FAL_API_UNLOCK;
+ 
+     return rv;
+@@ -481,6 +504,8 @@ fal_get_tx_mib_info(a_uint32_t dev_id, fal_port_t port_id,
+     rv = _fal_get_tx_mib_info(dev_id, port_id, mib_Info);
+     if (rv == SW_OK)
+         _fal_tx_mib_update(dev_id, port_id, mib_Info);
++    else if (mib_Info)
++        _fal_mib_counter_invalidate(dev_id, port_id);
+     FAL_API_UNLOCK;
+ 
+     return rv;
+@@ -535,9 +560,12 @@ fal_mib_port_flush_counters(a_uint32_t dev_id, fal_port_t port_id )
+         return SW_BAD_PARAM;
+     FAL_API_LOCK;
+     rv = _fal_mib_port_flush_counters(dev_id, port_id);
+-    if (rv == SW_OK && g_mibcounter[dev_id])
++    if (rv == SW_OK && g_mibcounter[dev_id]) {
+         memset(&g_mibcounter[dev_id][FAL_PORT_ID_VALUE(port_id)], 0,
+                sizeof(fal_mib_counter_t));
++        g_mibcounter_invalid[dev_id][FAL_PORT_ID_VALUE(port_id)] = A_FALSE;
++    } else if (rv != SW_OK)
++        _fal_mib_counter_invalidate(dev_id, port_id);
+     FAL_API_UNLOCK;
+     return rv;
+ }

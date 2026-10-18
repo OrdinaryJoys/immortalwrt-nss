@@ -16,16 +16,20 @@ fal = (args.prepared / 'src/fal/fal_mib.c').read_text()
 ref = (args.prepared / 'src/ref/ref_mib.c').read_text()
 header = (args.prepared / 'include/fal/fal_mib.h').read_text()
 platform = (args.prepared / 'include/init/ssdk_plat.h').read_text()
+port_header = (args.prepared / 'include/fal/fal_type.h').read_text()
+port_macro = re.search(r'^#define FAL_PORT_ID_VALUE\([^\n]+', port_header, re.M).group()
 buffer_sizes = re.findall(r'a_uint8_t\s+buf\[(\d+)\]', platform)
 if len(buffer_sizes) != 1:
     raise RuntimeError('ambiguous target diagnostic buffer size')
 
 
 def function(text, name):
-    matches = list(re.finditer(r'(?m)^' + re.escape(name) + r'\(', text))
+    matches = list(re.finditer(r'(?m)^(?:static void )?' + re.escape(name) + r'\(', text))
     if len(matches) != 1:
         raise RuntimeError('ambiguous function: ' + name)
     start = matches[0].start()
+    if text.startswith('static void ', start):
+        start += len('static void ')
     opening = text.index('{', start)
     depth, end = 1, opening + 1
     while depth:
@@ -51,14 +55,17 @@ typedef unsigned long a_uint64_t;
 typedef uint64_t u64;
 typedef uint32_t fal_port_t;
 typedef int sw_error_t;
+typedef int a_bool_t;
 #define SW_OK 0
 #define SW_BAD_PTR -1
 #define SW_BAD_PARAM -2
+#define SW_READ_ERROR -8
+#define A_TRUE 1
+#define A_FALSE 0
 #define SW_MAX_NR_PORT 8
 #define SW_MAX_NR_DEV 1
-#define FAL_PORT_ID_VALUE(v) ((v) & 0xffff)
 '''
-prefix += types
+prefix += port_macro + '\n' + types
 prefix += r'''
 static fal_mib_counter_t counters[8];
 static fal_mib_counter_t *g_mibcounter[1] = {counters};
@@ -84,6 +91,12 @@ static int _fal_mib_port_flush_counters(unsigned dev, unsigned port) {
     (void)dev; (void)port; assert(fal_locks == 1); return flush_status;
 }
 '''
+if 'static a_bool_t g_mibcounter_invalid[' in fal:
+    prefix += re.search(r'static a_bool_t g_mibcounter_invalid\[[^;]+;', fal).group() + '\n'
+    prefix += 'static void\n' + function(fal, '_fal_mib_counter_invalidate')
+    prefix += 'static void reset_mib_validity(void) { memset(g_mibcounter_invalid,0,sizeof(g_mibcounter_invalid)); }\n'
+else:
+    prefix += 'static void reset_mib_validity(void) {}\n'
 for name in ('_fal_rx_mib_update', '_fal_tx_mib_update'):
     # The updater definitions have a same-line static return type.
     anchor = 'static void ' + name + '('
@@ -128,6 +141,7 @@ tests = r'''
 static unsigned checks, failures;
 static void check(int ok, const char *name) {checks++; if(!ok) {failures++;printf("FAIL %s\n",name);}}
 static void reset(void) {
+    reset_mib_validity();
     memset(counters,0,sizeof(counters)); memset(&sample,0,sizeof(sample));
     io_status=flush_status=warnings=mutate_on_unlock=0; assert(!fal_locks && !mutexes);
 }
