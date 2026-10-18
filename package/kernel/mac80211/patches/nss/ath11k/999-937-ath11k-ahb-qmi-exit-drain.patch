@@ -1,0 +1,101 @@
+--- a/drivers/net/wireless/ath/ath11k/ahb.c
++++ b/drivers/net/wireless/ath/ath11k/ahb.c
+@@ -1363,9 +1363,17 @@
+ 			ath11k_warn(ab, "failed to receive recovery response completion\n");
+ 	}
+ 
++	spin_lock(&ab->qmi.event_lock);
+ 	set_bit(ATH11K_FLAG_UNREGISTERING, &ab->dev_flags);
+-	cancel_work_sync(&ab->restart_work);
++	spin_unlock(&ab->qmi.event_lock);
++
++	/* Close the producer before draining the consumer: event_post()
++	 * rejects new events under event_lock once UNREGISTERING is set.
++	 * event_work() may still queue restart_work while it drains, so
++	 * cancel it before restart_work.
++	 */
+ 	cancel_work_sync(&ab->qmi.event_work);
++	cancel_work_sync(&ab->restart_work);
+ 	cancel_work_sync(&ab->wmi_ast_work);
+ }
+ 
+@@ -1387,15 +1395,24 @@
+ static void ath11k_ahb_remove(struct platform_device *pdev)
+ {
+ 	struct ath11k_base *ab = platform_get_drvdata(pdev);
++	bool registered;
+ 
+-	if (test_bit(ATH11K_FLAG_QMI_FAIL, &ab->dev_flags)) {
++	/* Drain first, then choose the teardown path from the final state.
++	 * An in-flight QMI event may register the core after the initial
++	 * check; an initial unregistered device must still be deinitialised
++	 * if the drain completed registration.
++	 */
++	ath11k_ahb_remove_prepare(ab);
++	registered = test_bit(ATH11K_FLAG_REGISTERED, &ab->dev_flags);
++
++	if (test_bit(ATH11K_FLAG_QMI_FAIL, &ab->dev_flags) || !registered) {
+ 		ath11k_ahb_power_down(ab, false);
+ 		ath11k_debugfs_soc_destroy(ab);
+ 		ath11k_qmi_deinit_service(ab);
++		ath11k_core_pm_notifier_unregister(ab);
+ 		goto qmi_fail;
+ 	}
+ 
+-	ath11k_ahb_remove_prepare(ab);
+ 	ath11k_core_deinit(ab);
+ 
+ qmi_fail:
+@@ -1413,8 +1430,10 @@
+ 	 */
+ 	ath11k_ahb_remove_prepare(ab);
+ 
+-	if (!(test_bit(ATH11K_FLAG_REGISTERED, &ab->dev_flags)))
++	if (!(test_bit(ATH11K_FLAG_REGISTERED, &ab->dev_flags))) {
++		ath11k_core_pm_notifier_unregister(ab);
+ 		goto free_resources;
++	}
+ 
+ 	ath11k_core_deinit(ab);
+ 
+--- a/drivers/net/wireless/ath/ath11k/qmi.c
++++ b/drivers/net/wireless/ath/ath11k/qmi.c
+@@ -2960,6 +2960,11 @@
+ 	event->data = data;
+ 
+ 	spin_lock(&qmi->event_lock);
++	if (test_bit(ATH11K_FLAG_UNREGISTERING, &qmi->ab->dev_flags)) {
++		spin_unlock(&qmi->event_lock);
++		kfree(event);
++		return -ESHUTDOWN;
++	}
+ 	list_add_tail(&event->list, &qmi->event_list);
+ 	spin_unlock(&qmi->event_lock);
+ 
+@@ -3372,10 +3377,26 @@
+ 	return ret;
+ }
+ 
++static void ath11k_qmi_driver_event_purge(struct ath11k_qmi *qmi)
++{
++	struct ath11k_qmi_driver_event *event, *tmp;
++	LIST_HEAD(purge);
++
++	spin_lock(&qmi->event_lock);
++	list_splice_init(&qmi->event_list, &purge);
++	spin_unlock(&qmi->event_lock);
++
++	list_for_each_entry_safe(event, tmp, &purge, list) {
++		list_del(&event->list);
++		kfree(event);
++	}
++}
++
+ void ath11k_qmi_deinit_service(struct ath11k_base *ab)
+ {
+ 	qmi_handle_release(&ab->qmi.handle);
+ 	cancel_work_sync(&ab->qmi.event_work);
++	ath11k_qmi_driver_event_purge(&ab->qmi);
+ 	destroy_workqueue(ab->qmi.event_wq);
+ 	ath11k_qmi_m3_free(ab);
+ 	ath11k_qmi_free_target_mem_chunk(ab);
