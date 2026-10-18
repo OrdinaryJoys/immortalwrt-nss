@@ -71,12 +71,15 @@ static fal_mib_counter_t counters[8];
 static fal_mib_counter_t *g_mibcounter[1] = {counters};
 static fal_mib_info_t sample;
 static int io_status, flush_status, fal_locks, mutexes, warnings, mutate_on_unlock;
-static void unlock_fal(void) {
-    assert(fal_locks-- == 1);
-    if (mutate_on_unlock) counters[1].RxFcsErr += 100;
-}
-#define FAL_API_LOCK assert(fal_locks++ == 0)
-#define FAL_API_UNLOCK unlock_fal()
+typedef struct { int locked; } spinlock_t;
+static spinlock_t fal_mib_lock;
+#define spin_lock_irqsave(lock, flags) do { \
+    assert(!(lock)->locked); (lock)->locked = 1; (void)(flags); fal_locks++; \
+} while (0)
+#define spin_unlock_irqrestore(lock, flags) do { \
+    assert((lock)->locked); (lock)->locked = 0; (void)(flags); fal_locks--; \
+    if (mutate_on_unlock) counters[1].RxFcsErr += 100; \
+} while (0)
 static int _fal_get_mib_info(unsigned dev, unsigned port, fal_mib_info_t *out) {
     (void)dev; (void)port; assert(fal_locks == 1);
     *out = sample; return io_status;
@@ -97,6 +100,16 @@ if 'static a_bool_t g_mibcounter_invalid[' in fal:
     prefix += 'static void reset_mib_validity(void) { memset(g_mibcounter_invalid,0,sizeof(g_mibcounter_invalid)); }\n'
 else:
     prefix += 'static void reset_mib_validity(void) {}\n'
+prefix += 'static void _fal_rx_mib_update(a_uint32_t, fal_port_t, fal_mib_info_t *);\n'
+prefix += 'static void _fal_tx_mib_update(a_uint32_t, fal_port_t, fal_mib_info_t *);\n'
+helper = '__fal_mib_counter_get_locked('
+start = fal.index(helper)
+opening = fal.index('{', start)
+depth, end = 1, opening + 1
+while depth:
+    depth += (fal[end] == '{') - (fal[end] == '}')
+    end += 1
+prefix += 'sw_error_t\n' + fal[start:end] + '\n'
 for name in ('_fal_rx_mib_update', '_fal_tx_mib_update'):
     # The updater definitions have a same-line static return type.
     anchor = 'static void ' + name + '('
