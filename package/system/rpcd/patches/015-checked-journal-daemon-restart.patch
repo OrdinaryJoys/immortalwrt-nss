@@ -1,0 +1,250 @@
+--- a/uci.c
++++ b/uci.c
+@@ -18,6 +18,10 @@
+ 
+ #include <libgen.h>
+ #include <glob.h>
++#include <fcntl.h>
++#include <errno.h>
++#include <time.h>
++#include <syslog.h>
+ #include <sys/random.h>
+ 
+ #include <libubox/blobmsg.h>
+@@ -53,16 +57,174 @@
+ static unsigned int checked_history_next;
+ static bool checked_io_failed;
+ 
++static bool checked_journal_blocked;
++static bool checked_hex(const char *value, size_t length);
++
+ static bool checked_active(void)
+ {
+-	return checked_current.state != CHECKED_NONE;
++	return checked_journal_blocked || checked_current.state != CHECKED_NONE;
+ }
+ 
++static const char *checked_state_name(enum checked_state state)
++{
++	switch (state) {
++	case CHECKED_APPLYING: return "applying";
++	case CHECKED_PENDING: return "pending";
++	case CHECKED_UNKNOWN: return "unknown";
++	default: return "unknown";
++	}
++}
++
++static enum checked_state checked_state_parse(const char *s)
++{
++	if (!strcmp(s, "applying")) return CHECKED_APPLYING;
++	if (!strcmp(s, "pending")) return CHECKED_PENDING;
++	if (!strcmp(s, "unknown")) return CHECKED_UNKNOWN;
++	if (!strcmp(s, "confirmed")) return CHECKED_CONFIRMED;
++	if (!strcmp(s, "rolled_back")) return CHECKED_ROLLED_BACK;
++	return CHECKED_NONE;
++}
++
++static unsigned long long checked_now_ms(void)
++{
++	struct timespec ts;
++	clock_gettime(CLOCK_MONOTONIC, &ts);
++	return (unsigned long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
++}
++
++static int checked_journal_clear(void)
++{
++	if (!unlink(RPC_CHECKED_JOURNAL) || errno == ENOENT)
++		return 0;
++	syslog(LOG_ERR, "uci.checked: unlink journal: %m");
++	checked_journal_blocked = true;
++	return -1;
++}
++
++static int checked_journal_write(void)
++{
++	char data[PATH_MAX], tmp[PATH_MAX];
++	int fd, len, off = 0;
++	ssize_t n;
++
++	if (checked_current.state == CHECKED_NONE)
++		return checked_journal_clear();
++
++	len = snprintf(data, sizeof(data),
++		"version=1\nid=%s\nrequest=%s\nsid=%s\nstate=%s\n"
++		"files=%u\ncleanup=%u\ncreated_ms=%llu\n",
++		checked_current.id, checked_current.request, checked_current.sid,
++		checked_state_name(checked_current.state), checked_current.files,
++		checked_current.cleanup_pending ? 1 : 0, checked_now_ms());
++	if (len < 0 || (size_t)len >= sizeof(data)) {
++		checked_journal_blocked = true;
++		return -1;
++	}
++
++	snprintf(tmp, sizeof(tmp), "%s.tmp", RPC_CHECKED_JOURNAL);
++	fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0600);
++	if (fd < 0) {
++		syslog(LOG_ERR, "uci.checked: open journal: %m");
++		checked_journal_blocked = true;
++		return -1;
++	}
++	while (off < len) {
++		n = write(fd, data + off, len - off);
++		if (n <= 0) {
++			syslog(LOG_ERR, "uci.checked: write journal: %m");
++			close(fd); unlink(tmp); checked_journal_blocked = true;
++			return -1;
++		}
++		off += n;
++	}
++	{
++		int rc = fsync(fd);
++		if (close(fd))
++			rc = -1;
++		if (rc || rename(tmp, RPC_CHECKED_JOURNAL)) {
++			syslog(LOG_ERR, "uci.checked: commit journal: %m");
++			unlink(tmp); checked_journal_blocked = true;
++			return -1;
++		}
++	}
++	return 0;
++}
++
++static void checked_journal_load(void)
++{
++	char data[1024], *line, *save, *id = NULL, *request = NULL, *sid = NULL;
++	char *state = NULL, *files = NULL, *cleanup = NULL;
++	enum checked_state st;
++	int fd;
++	ssize_t n;
++
++	fd = open(RPC_CHECKED_JOURNAL, O_RDONLY);
++	if (fd < 0) {
++		if (errno != ENOENT) {
++			syslog(LOG_ERR, "uci.checked: open journal: %m");
++			checked_journal_blocked = true;
++		}
++		return;
++	}
++	n = read(fd, data, sizeof(data) - 1);
++	close(fd);
++	if (n <= 0) {
++		syslog(LOG_ERR, "uci.checked: empty/short journal");
++		checked_journal_blocked = true;
++		return;
++	}
++	data[n] = 0;
++	for (line = strtok_r(data, "\n", &save); line; line = strtok_r(NULL, "\n", &save)) {
++		if (!strncmp(line, "id=", 3)) id = line + 3;
++		else if (!strncmp(line, "request=", 8)) request = line + 8;
++		else if (!strncmp(line, "sid=", 4)) sid = line + 4;
++		else if (!strncmp(line, "state=", 6)) state = line + 6;
++		else if (!strncmp(line, "files=", 6)) files = line + 6;
++		else if (!strncmp(line, "cleanup=", 8)) cleanup = line + 8;
++	}
++	st = state ? checked_state_parse(state) : CHECKED_NONE;
++	if (!id || !request || !sid || !state || !files || !cleanup ||
++	    !checked_hex(id, 32) || !checked_hex(request, 32) ||
++	    strlen(sid) != RPC_SID_LEN || st == CHECKED_NONE) {
++		syslog(LOG_ERR, "uci.checked: malformed journal; writes blocked");
++		checked_journal_blocked = true;
++		return;
++	}
++	{
++		char *end;
++		unsigned long fv = strtoul(files, &end, 10);
++		if (*end || fv > UINT_MAX || (strcmp(cleanup, "0") && strcmp(cleanup, "1"))) {
++			syslog(LOG_ERR, "uci.checked: malformed journal fields; writes blocked");
++			checked_journal_blocked = true;
++			return;
++		}
++	}
++	if (st == CHECKED_APPLYING || st == CHECKED_PENDING || st == CHECKED_UNKNOWN) {
++		memset(&checked_current, 0, sizeof(checked_current));
++		memcpy(checked_current.id, id, 33);
++		memcpy(checked_current.request, request, 33);
++		memcpy(checked_current.sid, sid, RPC_SID_LEN + 1);
++		checked_current.files = (unsigned int)strtoul(files, NULL, 10);
++		checked_current.cleanup_pending = atoi(cleanup) != 0;
++		/* Never turn a crash-interrupted transaction into a success. */
++		checked_current.state = CHECKED_UNKNOWN;
++		memcpy(apply_sid, sid, RPC_SID_LEN + 1);
++		syslog(LOG_WARNING, "uci.checked: recovered journal as unknown");
++	} else {
++		/* Terminal journal is stale; clear it, or block if that fails. */
++		checked_journal_clear();
++	}
++}
++
+ static void checked_finish(enum checked_state state)
+ {
+ 	if (!checked_active())
+ 		return;
+ 	checked_current.state = state;
++	if (state == CHECKED_CONFIRMED || state == CHECKED_ROLLED_BACK) {
++		if (checked_journal_clear())
++			checked_current.cleanup_pending = true;
++	}
+ 	checked_history[checked_history_next++ % ARRAY_SIZE(checked_history)] = checked_current;
+ 	memset(&checked_current, 0, sizeof(checked_current));
+ }
+@@ -1653,6 +1815,7 @@
+ 	if (guarded && (checked_io_failed || restored != checked_current.files)) {
+ 		/* Keep snapshots and ownership for an explicit recovery retry. */
+ 		checked_current.state = CHECKED_UNKNOWN;
++		checked_journal_write();
+ 		return;
+ 	}
+ 
+@@ -1675,8 +1838,10 @@
+ 
+ 	snprintf(tmp, sizeof(tmp), "%s/*", RPC_SNAPSHOT_FILES);
+ 	if (glob(tmp, GLOB_PERIOD, NULL, &gl)) {
+-		if (checked_active())
++		if (checked_active()) {
+ 			checked_current.state = CHECKED_UNKNOWN;
++			checked_journal_write();
++		}
+ 		return;
+ 	}
+ 
+@@ -1781,6 +1946,11 @@
+ 			memcpy(checked_current.sid, sid, RPC_SID_LEN + 1);
+ 			checked_current.files = files;
+ 			checked_current.state = CHECKED_APPLYING;
++			if (checked_journal_write()) {
++				checked_current.state = CHECKED_UNKNOWN;
++				globfree(&gl);
++				return UBUS_STATUS_UNKNOWN_ERROR;
++			}
+ 		}
+ 
+ 		/* copy SID early because rpc_uci_apply_config() will clobber buf */
+@@ -1819,6 +1989,10 @@
+ 		}
+ 		if (guarded) {
+ 			checked_current.state = checked_io_failed ? CHECKED_UNKNOWN : CHECKED_PENDING;
++			if (checked_journal_write() && checked_current.state == CHECKED_PENDING) {
++				checked_current.state = CHECKED_UNKNOWN;
++				checked_journal_blocked = true;
++			}
+ 		}
+ 	}
+ 
+@@ -2192,6 +2366,7 @@
+ 	if (!cursor)
+ 		return UBUS_STATUS_UNKNOWN_ERROR;
+ 
++	checked_journal_load();
+ 	rpc_session_destroy_cb(&cb);
+ 
+ 	return ubus_add_object(ctx, &obj);
+--- a/include/rpcd/uci.h
++++ b/include/rpcd/uci.h
+@@ -34,6 +34,7 @@
+ #define RPC_UCI_SAVEDIR_PREFIX	RPC_UCI_DIR_PREFIX "/uci-"
+ #define RPC_SNAPSHOT_FILES	RPC_UCI_DIR_PREFIX "/snapshot-files/"
+ #define RPC_SNAPSHOT_DELTA	RPC_UCI_DIR_PREFIX "/snapshot-delta/"
++#define RPC_CHECKED_JOURNAL	RPC_UCI_DIR_PREFIX "/checked.journal"
+ #define RPC_UCI_DIR		"/etc/config/"
+ #define RPC_APPLY_TIMEOUT	60
+ 
