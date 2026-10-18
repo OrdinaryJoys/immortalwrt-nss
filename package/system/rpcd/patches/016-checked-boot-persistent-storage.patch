@@ -1,0 +1,51 @@
+--- a/uci.c
++++ b/uci.c
+@@ -150,6 +150,24 @@
+ 	return 0;
+ }
+ 
++static void checked_storage_init(void)
++{
++	if (mkdir(RPC_CHECKED_DIR, 0700) && errno != EEXIST) {
++		syslog(LOG_ERR, "uci.checked: mkdir %s: %m", RPC_CHECKED_DIR);
++		checked_journal_blocked = true;
++		return;
++	}
++	if (mkdir(RPC_SNAPSHOT_FILES, 0700) && errno != EEXIST) {
++		syslog(LOG_ERR, "uci.checked: mkdir %s: %m", RPC_SNAPSHOT_FILES);
++		checked_journal_blocked = true;
++		return;
++	}
++	if (mkdir(RPC_SNAPSHOT_DELTA, 0700) && errno != EEXIST) {
++		syslog(LOG_ERR, "uci.checked: mkdir %s: %m", RPC_SNAPSHOT_DELTA);
++		checked_journal_blocked = true;
++	}
++}
++
+ static void checked_journal_load(void)
+ {
+ 	char data[1024], *line, *save, *id = NULL, *request = NULL, *sid = NULL;
+@@ -2366,6 +2384,7 @@
+ 	if (!cursor)
+ 		return UBUS_STATUS_UNKNOWN_ERROR;
+ 
++	checked_storage_init();
+ 	checked_journal_load();
+ 	rpc_session_destroy_cb(&cb);
+ 
+--- a/include/rpcd/uci.h
++++ b/include/rpcd/uci.h
+@@ -32,9 +32,10 @@
+ 
+ #define RPC_UCI_DIR_PREFIX	"/var/run/rpcd"
+ #define RPC_UCI_SAVEDIR_PREFIX	RPC_UCI_DIR_PREFIX "/uci-"
+-#define RPC_SNAPSHOT_FILES	RPC_UCI_DIR_PREFIX "/snapshot-files/"
+-#define RPC_SNAPSHOT_DELTA	RPC_UCI_DIR_PREFIX "/snapshot-delta/"
+-#define RPC_CHECKED_JOURNAL	RPC_UCI_DIR_PREFIX "/checked.journal"
++#define RPC_CHECKED_DIR		"/etc/rpcd"
++#define RPC_SNAPSHOT_FILES	RPC_CHECKED_DIR "/snapshot-files/"
++#define RPC_SNAPSHOT_DELTA	RPC_CHECKED_DIR "/snapshot-delta/"
++#define RPC_CHECKED_JOURNAL	RPC_CHECKED_DIR "/checked.journal"
+ #define RPC_UCI_DIR		"/etc/config/"
+ #define RPC_APPLY_TIMEOUT	60
+ 
