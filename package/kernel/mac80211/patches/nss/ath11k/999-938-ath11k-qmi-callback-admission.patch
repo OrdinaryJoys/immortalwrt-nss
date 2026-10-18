@@ -1,0 +1,131 @@
+--- a/drivers/net/wireless/ath/ath11k/qmi.h
++++ b/drivers/net/wireless/ath/ath11k/qmi.h
+@@ -7,8 +7,10 @@
+ #ifndef ATH11K_QMI_H
+ #define ATH11K_QMI_H
+ 
++#include <linux/atomic.h>
+ #include <linux/mutex.h>
+ #include <linux/soc/qcom/qmi.h>
++#include <linux/wait.h>
+ 
+ #define ATH11K_HOST_VERSION_STRING		"WIN"
+ #define ATH11K_QMI_WLANFW_TIMEOUT_MS		10000
+@@ -147,6 +149,11 @@
+ 	struct workqueue_struct *event_wq;
+ 	struct list_head event_list;
+ 	spinlock_t event_lock; /* spinlock for qmi event list */
++	struct mutex cb_lock; /* serializes callback admission/close */
++	wait_queue_head_t cb_waitq;
++	atomic_t cb_active;
++	bool cb_closing;
++	bool cb_initialized;
+ 	struct ath11k_qmi_ce_cfg ce_cfg;
+ 	struct target_mem_chunk target_mem[ATH11K_QMI_WLANFW_MAX_NUM_MEM_SEG_V01];
+ 	u32 mem_seg_count;
+--- a/drivers/net/wireless/ath/ath11k/qmi.c
++++ b/drivers/net/wireless/ath/ath11k/qmi.c
+@@ -3045,8 +3045,49 @@
+ 	}
+ 
+ 	return ret;
++}
++
++static bool ath11k_qmi_cb_enter(struct ath11k_qmi *qmi)
++{
++	bool admitted = false;
++
++	if (!qmi->cb_initialized)
++		return false;
++
++	mutex_lock(&qmi->cb_lock);
++	if (!qmi->cb_closing) {
++		atomic_inc(&qmi->cb_active);
++		admitted = true;
++	}
++	mutex_unlock(&qmi->cb_lock);
++
++	return admitted;
+ }
+ 
++static void ath11k_qmi_cb_leave(struct ath11k_qmi *qmi)
++{
++	if (!qmi->cb_initialized)
++		return;
++
++	if (atomic_dec_and_test(&qmi->cb_active))
++		wake_up_all(&qmi->cb_waitq);
++}
++
++static void ath11k_qmi_cb_close(struct ath11k_qmi *qmi)
++{
++	if (!qmi->cb_initialized)
++		return;
++
++	mutex_lock(&qmi->cb_lock);
++	qmi->cb_closing = true;
++	mutex_unlock(&qmi->cb_lock);
++
++	/* Wait for callbacks that already passed admission.  New callbacks
++	 * are rejected by cb_enter() while this waits.
++	 */
++	wait_event(qmi->cb_waitq, atomic_read(&qmi->cb_active) == 0);
++}
++
+ static void ath11k_qmi_msg_mem_request_cb(struct qmi_handle *qmi_hdl,
+ 					  struct sockaddr_qrtr *sq,
+ 					  struct qmi_txn *txn,
+@@ -3056,6 +3097,9 @@
+ 	struct ath11k_base *ab = qmi->ab;
+ 	const struct qmi_wlanfw_request_mem_ind_msg_v01 *msg = data;
+ 	int i, ret;
++
++	if (!ath11k_qmi_cb_enter(qmi))
++		return;
+ 
+ 	ath11k_dbg(ab, ATH11K_DBG_QMI, "firmware request memory request\n");
+ 
+@@ -3079,18 +3123,21 @@
+ 		if (ret) {
+ 			ath11k_warn(ab, "failed to assign qmi target memory: %d\n",
+ 				    ret);
+-			return;
++			goto out;
+ 		}
+ 	} else {
+ 		ret = ath11k_qmi_alloc_target_mem_chunk(ab);
+ 		if (ret) {
+ 			ath11k_warn(ab, "failed to allocate qmi target memory: %d\n",
+ 				    ret);
+-			return;
++			goto out;
+ 		}
+ 	}
+ 
+ 	ath11k_qmi_driver_event_post(qmi, ATH11K_QMI_EVENT_REQUEST_MEM, NULL);
++
++out:
++	ath11k_qmi_cb_leave(qmi);
+ }
+ 
+ static void ath11k_qmi_msg_mem_ready_cb(struct qmi_handle *qmi_hdl,
+@@ -3346,6 +3393,11 @@
+ 	memset(&ab->qmi.target, 0, sizeof(struct target_info));
+ 	memset(&ab->qmi.target_mem, 0, sizeof(struct target_mem_chunk));
+ 	ab->qmi.ab = ab;
++	mutex_init(&ab->qmi.cb_lock);
++	init_waitqueue_head(&ab->qmi.cb_waitq);
++	atomic_set(&ab->qmi.cb_active, 0);
++	ab->qmi.cb_closing = false;
++	ab->qmi.cb_initialized = true;
+ 
+ 	ab->qmi.target_mem_mode = ab->hw_params.fw_mem_mode;
+ 	ret = qmi_handle_init(&ab->qmi.handle, ATH11K_QMI_RESP_LEN_MAX,
+@@ -3394,6 +3446,7 @@
+ 
+ void ath11k_qmi_deinit_service(struct ath11k_base *ab)
+ {
++	ath11k_qmi_cb_close(&ab->qmi);
+ 	qmi_handle_release(&ab->qmi.handle);
+ 	cancel_work_sync(&ab->qmi.event_work);
+ 	ath11k_qmi_driver_event_purge(&ab->qmi);
