@@ -1,0 +1,687 @@
+--- a/src/adpt/hppe/adpt_hppe_mib.c
++++ b/src/adpt/hppe/adpt_hppe_mib.c
+@@ -35,6 +35,26 @@
+ 	if (rv != SW_OK) \
+ 		return rv; \
+ } while (0)
++
++#define HPPE_XGMIB_GET64(_low, _high, _field) do { \
++	data_low = 0; \
++	data_high = 0; \
++	rv = (_low)(dev_id, port_id, (void *)&data_low); \
++	if (rv != SW_OK) \
++		return rv; \
++	rv = (_high)(dev_id, port_id, (void *)&data_high); \
++	if (rv != SW_OK) \
++		return rv; \
++	mib_info->_field = ((a_uint64_t)data_high << 32) | data_low; \
++} while (0)
++
++#define HPPE_XGMIB_GET32(_get, _field) do { \
++	data_low = 0; \
++	rv = (_get)(dev_id, port_id, (void *)&data_low); \
++	if (rv != SW_OK) \
++		return rv; \
++	mib_info->_field = data_low; \
++} while (0)
+ #ifdef CPPE
+ #include "adpt_cppe_mib.h"
+ #endif
+@@ -375,6 +395,7 @@
+ {
+ 	a_uint64_t data_low , data_high ;
+ 
++	sw_error_t rv;
+ 	ADPT_DEV_ID_CHECK(dev_id);
+ 	ADPT_NULL_POINT_CHECK(mib_info);
+ 	memset(mib_info, 0, sizeof( * mib_info ));
+@@ -387,233 +408,54 @@
+ 	port_id = HPPE_TO_XGMAC_PORT_ID(port_id);
+ 
+ 	/*get tx xgmib information*/
+-	data_low = 0; data_high = 0;
+-	hppe_tx_octet_count_good_bad_low_get(dev_id, port_id, (union tx_octet_count_good_bad_low_u*)&data_low);
+-	hppe_tx_octet_count_good_bad_high_get(dev_id, port_id, (union tx_octet_count_good_bad_high_u *)&data_high);
+-	mib_info->TxByte = (data_high<<32) |data_low;
+-
+-	data_low = 0; data_high = 0;
+-	hppe_tx_frame_count_good_bad_low_get(dev_id, port_id, (union tx_frame_count_good_bad_low_u *)&data_low);
+-	hppe_tx_frame_count_good_bad_high_get(dev_id, port_id, (union tx_frame_count_good_bad_high_u *)&data_high);
+-	mib_info->TxFrame =  (data_high<<32) |data_low;
+-
+-	data_low = 0; data_high = 0;
+-	hppe_tx_broadcast_frames_good_low_get(dev_id, port_id, (union tx_broadcast_frames_good_low_u *)&data_low);
+-	hppe_tx_broadcast_frames_good_high_get(dev_id, port_id, (union tx_broadcast_frames_good_high_u*)&data_high);
+-	mib_info->TxBroadGood =  (data_high<<32) |data_low;
+-
+-	data_low = 0; data_high = 0;
+-	hppe_tx_multicast_frames_good_low_get(dev_id, port_id, (union tx_multicast_frames_good_low_u*)&data_low);
+-	hppe_tx_multicast_frames_good_high_get(dev_id, port_id, (union tx_multicast_frames_good_high_u*)&data_high);
+-	mib_info->TxMultiGood =  (data_high<<32) |data_low;
+-
+-	data_low = 0; data_high = 0;
+-	hppe_tx_64octets_frames_good_bad_low_get(dev_id, port_id, (union tx_64octets_frames_good_bad_low_u*)&data_low);
+-	hppe_tx_64octets_frames_good_bad_high_get(dev_id, port_id, (union tx_64octets_frames_good_bad_high_u*)&data_high);
+-	mib_info->Tx64Byte =  (data_high<<32) |data_low;
+-
+-	data_low = 0; data_high = 0;
+-	hppe_tx_65to127octets_frames_good_bad_low_get(dev_id, port_id, (union tx_65to127octets_frames_good_bad_low_u *)&data_low);
+-	hppe_tx_65to127octets_frames_good_bad_high_get(dev_id, port_id, (union tx_65to127octets_frames_good_bad_high_u *)&data_high);
+-	mib_info->Tx128Byte =  (data_high<<32) |data_low;
+-
+-	data_low = 0; data_high = 0;
+-	hppe_tx_128to255octets_frames_good_bad_low_get(dev_id, port_id, (union tx_128to255octets_frames_good_bad_low_u  *)&data_low);
+-	hppe_tx_128to255octets_frames_good_bad_high_get(dev_id, port_id, (union tx_128to255octets_frames_good_bad_high_u  *)&data_high);
+-	mib_info->Tx256Byte =  (data_high<<32) |data_low;
+-
+-	data_low = 0; data_high = 0;
+-	hppe_tx_256to511octets_frames_good_bad_low_get(dev_id, port_id, (union tx_256to511octets_frames_good_bad_low_u  *)&data_low);
+-	hppe_tx_256to511octets_frames_good_bad_high_get(dev_id, port_id, (union tx_256to511octets_frames_good_bad_high_u  *)&data_high);
+-	mib_info->Tx512Byte =  (data_high<<32) |data_low;
+-
+-	data_low = 0; data_high = 0;
+-	hppe_tx_512to1023octets_frames_good_bad_low_get(dev_id, port_id, (union tx_512to1023octets_frames_good_bad_low_u*)&data_low);
+-	hppe_tx_512to1023octets_frames_good_bad_high_get(dev_id, port_id, (union tx_512to1023octets_frames_good_bad_high_u*)&data_high);
+-	mib_info->Tx1024Byte =  (data_high<<32) |data_low;
+-
+-	data_low = 0; data_high = 0;
+-	hppe_tx_1024tomaxoctets_frames_good_bad_low_get(dev_id, port_id, (union tx_1024tomaxoctets_frames_good_bad_low_u*)&data_low);
+-	hppe_tx_1024tomaxoctets_frames_good_bad_high_get(dev_id, port_id, (union tx_1024tomaxoctets_frames_good_bad_high_u*)&data_high);
+-	mib_info->TxMaxByte =  (data_high<<32) |data_low;
+-
+-	data_low = 0; data_high = 0;
+-	hppe_tx_unicast_frames_good_bad_low_get(dev_id, port_id, (union tx_unicast_frames_good_bad_low_u*)&data_low);
+-	hppe_tx_unicast_frames_good_bad_high_get(dev_id, port_id, (union tx_unicast_frames_good_bad_high_u*)&data_high);
+-	mib_info->TxUnicast =  (data_high<<32) |data_low;
+-
+-	data_low = 0; data_high = 0;
+-	hppe_tx_multicast_frames_good_bad_low_get(dev_id, port_id, (union tx_multicast_frames_good_bad_low_u *)&data_low);
+-	hppe_tx_multicast_frames_good_bad_high_get(dev_id, port_id, (union tx_multicast_frames_good_bad_high_u *)&data_high);
+-	mib_info->TxMulti =  (data_high<<32) |data_low;
+-
+-	data_low = 0; data_high = 0;
+-	hppe_tx_broadcast_frames_good_bad_low_get(dev_id, port_id, (union tx_broadcast_frames_good_bad_low_u*)&data_low);
+-	hppe_tx_broadcast_frames_good_bad_high_get(dev_id, port_id, (union tx_broadcast_frames_good_bad_high_u*)&data_high);
+-	mib_info->TxBroad =  (data_high<<32) |data_low;
+-
+-	data_low = 0; data_high = 0;
+-	hppe_tx_underflow_error_frames_low_get(dev_id, port_id, (union tx_underflow_error_frames_low_u*)&data_low);
+-	hppe_tx_underflow_error_frames_high_get(dev_id, port_id, (union tx_underflow_error_frames_high_u*)&data_high);
+-	mib_info->TxUnderFlowError =  (data_high<<32) |data_low;
+-
+-	data_low = 0; data_high = 0;
+-	hppe_tx_octet_count_good_low_get(dev_id, port_id, (union tx_octet_count_good_low_u*)&data_low);
+-	hppe_tx_octet_count_good_high_get(dev_id, port_id, (union tx_octet_count_good_high_u*)&data_high);
+-	mib_info->TxByteGood =  (data_high<<32) |data_low;
+-
+-	data_low = 0; data_high = 0;
+-	hppe_tx_frame_count_good_low_get(dev_id, port_id, (union tx_frame_count_good_low_u*)&data_low);
+-	hppe_tx_frame_count_good_high_get(dev_id, port_id, (union tx_frame_count_good_high_u*)&data_high);
+-	mib_info->TxFrameGood =  (data_high<<32) |data_low;
+-
+-	data_low = 0; data_high = 0;
+-	hppe_tx_pause_frames_low_get(dev_id, port_id, (union tx_pause_frames_low_u *)&data_low);
+-	hppe_tx_pause_frames_high_get(dev_id, port_id, (union tx_pause_frames_high_u *)&data_high);
+-	mib_info->TxPause =  (data_high<<32) |data_low;
+-
+-	data_low = 0; data_high = 0;
+-	hppe_tx_vlan_frames_good_low_get(dev_id, port_id, (union tx_vlan_frames_good_low_u *)&data_low);
+-	hppe_tx_vlan_frames_good_high_get(dev_id, port_id, (union tx_vlan_frames_good_high_u *)&data_high);
+-	mib_info->TxVLANFrameGood =  (data_high<<32) |data_low;
+-
+-	data_low = 0;
+-	hppe_tx_lpi_usec_cntr_get(dev_id, port_id, (union tx_lpi_usec_cntr_u  *)&data_low);
+-	mib_info->TxLPIUsec =  data_low;
+-
+-	data_low = 0;
+-	hppe_tx_lpi_tran_cntr_get(dev_id, port_id, (union tx_lpi_tran_cntr_u  *)&data_low);
+-	mib_info->TxLPITran =  data_low;
+-
++	HPPE_XGMIB_GET64(hppe_tx_octet_count_good_bad_low_get, hppe_tx_octet_count_good_bad_high_get, TxByte);
++	HPPE_XGMIB_GET64(hppe_tx_frame_count_good_bad_low_get, hppe_tx_frame_count_good_bad_high_get, TxFrame);
++	HPPE_XGMIB_GET64(hppe_tx_broadcast_frames_good_low_get, hppe_tx_broadcast_frames_good_high_get, TxBroadGood);
++	HPPE_XGMIB_GET64(hppe_tx_multicast_frames_good_low_get, hppe_tx_multicast_frames_good_high_get, TxMultiGood);
++	HPPE_XGMIB_GET64(hppe_tx_64octets_frames_good_bad_low_get, hppe_tx_64octets_frames_good_bad_high_get, Tx64Byte);
++	HPPE_XGMIB_GET64(hppe_tx_65to127octets_frames_good_bad_low_get, hppe_tx_65to127octets_frames_good_bad_high_get, Tx128Byte);
++	HPPE_XGMIB_GET64(hppe_tx_128to255octets_frames_good_bad_low_get, hppe_tx_128to255octets_frames_good_bad_high_get, Tx256Byte);
++	HPPE_XGMIB_GET64(hppe_tx_256to511octets_frames_good_bad_low_get, hppe_tx_256to511octets_frames_good_bad_high_get, Tx512Byte);
++	HPPE_XGMIB_GET64(hppe_tx_512to1023octets_frames_good_bad_low_get, hppe_tx_512to1023octets_frames_good_bad_high_get, Tx1024Byte);
++	HPPE_XGMIB_GET64(hppe_tx_1024tomaxoctets_frames_good_bad_low_get, hppe_tx_1024tomaxoctets_frames_good_bad_high_get, TxMaxByte);
++	HPPE_XGMIB_GET64(hppe_tx_unicast_frames_good_bad_low_get, hppe_tx_unicast_frames_good_bad_high_get, TxUnicast);
++	HPPE_XGMIB_GET64(hppe_tx_multicast_frames_good_bad_low_get, hppe_tx_multicast_frames_good_bad_high_get, TxMulti);
++	HPPE_XGMIB_GET64(hppe_tx_broadcast_frames_good_bad_low_get, hppe_tx_broadcast_frames_good_bad_high_get, TxBroad);
++	HPPE_XGMIB_GET64(hppe_tx_underflow_error_frames_low_get, hppe_tx_underflow_error_frames_high_get, TxUnderFlowError);
++	HPPE_XGMIB_GET64(hppe_tx_octet_count_good_low_get, hppe_tx_octet_count_good_high_get, TxByteGood);
++	HPPE_XGMIB_GET64(hppe_tx_frame_count_good_low_get, hppe_tx_frame_count_good_high_get, TxFrameGood);
++	HPPE_XGMIB_GET64(hppe_tx_pause_frames_low_get, hppe_tx_pause_frames_high_get, TxPause);
++	HPPE_XGMIB_GET64(hppe_tx_vlan_frames_good_low_get, hppe_tx_vlan_frames_good_high_get, TxVLANFrameGood);
++	HPPE_XGMIB_GET32(hppe_tx_lpi_usec_cntr_get, TxLPIUsec);
++	HPPE_XGMIB_GET32(hppe_tx_lpi_tran_cntr_get, TxLPITran);
+ 	/*get rx xgmib information*/
+-	data_low = 0; data_high = 0;
+-	hppe_rx_frame_count_good_bad_low_get(dev_id, port_id, (union rx_frame_count_good_bad_low_u *)&data_low);
+-	hppe_rx_frame_count_good_bad_high_get(dev_id, port_id, (union rx_frame_count_good_bad_high_u *)&data_high);
+-	mib_info->RxFrame =  (data_high<<32) |data_low;
+-
+-	data_low = 0; data_high = 0;
+-	hppe_rx_octet_count_good_bad_low_get(dev_id, port_id, (union rx_octet_count_good_bad_low_u*)&data_low);
+-	hppe_rx_octet_count_good_bad_high_get(dev_id, port_id, (union rx_octet_count_good_bad_high_u*)&data_high);
+-	mib_info->RxByte =  (data_high<<32) |data_low;
+-
+-	data_low = 0; data_high = 0;
+-	hppe_rx_octet_count_good_low_get(dev_id, port_id, (union rx_octet_count_good_low_u *)&data_low);
+-	hppe_rx_octet_count_good_high_get(dev_id, port_id, (union rx_octet_count_good_high_u *)&data_high);
+-	mib_info->RxByteGood =  (data_high<<32) |data_low;
+-
+-	data_low = 0; data_high = 0;
+-	hppe_rx_broadcast_frames_good_low_get(dev_id, port_id, (union rx_broadcast_frames_good_low_u *)&data_low);
+-	hppe_rx_broadcast_frames_good_high_get(dev_id, port_id, (union rx_broadcast_frames_good_high_u*)&data_high);
+-	mib_info->RxBroadGood =  (data_high<<32) |data_low;
+-
+-	data_low = 0; data_high = 0;
+-	hppe_rx_multicast_frames_good_low_get(dev_id, port_id, (union rx_multicast_frames_good_low_u*)&data_low);
+-	hppe_rx_multicast_frames_good_high_get(dev_id, port_id, (union rx_multicast_frames_good_high_u*)&data_high);
+-	mib_info->RxMultiGood =  (data_high<<32) |data_low;
+-
+-	data_low = 0; data_high = 0;
+-	hppe_rx_crc_error_frames_low_get(dev_id, port_id, (union rx_crc_error_frames_low_u *)&data_low);
+-	hppe_rx_crc_error_frames_high_get(dev_id, port_id, (union rx_crc_error_frames_high_u *)&data_high);
+-	mib_info->RxFcsErr =  (data_high<<32) |data_low;
+-
+-	data_low = 0;
+-	hppe_rx_runt_error_frames_get(dev_id, port_id, (union rx_runt_error_frames_u  *)&data_low);
+-	mib_info->RxRuntErr  =   data_low;
+-
+-	data_low = 0;
+-	hppe_rx_jabber_error_frames_get(dev_id, port_id, (union rx_jabber_error_frames_u  *)&data_low);
+-	mib_info->RxJabberError = data_low;
+-
+-	data_low = 0;
+-	hppe_rx_undersize_frames_good_get(dev_id, port_id, (union rx_undersize_frames_good_u  *)&data_low);
+-	mib_info->RxUndersizeGood =  data_low;
+-
+-	data_low = 0;
+-	hppe_rx_oversize_frames_good_get(dev_id, port_id, (union rx_oversize_frames_good_u  *)&data_low);
+-	mib_info->RxOversizeGood = data_low;
+-
+-	data_low = 0; data_high = 0;
+-	hppe_rx_64octets_frames_good_bad_low_get(dev_id, port_id, (union rx_64octets_frames_good_bad_low_u  *)&data_low);
+-	hppe_rx_64octets_frames_good_bad_high_get(dev_id, port_id, (union rx_64octets_frames_good_bad_high_u  *)&data_high);
+-	mib_info->Rx64Byte =  (data_high<<32) |data_low;
+-
+-	data_low = 0; data_high = 0;
+-	hppe_rx_65to127octets_frames_good_bad_low_get(dev_id, port_id, (union rx_65to127octets_frames_good_bad_low_u  *)&data_low);
+-	hppe_rx_65to127octets_frames_good_bad_high_get(dev_id, port_id, (union rx_65to127octets_frames_good_bad_high_u  *)&data_high);
+-	mib_info->Rx128Byte =  (data_high<<32) |data_low;
+-
+-	data_low = 0; data_high = 0;
+-	hppe_rx_128to255octets_frames_good_bad_low_get(dev_id, port_id, (union rx_128to255octets_frames_good_bad_low_u  *)&data_low);
+-	hppe_rx_128to255octets_frames_good_bad_high_get(dev_id, port_id, (union rx_128to255octets_frames_good_bad_high_u  *)&data_high);
+-	mib_info->Rx256Byte =  (data_high<<32) |data_low;
+-
+-	data_low = 0; data_high = 0;
+-	hppe_rx_256to511octets_frames_good_bad_low_get	(dev_id, port_id, (union rx_256to511octets_frames_good_bad_low_u  *)&data_low);
+-	hppe_rx_256to511octets_frames_good_bad_high_get(dev_id, port_id, (union rx_256to511octets_frames_good_bad_high_u  *)&data_high);
+-	mib_info->Rx512Byte =  (data_high<<32) |data_low;
+-
+-	data_low = 0; data_high = 0;
+-	hppe_rx_512to1023octets_frames_good_bad_low_get(dev_id, port_id, (union rx_512to1023octets_frames_good_bad_low_u *)&data_low);
+-	hppe_rx_512to1023octets_frames_good_bad_high_get(dev_id, port_id, (union rx_512to1023octets_frames_good_bad_high_u *)&data_high);
+-	mib_info->Rx1024Byte =  (data_high<<32) |data_low;
+-
+-	data_low = 0; data_high = 0;
+-	hppe_rx_1024tomaxoctets_frames_good_bad_low_get(dev_id, port_id, (union rx_1024tomaxoctets_frames_good_bad_low_u *)&data_low);
+-	hppe_rx_1024tomaxoctets_frames_good_bad_high_get(dev_id, port_id, (union rx_1024tomaxoctets_frames_good_bad_high_u *)&data_high);
+-	mib_info->RxMaxByte =  (data_high<<32) |data_low;
+-
+-	data_low = 0; data_high = 0;
+-	hppe_rx_unicast_frames_good_low_get(dev_id, port_id, (union rx_unicast_frames_good_low_u  *)&data_low);
+-	hppe_rx_unicast_frames_good_high_get(dev_id, port_id, (union rx_unicast_frames_good_high_u  *)&data_high);
+-	mib_info->RxUnicastGood =  (data_high<<32) |data_low;
+-
+-	data_low = 0; data_high = 0;
+-	hppe_rx_length_error_frames_low_get(dev_id, port_id, (union rx_length_error_frames_low_u  *)&data_low);
+-	hppe_rx_length_error_frames_high_get(dev_id, port_id, (union rx_length_error_frames_high_u  *)&data_high);
+-	mib_info->RxLengthError =  (data_high<<32) |data_low;
+-
+-	data_low = 0; data_high = 0;
+-	hppe_rx_outofrange_frames_low_get(dev_id, port_id, (union rx_outofrange_frames_low_u*)&data_low);
+-	hppe_rx_outofrange_frames_high_get(dev_id, port_id, (union rx_outofrange_frames_high_u*)&data_high);
+-	mib_info->RxOutOfRangeError =  (data_high<<32) |data_low;
+-
+-	data_low = 0; data_high = 0;
+-	hppe_rx_pause_frames_low_get(dev_id, port_id, (union rx_pause_frames_low_u *)&data_low);
+-	hppe_rx_pause_frames_high_get(dev_id, port_id, (union rx_pause_frames_high_u *)&data_high);
+-	mib_info->RxPause =  (data_high<<32) |data_low;
+-
+-	data_low = 0; data_high = 0;
+-	hppe_rx_fifooverflow_frames_low_get(dev_id, port_id, (union rx_fifooverflow_frames_low_u *)&data_low);
+-	hppe_rx_fifooverflow_frames_high_get(dev_id, port_id, (union rx_fifooverflow_frames_high_u *)&data_high);
+-	mib_info->RxOverFlow =  (data_high<<32) |data_low;
+-
+-	data_low = 0; data_high = 0;
+-	hppe_rx_vlan_frames_good_bad_low_get(dev_id, port_id, (union rx_vlan_frames_good_bad_low_u *)&data_low);
+-	hppe_rx_vlan_frames_good_bad_high_get(dev_id, port_id, (union rx_vlan_frames_good_bad_high_u*)&data_high);
+-	mib_info->RxVLANFrameGoodBad =  (data_high<<32) |data_low;
+-
+-	data_low = 0;
+-	hppe_rx_watchdog_error_frames_get(dev_id, port_id, (union rx_watchdog_error_frames_u*)&data_low);
+-	mib_info->RxWatchDogError = data_low;
+-
+-	data_low = 0;
+-	hppe_rx_lpi_usec_cntr_get(dev_id, port_id, (union rx_lpi_usec_cntr_u *)&data_low);
+-	mib_info->RxLPIUsec = data_low;
+-
+-	data_low = 0;
+-	hppe_rx_lpi_tran_cntr_get(dev_id, port_id, (union rx_lpi_tran_cntr_u *)&data_low);
+-	mib_info->RxLPITran = data_low;
+-
+-	data_low = 0; data_high = 0;
+-	hppe_rx_discard_frame_count_good_bad_low_get(dev_id, port_id, (union rx_discard_frame_count_good_bad_low_u *)&data_low);
+-	hppe_rx_discard_frame_count_good_bad_high_get(dev_id, port_id, (union rx_discard_frame_count_good_bad_high_u *)&data_high);
+-	mib_info->RxDropFrameGoodBad =  (data_high<<32) |data_low;
+-
+-	data_low = 0; data_high = 0;
+-	hppe_rx_discard_octet_count_good_bad_low_get(dev_id, port_id, (union rx_discard_octet_count_good_bad_low_u *)&data_low);
+-	hppe_rx_discard_octet_count_good_bad_high_get(dev_id, port_id, (union rx_discard_octet_count_good_bad_high_u *)&data_high);
+-	mib_info->RxDropByteGoodBad =  (data_high<<32) |data_low;
+-
++	HPPE_XGMIB_GET64(hppe_rx_frame_count_good_bad_low_get, hppe_rx_frame_count_good_bad_high_get, RxFrame);
++	HPPE_XGMIB_GET64(hppe_rx_octet_count_good_bad_low_get, hppe_rx_octet_count_good_bad_high_get, RxByte);
++	HPPE_XGMIB_GET64(hppe_rx_octet_count_good_low_get, hppe_rx_octet_count_good_high_get, RxByteGood);
++	HPPE_XGMIB_GET64(hppe_rx_broadcast_frames_good_low_get, hppe_rx_broadcast_frames_good_high_get, RxBroadGood);
++	HPPE_XGMIB_GET64(hppe_rx_multicast_frames_good_low_get, hppe_rx_multicast_frames_good_high_get, RxMultiGood);
++	HPPE_XGMIB_GET64(hppe_rx_crc_error_frames_low_get, hppe_rx_crc_error_frames_high_get, RxFcsErr);
++	HPPE_XGMIB_GET32(hppe_rx_runt_error_frames_get, RxRuntErr);
++	HPPE_XGMIB_GET32(hppe_rx_jabber_error_frames_get, RxJabberError);
++	HPPE_XGMIB_GET32(hppe_rx_undersize_frames_good_get, RxUndersizeGood);
++	HPPE_XGMIB_GET32(hppe_rx_oversize_frames_good_get, RxOversizeGood);
++	HPPE_XGMIB_GET64(hppe_rx_64octets_frames_good_bad_low_get, hppe_rx_64octets_frames_good_bad_high_get, Rx64Byte);
++	HPPE_XGMIB_GET64(hppe_rx_65to127octets_frames_good_bad_low_get, hppe_rx_65to127octets_frames_good_bad_high_get, Rx128Byte);
++	HPPE_XGMIB_GET64(hppe_rx_128to255octets_frames_good_bad_low_get, hppe_rx_128to255octets_frames_good_bad_high_get, Rx256Byte);
++	HPPE_XGMIB_GET64(hppe_rx_256to511octets_frames_good_bad_low_get, hppe_rx_256to511octets_frames_good_bad_high_get, Rx512Byte);
++	HPPE_XGMIB_GET64(hppe_rx_512to1023octets_frames_good_bad_low_get, hppe_rx_512to1023octets_frames_good_bad_high_get, Rx1024Byte);
++	HPPE_XGMIB_GET64(hppe_rx_1024tomaxoctets_frames_good_bad_low_get, hppe_rx_1024tomaxoctets_frames_good_bad_high_get, RxMaxByte);
++	HPPE_XGMIB_GET64(hppe_rx_unicast_frames_good_low_get, hppe_rx_unicast_frames_good_high_get, RxUnicastGood);
++	HPPE_XGMIB_GET64(hppe_rx_length_error_frames_low_get, hppe_rx_length_error_frames_high_get, RxLengthError);
++	HPPE_XGMIB_GET64(hppe_rx_outofrange_frames_low_get, hppe_rx_outofrange_frames_high_get, RxOutOfRangeError);
++	HPPE_XGMIB_GET64(hppe_rx_pause_frames_low_get, hppe_rx_pause_frames_high_get, RxPause);
++	HPPE_XGMIB_GET64(hppe_rx_fifooverflow_frames_low_get, hppe_rx_fifooverflow_frames_high_get, RxOverFlow);
++	HPPE_XGMIB_GET64(hppe_rx_vlan_frames_good_bad_low_get, hppe_rx_vlan_frames_good_bad_high_get, RxVLANFrameGoodBad);
++	HPPE_XGMIB_GET32(hppe_rx_watchdog_error_frames_get, RxWatchDogError);
++	HPPE_XGMIB_GET32(hppe_rx_lpi_usec_cntr_get, RxLPIUsec);
++	HPPE_XGMIB_GET32(hppe_rx_lpi_tran_cntr_get, RxLPITran);
++	HPPE_XGMIB_GET64(hppe_rx_discard_frame_count_good_bad_low_get, hppe_rx_discard_frame_count_good_bad_high_get, RxDropFrameGoodBad);
++	HPPE_XGMIB_GET64(hppe_rx_discard_octet_count_good_bad_low_get, hppe_rx_discard_octet_count_good_bad_high_get, RxDropByteGoodBad);
+ 	return SW_OK;
+ }
+ 
+@@ -624,6 +466,7 @@
+ 
+ 	a_uint64_t data_low , data_high ;
+ 
++	sw_error_t rv;
+ 	ADPT_DEV_ID_CHECK(dev_id);
+ 	ADPT_NULL_POINT_CHECK(mib_info);
+ 	memset(mib_info, 0, sizeof(* mib_info));
+@@ -636,104 +479,26 @@
+ 	port_id = HPPE_TO_XGMAC_PORT_ID(port_id);
+ 
+ 	/*get tx xgmib information*/
+-	data_low = 0; data_high = 0;
+-	hppe_tx_octet_count_good_bad_low_get(dev_id, port_id, (union tx_octet_count_good_bad_low_u*)&data_low);
+-	hppe_tx_octet_count_good_bad_high_get(dev_id, port_id, (union tx_octet_count_good_bad_high_u *)&data_high);
+-	mib_info->TxByte = (data_high<<32) |data_low;
+-
+-	data_low = 0; data_high = 0;
+-	hppe_tx_frame_count_good_bad_low_get(dev_id, port_id, (union tx_frame_count_good_bad_low_u *)&data_low);
+-	hppe_tx_frame_count_good_bad_high_get(dev_id, port_id, (union tx_frame_count_good_bad_high_u *)&data_high);
+-	mib_info->TxFrame =  (data_high<<32) |data_low;
+-
+-	data_low = 0; data_high = 0;
+-	hppe_tx_broadcast_frames_good_low_get(dev_id, port_id, (union tx_broadcast_frames_good_low_u *)&data_low);
+-	hppe_tx_broadcast_frames_good_high_get(dev_id, port_id, (union tx_broadcast_frames_good_high_u*)&data_high);
+-	mib_info->TxBroadGood =  (data_high<<32) |data_low;
+-
+-	data_low = 0; data_high = 0;
+-	hppe_tx_multicast_frames_good_low_get(dev_id, port_id, (union tx_multicast_frames_good_low_u*)&data_low);
+-	hppe_tx_multicast_frames_good_high_get(dev_id, port_id, (union tx_multicast_frames_good_high_u*)&data_high);
+-	mib_info->TxMultiGood =  (data_high<<32) |data_low;
+-
+-	data_low = 0; data_high = 0;
+-	hppe_tx_64octets_frames_good_bad_low_get(dev_id, port_id, (union tx_64octets_frames_good_bad_low_u*)&data_low);
+-	hppe_tx_64octets_frames_good_bad_high_get(dev_id, port_id, (union tx_64octets_frames_good_bad_high_u*)&data_high);
+-	mib_info->Tx64Byte =  (data_high<<32) |data_low;
+-
+-	data_low = 0; data_high = 0;
+-	hppe_tx_65to127octets_frames_good_bad_low_get(dev_id, port_id, (union tx_65to127octets_frames_good_bad_low_u *)&data_low);
+-	hppe_tx_65to127octets_frames_good_bad_high_get(dev_id, port_id, (union tx_65to127octets_frames_good_bad_high_u *)&data_high);
+-	mib_info->Tx128Byte =  (data_high<<32) |data_low;
+-
+-	data_low = 0; data_high = 0;
+-	hppe_tx_128to255octets_frames_good_bad_low_get(dev_id, port_id, (union tx_128to255octets_frames_good_bad_low_u  *)&data_low);
+-	hppe_tx_128to255octets_frames_good_bad_high_get(dev_id, port_id, (union tx_128to255octets_frames_good_bad_high_u  *)&data_high);
+-	mib_info->Tx256Byte =  (data_high<<32) |data_low;
+-
+-	data_low = 0; data_high = 0;
+-	hppe_tx_256to511octets_frames_good_bad_low_get(dev_id, port_id, (union tx_256to511octets_frames_good_bad_low_u  *)&data_low);
+-	hppe_tx_256to511octets_frames_good_bad_high_get(dev_id, port_id, (union tx_256to511octets_frames_good_bad_high_u  *)&data_high);
+-	mib_info->Tx512Byte =  (data_high<<32) |data_low;
+-
+-	data_low = 0; data_high = 0;
+-	hppe_tx_512to1023octets_frames_good_bad_low_get(dev_id, port_id, (union tx_512to1023octets_frames_good_bad_low_u*)&data_low);
+-	hppe_tx_512to1023octets_frames_good_bad_high_get(dev_id, port_id, (union tx_512to1023octets_frames_good_bad_high_u*)&data_high);
+-	mib_info->Tx1024Byte =  (data_high<<32) |data_low;
+-
+-	data_low = 0; data_high = 0;
+-	hppe_tx_1024tomaxoctets_frames_good_bad_low_get(dev_id, port_id, (union tx_1024tomaxoctets_frames_good_bad_low_u*)&data_low);
+-	hppe_tx_1024tomaxoctets_frames_good_bad_high_get(dev_id, port_id, (union tx_1024tomaxoctets_frames_good_bad_high_u*)&data_high);
+-	mib_info->TxMaxByte =  (data_high<<32) |data_low;
+-
+-	data_low = 0; data_high = 0;
+-	hppe_tx_unicast_frames_good_bad_low_get(dev_id, port_id, (union tx_unicast_frames_good_bad_low_u*)&data_low);
+-	hppe_tx_unicast_frames_good_bad_high_get(dev_id, port_id, (union tx_unicast_frames_good_bad_high_u*)&data_high);
+-	mib_info->TxUnicast =  (data_high<<32) |data_low;
+-
+-	data_low = 0; data_high = 0;
+-	hppe_tx_multicast_frames_good_bad_low_get(dev_id, port_id, (union tx_multicast_frames_good_bad_low_u *)&data_low);
+-	hppe_tx_multicast_frames_good_bad_high_get(dev_id, port_id, (union tx_multicast_frames_good_bad_high_u *)&data_high);
+-	mib_info->TxMulti =  (data_high<<32) |data_low;
+-
+-	data_low = 0; data_high = 0;
+-	hppe_tx_broadcast_frames_good_bad_low_get(dev_id, port_id, (union tx_broadcast_frames_good_bad_low_u*)&data_low);
+-	hppe_tx_broadcast_frames_good_bad_high_get(dev_id, port_id, (union tx_broadcast_frames_good_bad_high_u*)&data_high);
+-	mib_info->TxBroad =  (data_high<<32) |data_low;
+-
+-	data_low = 0; data_high = 0;
+-	hppe_tx_underflow_error_frames_low_get(dev_id, port_id, (union tx_underflow_error_frames_low_u*)&data_low);
+-	hppe_tx_underflow_error_frames_high_get(dev_id, port_id, (union tx_underflow_error_frames_high_u*)&data_high);
+-	mib_info->TxUnderFlowError =  (data_high<<32) |data_low;
+-
+-	data_low = 0; data_high = 0;
+-	hppe_tx_octet_count_good_low_get(dev_id, port_id, (union tx_octet_count_good_low_u*)&data_low);
+-	hppe_tx_octet_count_good_high_get(dev_id, port_id, (union tx_octet_count_good_high_u*)&data_high);
+-	mib_info->TxByteGood =  (data_high<<32) |data_low;
+-
+-	data_low = 0; data_high = 0;
+-	hppe_tx_frame_count_good_low_get(dev_id, port_id, (union tx_frame_count_good_low_u*)&data_low);
+-	hppe_tx_frame_count_good_high_get(dev_id, port_id, (union tx_frame_count_good_high_u*)&data_high);
+-	mib_info->TxFrameGood =  (data_high<<32) |data_low;
+-
+-	data_low = 0; data_high = 0;
+-	hppe_tx_pause_frames_low_get(dev_id, port_id, (union tx_pause_frames_low_u *)&data_low);
+-	hppe_tx_pause_frames_high_get(dev_id, port_id, (union tx_pause_frames_high_u *)&data_high);
+-	mib_info->TxPause =  (data_high<<32) |data_low;
+-
+-	data_low = 0; data_high = 0;
+-	hppe_tx_vlan_frames_good_low_get(dev_id, port_id, (union tx_vlan_frames_good_low_u *)&data_low);
+-	hppe_tx_vlan_frames_good_high_get(dev_id, port_id, (union tx_vlan_frames_good_high_u *)&data_high);
+-	mib_info->TxVLANFrameGood =  (data_high<<32) |data_low;
+-
+-	data_low = 0;
+-	hppe_tx_lpi_usec_cntr_get(dev_id, port_id, (union tx_lpi_usec_cntr_u  *)&data_low);
+-	mib_info->TxLPIUsec = data_low;
+-
+-	data_low = 0;
+-	hppe_tx_lpi_tran_cntr_get(dev_id, port_id, (union tx_lpi_tran_cntr_u  *)&data_low);
+-	mib_info->TxLPITran = data_low;
+-
++	HPPE_XGMIB_GET64(hppe_tx_octet_count_good_bad_low_get, hppe_tx_octet_count_good_bad_high_get, TxByte);
++	HPPE_XGMIB_GET64(hppe_tx_frame_count_good_bad_low_get, hppe_tx_frame_count_good_bad_high_get, TxFrame);
++	HPPE_XGMIB_GET64(hppe_tx_broadcast_frames_good_low_get, hppe_tx_broadcast_frames_good_high_get, TxBroadGood);
++	HPPE_XGMIB_GET64(hppe_tx_multicast_frames_good_low_get, hppe_tx_multicast_frames_good_high_get, TxMultiGood);
++	HPPE_XGMIB_GET64(hppe_tx_64octets_frames_good_bad_low_get, hppe_tx_64octets_frames_good_bad_high_get, Tx64Byte);
++	HPPE_XGMIB_GET64(hppe_tx_65to127octets_frames_good_bad_low_get, hppe_tx_65to127octets_frames_good_bad_high_get, Tx128Byte);
++	HPPE_XGMIB_GET64(hppe_tx_128to255octets_frames_good_bad_low_get, hppe_tx_128to255octets_frames_good_bad_high_get, Tx256Byte);
++	HPPE_XGMIB_GET64(hppe_tx_256to511octets_frames_good_bad_low_get, hppe_tx_256to511octets_frames_good_bad_high_get, Tx512Byte);
++	HPPE_XGMIB_GET64(hppe_tx_512to1023octets_frames_good_bad_low_get, hppe_tx_512to1023octets_frames_good_bad_high_get, Tx1024Byte);
++	HPPE_XGMIB_GET64(hppe_tx_1024tomaxoctets_frames_good_bad_low_get, hppe_tx_1024tomaxoctets_frames_good_bad_high_get, TxMaxByte);
++	HPPE_XGMIB_GET64(hppe_tx_unicast_frames_good_bad_low_get, hppe_tx_unicast_frames_good_bad_high_get, TxUnicast);
++	HPPE_XGMIB_GET64(hppe_tx_multicast_frames_good_bad_low_get, hppe_tx_multicast_frames_good_bad_high_get, TxMulti);
++	HPPE_XGMIB_GET64(hppe_tx_broadcast_frames_good_bad_low_get, hppe_tx_broadcast_frames_good_bad_high_get, TxBroad);
++	HPPE_XGMIB_GET64(hppe_tx_underflow_error_frames_low_get, hppe_tx_underflow_error_frames_high_get, TxUnderFlowError);
++	HPPE_XGMIB_GET64(hppe_tx_octet_count_good_low_get, hppe_tx_octet_count_good_high_get, TxByteGood);
++	HPPE_XGMIB_GET64(hppe_tx_frame_count_good_low_get, hppe_tx_frame_count_good_high_get, TxFrameGood);
++	HPPE_XGMIB_GET64(hppe_tx_pause_frames_low_get, hppe_tx_pause_frames_high_get, TxPause);
++	HPPE_XGMIB_GET64(hppe_tx_vlan_frames_good_low_get, hppe_tx_vlan_frames_good_high_get, TxVLANFrameGood);
++	HPPE_XGMIB_GET32(hppe_tx_lpi_usec_cntr_get, TxLPIUsec);
++	HPPE_XGMIB_GET32(hppe_tx_lpi_tran_cntr_get, TxLPITran);
+ 	return SW_OK;
+ }
+ 
+@@ -743,6 +508,7 @@
+ {
+ 	a_uint64_t data_low , data_high ;
+ 
++	sw_error_t rv;
+ 	ADPT_DEV_ID_CHECK(dev_id);
+ 	ADPT_NULL_POINT_CHECK(mib_info);
+ 	memset(mib_info, 0, sizeof(* mib_info));
+@@ -755,134 +521,34 @@
+ 	port_id = HPPE_TO_XGMAC_PORT_ID(port_id);
+ 
+ 	/*get tx xgmib information*/
+-	data_low = 0; data_high = 0;
+-	hppe_rx_frame_count_good_bad_low_get(dev_id, port_id, (union rx_frame_count_good_bad_low_u *)&data_low);
+-	hppe_rx_frame_count_good_bad_high_get(dev_id, port_id, (union rx_frame_count_good_bad_high_u *)&data_high);
+-	mib_info->RxFrame =  (data_high<<32) |data_low;
++	HPPE_XGMIB_GET64(hppe_rx_frame_count_good_bad_low_get, hppe_rx_frame_count_good_bad_high_get, RxFrame);
++	HPPE_XGMIB_GET64(hppe_rx_octet_count_good_bad_low_get, hppe_rx_octet_count_good_bad_high_get, RxByte);
++	HPPE_XGMIB_GET64(hppe_rx_octet_count_good_low_get, hppe_rx_octet_count_good_high_get, RxByteGood);
++	HPPE_XGMIB_GET64(hppe_rx_broadcast_frames_good_low_get, hppe_rx_broadcast_frames_good_high_get, RxBroadGood);
++	HPPE_XGMIB_GET64(hppe_rx_multicast_frames_good_low_get, hppe_rx_multicast_frames_good_high_get, RxMultiGood);
++	HPPE_XGMIB_GET64(hppe_rx_crc_error_frames_low_get, hppe_rx_crc_error_frames_high_get, RxFcsErr);
++	HPPE_XGMIB_GET32(hppe_rx_runt_error_frames_get, RxRuntErr);
++	HPPE_XGMIB_GET32(hppe_rx_jabber_error_frames_get, RxJabberError);
++	HPPE_XGMIB_GET32(hppe_rx_undersize_frames_good_get, RxUndersizeGood);
++	HPPE_XGMIB_GET32(hppe_rx_oversize_frames_good_get, RxOversizeGood);
++	HPPE_XGMIB_GET64(hppe_rx_64octets_frames_good_bad_low_get, hppe_rx_64octets_frames_good_bad_high_get, Rx64Byte);
++	HPPE_XGMIB_GET64(hppe_rx_65to127octets_frames_good_bad_low_get, hppe_rx_65to127octets_frames_good_bad_high_get, Rx128Byte);
++	HPPE_XGMIB_GET64(hppe_rx_128to255octets_frames_good_bad_low_get, hppe_rx_128to255octets_frames_good_bad_high_get, Rx256Byte);
++	HPPE_XGMIB_GET64(hppe_rx_256to511octets_frames_good_bad_low_get, hppe_rx_256to511octets_frames_good_bad_high_get, Rx512Byte);
++	HPPE_XGMIB_GET64(hppe_rx_512to1023octets_frames_good_bad_low_get, hppe_rx_512to1023octets_frames_good_bad_high_get, Rx1024Byte);
++	HPPE_XGMIB_GET64(hppe_rx_1024tomaxoctets_frames_good_bad_low_get, hppe_rx_1024tomaxoctets_frames_good_bad_high_get, RxMaxByte);
++	HPPE_XGMIB_GET64(hppe_rx_unicast_frames_good_low_get, hppe_rx_unicast_frames_good_high_get, RxUnicastGood);
++	HPPE_XGMIB_GET64(hppe_rx_length_error_frames_low_get, hppe_rx_length_error_frames_high_get, RxLengthError);
++	HPPE_XGMIB_GET64(hppe_rx_outofrange_frames_low_get, hppe_rx_outofrange_frames_high_get, RxOutOfRangeError);
++	HPPE_XGMIB_GET64(hppe_rx_pause_frames_low_get, hppe_rx_pause_frames_high_get, RxPause);
++	HPPE_XGMIB_GET64(hppe_rx_fifooverflow_frames_low_get, hppe_rx_fifooverflow_frames_high_get, RxOverFlow);
++	HPPE_XGMIB_GET64(hppe_rx_vlan_frames_good_bad_low_get, hppe_rx_vlan_frames_good_bad_high_get, RxVLANFrameGoodBad);
++	HPPE_XGMIB_GET32(hppe_rx_watchdog_error_frames_get, RxWatchDogError);
++	HPPE_XGMIB_GET32(hppe_rx_lpi_usec_cntr_get, RxLPIUsec);
++	HPPE_XGMIB_GET32(hppe_rx_lpi_tran_cntr_get, RxLPITran);
+ 
+-	data_low = 0; data_high = 0;
+-	hppe_rx_octet_count_good_bad_low_get(dev_id, port_id, (union rx_octet_count_good_bad_low_u*)&data_low);
+-	hppe_rx_octet_count_good_bad_high_get(dev_id, port_id, (union rx_octet_count_good_bad_high_u*)&data_high);
+-	mib_info->RxByte =  (data_high<<32) |data_low;
+-
+-	data_low = 0; data_high = 0;
+-	hppe_rx_octet_count_good_low_get(dev_id, port_id, (union rx_octet_count_good_low_u *)&data_low);
+-	hppe_rx_octet_count_good_high_get(dev_id, port_id, (union rx_octet_count_good_high_u *)&data_high);
+-	mib_info->RxByteGood =  (data_high<<32) |data_low;
+-
+-	data_low = 0; data_high = 0;
+-	hppe_rx_broadcast_frames_good_low_get(dev_id, port_id, (union rx_broadcast_frames_good_low_u *)&data_low);
+-	hppe_rx_broadcast_frames_good_high_get(dev_id, port_id, (union rx_broadcast_frames_good_high_u*)&data_high);
+-	mib_info->RxBroadGood =  (data_high<<32) |data_low;
+-
+-	data_low = 0; data_high = 0;
+-	hppe_rx_multicast_frames_good_low_get(dev_id, port_id, (union rx_multicast_frames_good_low_u*)&data_low);
+-	hppe_rx_multicast_frames_good_high_get(dev_id, port_id, (union rx_multicast_frames_good_high_u*)&data_high);
+-	mib_info->RxMultiGood =  (data_high<<32) |data_low;
+-
+-	data_low = 0; data_high = 0;
+-	hppe_rx_crc_error_frames_low_get(dev_id, port_id, (union rx_crc_error_frames_low_u *)&data_low);
+-	hppe_rx_crc_error_frames_high_get(dev_id, port_id, (union rx_crc_error_frames_high_u *)&data_high);
+-	mib_info->RxFcsErr =  (data_high<<32) |data_low;
+-
+-	data_low = 0;
+-	hppe_rx_runt_error_frames_get(dev_id, port_id, (union rx_runt_error_frames_u  *)&data_low);
+-	mib_info->RxRuntErr = data_low;
+-
+-	data_low = 0;
+-	hppe_rx_jabber_error_frames_get(dev_id, port_id, (union rx_jabber_error_frames_u  *)&data_low);
+-	mib_info->RxJabberError = data_low;
+-
+-	data_low = 0;
+-	hppe_rx_undersize_frames_good_get(dev_id, port_id, (union rx_undersize_frames_good_u  *)&data_low);
+-	mib_info->RxUndersizeGood = data_low;
+-
+-	data_low = 0;
+-	hppe_rx_oversize_frames_good_get(dev_id, port_id, (union rx_oversize_frames_good_u  *)&data_low);
+-	mib_info->RxOversizeGood = data_low;
+-
+-	data_low = 0; data_high = 0;
+-	hppe_rx_64octets_frames_good_bad_low_get(dev_id, port_id, (union rx_64octets_frames_good_bad_low_u  *)&data_low);
+-	hppe_rx_64octets_frames_good_bad_high_get(dev_id, port_id, (union rx_64octets_frames_good_bad_high_u  *)&data_high);
+-	mib_info->Rx64Byte =  (data_high<<32) |data_low;
+-
+-	data_low = 0; data_high = 0;
+-	hppe_rx_65to127octets_frames_good_bad_low_get(dev_id, port_id, (union rx_65to127octets_frames_good_bad_low_u  *)&data_low);
+-	hppe_rx_65to127octets_frames_good_bad_high_get(dev_id, port_id, (union rx_65to127octets_frames_good_bad_high_u  *)&data_high);
+-	mib_info->Rx128Byte =  (data_high<<32) |data_low;
+-
+-	data_low = 0; data_high = 0;
+-	hppe_rx_128to255octets_frames_good_bad_low_get(dev_id, port_id, (union rx_128to255octets_frames_good_bad_low_u  *)&data_low);
+-	hppe_rx_128to255octets_frames_good_bad_high_get(dev_id, port_id, (union rx_128to255octets_frames_good_bad_high_u  *)&data_high);
+-	mib_info->Rx256Byte =  (data_high<<32) |data_low;
+-
+-	data_low = 0; data_high = 0;
+-	hppe_rx_256to511octets_frames_good_bad_low_get	(dev_id, port_id, (union rx_256to511octets_frames_good_bad_low_u  *)&data_low);
+-	hppe_rx_256to511octets_frames_good_bad_high_get(dev_id, port_id, (union rx_256to511octets_frames_good_bad_high_u  *)&data_high);
+-	mib_info->Rx512Byte =  (data_high<<32) |data_low;
+-
+-	data_low = 0; data_high = 0;
+-	hppe_rx_512to1023octets_frames_good_bad_low_get(dev_id, port_id, (union rx_512to1023octets_frames_good_bad_low_u *)&data_low);
+-	hppe_rx_512to1023octets_frames_good_bad_high_get(dev_id, port_id, (union rx_512to1023octets_frames_good_bad_high_u *)&data_high);
+-	mib_info->Rx1024Byte =  (data_high<<32) |data_low;
+-
+-	data_low = 0; data_high = 0;
+-	hppe_rx_1024tomaxoctets_frames_good_bad_low_get(dev_id, port_id, (union rx_1024tomaxoctets_frames_good_bad_low_u *)&data_low);
+-	hppe_rx_1024tomaxoctets_frames_good_bad_high_get(dev_id, port_id, (union rx_1024tomaxoctets_frames_good_bad_high_u *)&data_high);
+-	mib_info->RxMaxByte =  (data_high<<32) |data_low;
+-
+-	data_low = 0; data_high = 0;
+-	hppe_rx_unicast_frames_good_low_get(dev_id, port_id, (union rx_unicast_frames_good_low_u  *)&data_low);
+-	hppe_rx_unicast_frames_good_high_get(dev_id, port_id, (union rx_unicast_frames_good_high_u  *)&data_high);
+-	mib_info->RxUnicastGood =  (data_high<<32) |data_low;
+-
+-	data_low = 0; data_high = 0;
+-	hppe_rx_length_error_frames_low_get(dev_id, port_id, (union rx_length_error_frames_low_u  *)&data_low);
+-	hppe_rx_length_error_frames_high_get(dev_id, port_id, (union rx_length_error_frames_high_u  *)&data_high);
+-	mib_info->RxLengthError =  (data_high<<32) |data_low;
+-
+-	data_low = 0; data_high = 0;
+-	hppe_rx_outofrange_frames_low_get(dev_id, port_id, (union rx_outofrange_frames_low_u*)&data_low);
+-	hppe_rx_outofrange_frames_high_get(dev_id, port_id, (union rx_outofrange_frames_high_u*)&data_high);
+-	mib_info->RxOutOfRangeError =  (data_high<<32) |data_low;
+-
+-	data_low = 0; data_high = 0;
+-	hppe_rx_pause_frames_low_get(dev_id, port_id, (union rx_pause_frames_low_u *)&data_low);
+-	hppe_rx_pause_frames_high_get(dev_id, port_id, (union rx_pause_frames_high_u *)&data_high);
+-	mib_info->RxPause =  (data_high<<32) |data_low;
+-
+-	data_low = 0; data_high = 0;
+-	hppe_rx_fifooverflow_frames_low_get(dev_id, port_id, (union rx_fifooverflow_frames_low_u *)&data_low);
+-	hppe_rx_fifooverflow_frames_high_get(dev_id, port_id, (union rx_fifooverflow_frames_high_u *)&data_high);
+-	mib_info->RxOverFlow =  (data_high<<32) |data_low;
+-
+-	data_low = 0; data_high = 0;
+-	hppe_rx_vlan_frames_good_bad_low_get(dev_id, port_id, (union rx_vlan_frames_good_bad_low_u *)&data_low);
+-	hppe_rx_vlan_frames_good_bad_high_get(dev_id, port_id, (union rx_vlan_frames_good_bad_high_u*)&data_high);
+-	mib_info->RxVLANFrameGoodBad =  (data_high<<32) |data_low;
+-
+-	data_low = 0;
+-	hppe_rx_watchdog_error_frames_get(dev_id, port_id, (union rx_watchdog_error_frames_u*)&data_low);
+-	mib_info->RxWatchDogError = data_low;
+-
+-	data_low = 0;
+-	hppe_rx_lpi_usec_cntr_get(dev_id, port_id, (union rx_lpi_usec_cntr_u *)&data_low);
+-	mib_info->RxLPIUsec = data_low;
+-
+-	data_low = 0;
+-	hppe_rx_lpi_tran_cntr_get(dev_id, port_id, (union rx_lpi_tran_cntr_u *)&data_low);
+-	mib_info->RxLPITran =   (data_high<<32) & data_low;
+-
+-	data_low = 0; data_high = 0;
+-	hppe_rx_discard_frame_count_good_bad_low_get(dev_id, port_id, (union rx_discard_frame_count_good_bad_low_u *)&data_low);
+-	hppe_rx_discard_frame_count_good_bad_high_get(dev_id, port_id, (union rx_discard_frame_count_good_bad_high_u *)&data_high);
+-	mib_info->RxDropFrameGoodBad =  (data_high<<32) |data_low;
+-
+-	data_low = 0; data_high = 0;
+-	hppe_rx_discard_octet_count_good_bad_low_get(dev_id, port_id, (union rx_discard_octet_count_good_bad_low_u *)&data_low);
+-	hppe_rx_discard_octet_count_good_bad_high_get(dev_id, port_id, (union rx_discard_octet_count_good_bad_high_u *)&data_high);
+-	mib_info->RxDropByteGoodBad =  (data_high<<32) |data_low;
+-
++	HPPE_XGMIB_GET64(hppe_rx_discard_frame_count_good_bad_low_get, hppe_rx_discard_frame_count_good_bad_high_get, RxDropFrameGoodBad);
++	HPPE_XGMIB_GET64(hppe_rx_discard_octet_count_good_bad_low_get, hppe_rx_discard_octet_count_good_bad_high_get, RxDropByteGoodBad);
+ 	return SW_OK;
+ }
+ 
+--- a/src/fal/fal_mib.c
++++ b/src/fal/fal_mib.c
+@@ -650,9 +650,12 @@
+     FAL_API_LOCK;
+     rv = _fal_get_xgmib_info(dev_id, port_id, mib_Info);
+     FAL_API_UNLOCK;
++	if (rv != SW_OK)
++		return rv;
+ 
+     rv = fal_mib_counter_get(dev_id, port_id, &gmac_mib);
+-    SW_RTN_ON_ERROR(rv);
++	if (rv != SW_OK)
++		return rv;
+ 
+     mib_Info->RxFrame += (gmac_mib.RxBroad +
+ 				gmac_mib.RxMulti + gmac_mib.RxUniCast);
+@@ -692,7 +695,7 @@
+ 				gmac_mib.TxMulti + gmac_mib.TxUniCast);
+     mib_Info->TxPause += gmac_mib.TxPause;
+ 
+-    return rv;
++	return SW_OK;
+ }
+ 
+ /**
+--- a/src/ref/ref_mib.c
++++ b/src/ref/ref_mib.c
+@@ -108,6 +108,7 @@
+ {
+ 	int port = 0;
+ 	int len = 0;
++	int ret;
+ 	fal_xgmib_info_t xgmib_info;
+ 
+ 	struct qca_phy_priv *priv = qca_phy_priv_get(dev);
+@@ -117,7 +118,9 @@
+ 	if (port >= dev->ports)
+ 	    return -EINVAL;
+ 
+-	fal_get_xgmib_info(priv->device_id, port, &xgmib_info);
++	ret = fal_get_xgmib_info(priv->device_id, port, &xgmib_info);
++	if (ret != SW_OK)
++		return -EIO;
+ 
+ 	mutex_lock(&priv->mib_lock);
+ 
+@@ -252,9 +255,6 @@
+ 	"%-18s: %lu\n", "TxByteGood", xgmib_info.TxByteGood);
+ 
+ 	len += snprintf(buf + len, sizeof(priv->buf) - len,
+-	"%-18s: %lu\n", "TxByteGood", xgmib_info.TxByteGood);
+-
+-	len += snprintf(buf + len, sizeof(priv->buf) - len,
+ 	"%-18s: %lu\n", "TxPause", xgmib_info.TxPause);
+ 
+ 	len += snprintf(buf + len, sizeof(priv->buf) - len,
+@@ -297,8 +297,7 @@
+         priv->version == QCA_VER_MRPPE) &&
+         qca_hppe_port_mac_type_get(priv->device_id, port) == PORT_XGMAC_TYPE)
+     {
+-        qca_ar8327_sw_print_xgport_mib(dev, attr, val);
+-        return 0;
++	return qca_ar8327_sw_print_xgport_mib(dev, attr, val);
+     }
+ #endif
+     mutex_lock(&priv->mib_lock);
