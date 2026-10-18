@@ -2,7 +2,7 @@
   "schema": 1,
   "base_commit": "28faf6403792d25b9826043aaf37880624c19568",
   "upstream_commit": "d99f703e4035d03fbcfbada3cb697db346c2b984",
-  "package_release": 2,
+  "package_release": 5,
   "default_checked_support": false,
   "patches": [
     {
@@ -24,6 +24,18 @@
     {
       "name": "014-checked-uci-experimental-default-off.patch",
       "sha256": "e3fc9809e06328f183446c7bd0880ed581b0d33ad56e042c3893558100a92499"
+    },
+    {
+      "name": "015-checked-journal-daemon-restart.patch",
+      "sha256": "2a156b2dff51823a5083d7e3000fd8405eb02745fb9769c87ee8ee9ada3e0e6f"
+    },
+    {
+      "name": "016-checked-boot-persistent-storage.patch",
+      "sha256": "ed95a08ee9fb92c4f34e2380d8ee6a5be31e4ae88707932d1de0b87c9672b1ef"
+    },
+    {
+      "name": "017-checked-init-default-off-gate.patch",
+      "sha256": "bae12e265f70f93c937dfd3d4c957983e3963c532732f9e817790e89cd33a4bc"
     }
   ],
   "prepared_files": {
@@ -35,17 +47,17 @@
     "include/rpcd/plugin.h": "66caee7f53582767feecd451502004d85fe74df9bcb973196e99b454649c1999",
     "include/rpcd/rc.h": "d84dbabd3fa6f97787726cb931e9610c0c6d375ecf8de25fd06d0098ebdf856e",
     "include/rpcd/session.h": "d258c6baf7a512168f1231db8dc428c2c3c70ffb575086be8542eec6efbec0c3",
-    "include/rpcd/uci.h": "73ccf1a7338110b103a7cc768c5451b23d5d8bc61ea33e70a3cdb42e267a41bf",
+    "include/rpcd/uci.h": "0225afabd44405c7e83c5705c92ca47d537a226787e95ea0a69ebc2e55a1f798",
     "iwinfo.c": "0fd26292e4239831c08dd042b4322833c04d3334bec07f24fdb9722c0ceafede",
     "main.c": "032aeb5620cf57a1aa112a0dbe265dc97229cf117b0b3c66675be6feaa43e54d",
     "plugin.c": "e0dbe9a8d33e2fcf5ec48beefca1682eb01323acdadd63952e11fb42ce4dd034",
     "rc.c": "86358cab44dcad555f36671c87d2020de85437b4c66a148fbc1efae2f9f4203c",
     "session.c": "78b8778107847ab5314661038b8b2a85883f380ea840c6e4cc13bd533aaafcd3",
     "sys.c": "8419e1b1115b5423b5638c74caecbb4abaf2f63692faf2268f0392adf5c081e5",
-    "uci.c": "01ec2bf77d59e3d2388f6035ff18a1af4e38db19f03b06dfb3c1bdcff9da72c0",
+    "uci.c": "052f7765e24463dd7b08e58b9ec1f05b85d3a9150b12c3b72089e4b44812a9de",
     "ucode.c": "1cfc5a4ab072941a02c21154a4e3361c31956940226a880d43f46791736f9bb0",
     "unauthenticated.json": "f9ffec0554e0dd2e429f7c1fc843393c6bd97c4af843ba8f4c0d1020a7d22a67"
   },
   "exact_files": 18,
-  "claim_boundary": "Four official rpcd backports plus an adapted experimental backend. CHECKED_UCI_SUPPORT is OFF by default. No restart-durable transaction journal, frontend activation or AX6 runtime certification."
+  "claim_boundary": "Four official rpcd backports plus an adapted experimental backend. CHECKED_UCI_SUPPORT is OFF by default and journal init is gated off at runtime. Restart journal implemented; true boot, recover path, frontend activation and AX6 runtime certification remain open."
 }
