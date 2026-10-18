@@ -1,0 +1,15 @@
+--- a/uci.c
++++ b/uci.c
+@@ -2384,8 +2384,10 @@
+ 	if (!cursor)
+ 		return UBUS_STATUS_UNKNOWN_ERROR;
+ 
+-	checked_storage_init();
+-	checked_journal_load();
++	if (RPCD_CHECKED_UCI_SUPPORT) {
++		checked_storage_init();
++		checked_journal_load();
++	}
+ 	rpc_session_destroy_cb(&cb);
+ 
+ 	return ubus_add_object(ctx, &obj);
