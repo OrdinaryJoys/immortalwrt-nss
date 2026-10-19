@@ -1,0 +1,95 @@
+Subject: wifi: ath11k: unwind only MAC resources acquired by this startup
+
+The NSS recovery path retains registered MAC objects. mac_allocate,
+mac_register and thermal_register return success without acquiring new
+ownership when REGISTERED is set. Startup failures must not destroy or
+unregister those retained objects, or unregister skipped thermal devices.
+Capture that state under the caller's core_lock for each unwind scope.
+
+Also route DBS mode setup errors through REO cleanup: both the REO rings
+and newly allocated MAC objects already exist at that point.
+
+This does not restore thermal devices removed by reconfigure_on_crash,
+or establish the full QMI_FAIL/remove and NSS partial-start contract.
+
+Upstream-Status: Pending
+
+---
+
+--- a/drivers/net/wireless/ath/ath11k/core.c
++++ b/drivers/net/wireless/ath/ath11k/core.c
+@@ -2108,6 +2108,7 @@ static void ath11k_core_soc_destroy(struct ath11k_base *ab)
+ 
+ static int ath11k_core_pdev_create(struct ath11k_base *ab)
+ {
++	bool mac_registered = test_bit(ATH11K_FLAG_REGISTERED, &ab->dev_flags);
+ 	int ret;
+ 
+ 	ret = ath11k_debugfs_pdev_create(ab);
+@@ -2150,9 +2151,11 @@ static int ath11k_core_pdev_create(struct ath11k_base *ab)
+ 	return 0;
+ 
+ err_thermal_unregister:
+-	ath11k_thermal_unregister(ab);
++	if (!mac_registered)
++		ath11k_thermal_unregister(ab);
+ err_mac_unregister:
+-	ath11k_mac_unregister(ab);
++	if (!mac_registered)
++		ath11k_mac_unregister(ab);
+ err_nss_tear:
+ 	ath11k_nss_teardown(ab);
+ err_dp_pdev_free:
+@@ -2215,6 +2218,7 @@ static void ath11k_core_pdev_destroy(struct ath11k_base *ab)
+ 
+ static int ath11k_core_start(struct ath11k_base *ab)
+ {
++	bool mac_registered = test_bit(ATH11K_FLAG_REGISTERED, &ab->dev_flags);
+ 	int ret;
+ 
+ 	ret = ath11k_wmi_attach(ab);
+@@ -2299,7 +2303,7 @@ static int ath11k_core_start(struct ath11k_base *ab)
+ 		ret = ath11k_wmi_set_hw_mode(ab, WMI_HOST_HW_MODE_DBS);
+ 		if (ret) {
+ 			ath11k_err(ab, "failed to send dbs mode: %d\n", ret);
+-			goto err_hif_stop;
++			goto err_reo_cleanup;
+ 		}
+ 	}
+ 
+@@ -2315,7 +2319,8 @@ static int ath11k_core_start(struct ath11k_base *ab)
+ err_reo_cleanup:
+ 	ath11k_dp_pdev_reo_cleanup(ab);
+ err_mac_destroy:
+-	ath11k_mac_destroy(ab);
++	if (!mac_registered)
++		ath11k_mac_destroy(ab);
+ err_hif_stop:
+ 	ath11k_hif_stop(ab);
+ err_wmi_detach:
+@@ -2343,6 +2348,7 @@ static int ath11k_core_start_firmware(struct ath11k_base *ab,
+ 
+ int ath11k_core_qmi_firmware_ready(struct ath11k_base *ab)
+ {
++	bool mac_registered;
+ 	int ret;
+ 
+ 	switch (ath11k_crypto_mode) {
+@@ -2381,6 +2387,7 @@ int ath11k_core_qmi_firmware_ready(struct ath11k_base *ab)
+ 		set_bit(ATH11K_FLAG_RAW_MODE, &ab->dev_flags);
+ 
+ 	mutex_lock(&ab->core_lock);
++	mac_registered = test_bit(ATH11K_FLAG_REGISTERED, &ab->dev_flags);
+ 	ret = ath11k_core_start(ab);
+ 	if (ret) {
+ 		ath11k_err(ab, "failed to start core: %d\n", ret);
+@@ -2399,7 +2406,8 @@ int ath11k_core_qmi_firmware_ready(struct ath11k_base *ab)
+ 
+ err_core_stop:
+ 	ath11k_core_stop(ab);
+-	ath11k_mac_destroy(ab);
++	if (!mac_registered)
++		ath11k_mac_destroy(ab);
+ err_dp_free:
+ 	ath11k_dp_free(ab);
+ 	mutex_unlock(&ab->core_lock);
