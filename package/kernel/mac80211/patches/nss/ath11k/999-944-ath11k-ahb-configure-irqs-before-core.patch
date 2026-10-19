@@ -1,0 +1,40 @@
+Subject: ath11k: establish AHB IRQ ownership before core startup
+
+Local adaptation: avoid a fallible IRQ allocation step after QMI/core
+startup. Release configured IRQs if core_init unwinds. This does not close
+registered firmware-recovery teardown ownership.
+
+--- a/drivers/net/wireless/ath/ath11k/ahb.c
++++ b/drivers/net/wireless/ath/ath11k/ahb.c
+@@ -1357,22 +1357,25 @@
+ 		goto err_ce_free;
+ 	}
+ 
+-	ret = ath11k_core_init(ab);
+-	if (ret) {
+-		ath11k_err(ab, "failed to init core: %d\n", ret);
+-		goto err_ce_free;
+-	}
+-
++	/* Configure IRQ ownership before QMI can start firmware/core work. */
+ 	ret = ath11k_ahb_config_irq(ab);
+ 	if (ret) {
+ 		ath11k_err(ab, "failed to configure irq: %d\n", ret);
+ 		goto err_ce_free;
+ 	}
+ 
++	ret = ath11k_core_init(ab);
++	if (ret) {
++		ath11k_err(ab, "failed to init core: %d\n", ret);
++		goto err_irq_free;
++	}
++
+ 	ath11k_qmi_fwreset_from_cold_boot(ab);
+ 
+ 	return 0;
+ 
++err_irq_free:
++	ath11k_ahb_free_irq(ab);
+ err_ce_free:
+ 	ath11k_ce_free_pipes(ab);
+ 

@@ -1,0 +1,81 @@
+Subject: [PATCH] wifi: ath11k: release AHB providers after core workqueue drain
+
+Keep the acquired remoteproc object and hybrid MSI DMA mapping owned by
+the AHB base until its workqueues are drained. Snapshot the provider values
+before core_free releases the base. Use the same finalizer on every probe
+failure and normal release; publish mapping ownership only after success.
+
+The remoteproc leak also has an upstream proposal dated 2026-09-17,
+Message-ID 20260917120221.2150282-1-vulab@iscas.ac.cn. This is a local
+adaptation, not a claim that the proposal or additional MSI fix is merged.
+MSI IRQs and core consumers must already be stopped by their owning layers;
+this patch does not replace the complete QMI/recovery teardown contract.
+
+---
+
+--- a/drivers/net/wireless/ath/ath11k/ahb.c
++++ b/drivers/net/wireless/ath/ath11k/ahb.c
+@@ -954,8 +954,25 @@
+ 	return 0;
+ }
+ 
++static void ath11k_ahb_core_free(struct ath11k_base *ab)
++{
++	struct ath11k_ahb *ab_ahb = ath11k_ahb_priv(ab);
++	struct rproc *rproc = ab_ahb->tgt_rproc;
++	struct device *dev = ab->dev;
++	dma_addr_t msi_addr = ab_ahb->msi_addr;
++	bool msi_addr_mapped = ab_ahb->msi_addr_mapped;
++
++	/* Keep providers alive until core_free() drains the workqueues. */
++	ath11k_core_free(ab);
++	if (msi_addr_mapped)
++		dma_unmap_resource(dev, msi_addr, PAGE_SIZE, DMA_FROM_DEVICE, 0);
++	if (rproc)
++		rproc_put(rproc);
++}
++
+ static int ath11k_ahb_setup_msi_resources(struct ath11k_base *ab)
+ {
++	struct ath11k_ahb *ab_ahb = ath11k_ahb_priv(ab);
+ 	struct platform_device *pdev = ab->pdev;
+ 	phys_addr_t msi_addr_pa;
+ 	dma_addr_t msi_addr_iova;
+@@ -982,6 +999,8 @@
+ 	if (dma_mapping_error(ab->dev, msi_addr_iova))
+ 		return -ENOMEM;
+ 
++	ab_ahb->msi_addr = msi_addr_iova;
++	ab_ahb->msi_addr_mapped = true;
+ 	ab->pci.msi.addr_lo = lower_32_bits(msi_addr_iova);
+ 	ab->pci.msi.addr_hi = upper_32_bits(msi_addr_iova);
+ 
+@@ -1397,7 +1416,7 @@
+ 	ath11k_ahb_ce_unmap(ab);
+ 
+ err_core_free:
+-	ath11k_core_free(ab);
++	ath11k_ahb_core_free(ab);
+ 	platform_set_drvdata(pdev, NULL);
+ 
+ 	return ret;
+@@ -1439,7 +1458,7 @@
+ 	ath11k_ce_free_pipes(ab);
+ 	ath11k_ahb_ce_unmap(ab);
+ 
+-	ath11k_core_free(ab);
++	ath11k_ahb_core_free(ab);
+ 	platform_set_drvdata(pdev, NULL);
+ }
+ 
+--- a/drivers/net/wireless/ath/ath11k/ahb.h
++++ b/drivers/net/wireless/ath/ath11k/ahb.h
+@@ -23,6 +23,8 @@
+ 
+ struct ath11k_ahb {
+ 	struct rproc *tgt_rproc;
++	dma_addr_t msi_addr;
++	bool msi_addr_mapped;
+ 	struct {
+ 		struct device *dev;
+ 		struct iommu_domain *iommu_domain;

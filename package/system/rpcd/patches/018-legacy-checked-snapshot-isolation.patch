@@ -1,0 +1,326 @@
+Subject: rpcd: isolate snapshot storage and fail closed before legacy commit
+
+--- a/include/rpcd/uci.h
++++ b/include/rpcd/uci.h
+@@ -33,8 +33,10 @@
+ #define RPC_UCI_DIR_PREFIX	"/var/run/rpcd"
+ #define RPC_UCI_SAVEDIR_PREFIX	RPC_UCI_DIR_PREFIX "/uci-"
+ #define RPC_CHECKED_DIR		"/etc/rpcd"
+-#define RPC_SNAPSHOT_FILES	RPC_CHECKED_DIR "/snapshot-files/"
+-#define RPC_SNAPSHOT_DELTA	RPC_CHECKED_DIR "/snapshot-delta/"
++#define RPC_SNAPSHOT_FILES	RPC_UCI_DIR_PREFIX "/snapshot-files/"
++#define RPC_SNAPSHOT_DELTA	RPC_UCI_DIR_PREFIX "/snapshot-delta/"
++#define RPC_CHECKED_SNAPSHOT_FILES RPC_CHECKED_DIR "/snapshot-files/"
++#define RPC_CHECKED_SNAPSHOT_DELTA RPC_CHECKED_DIR "/snapshot-delta/"
+ #define RPC_CHECKED_JOURNAL	RPC_CHECKED_DIR "/checked.journal"
+ #define RPC_UCI_DIR		"/etc/config/"
+ #define RPC_APPLY_TIMEOUT	60
+--- a/uci.c
++++ b/uci.c
+@@ -39,6 +39,7 @@
+ static struct uci_context *cursor;
+ static struct uloop_timeout apply_timer;
+ static struct ubus_context *apply_ctx;
++static unsigned int legacy_snapshot_files;
+ 
+ char apply_sid[RPC_SID_LEN + 1];
+ 
+@@ -67,6 +68,16 @@
+ static bool checked_active(void)
+ {
+ 	return checked_journal_blocked || checked_current.state != CHECKED_NONE;
++}
++
++static const char *rpc_uci_snapshot_files(bool guarded)
++{
++	return guarded ? RPC_CHECKED_SNAPSHOT_FILES : RPC_SNAPSHOT_FILES;
++}
++
++static const char *rpc_uci_snapshot_delta(bool guarded)
++{
++	return guarded ? RPC_CHECKED_SNAPSHOT_DELTA : RPC_SNAPSHOT_DELTA;
+ }
+ 
+ static const char *checked_state_name(enum checked_state state)
+@@ -161,13 +172,13 @@
+ 		checked_journal_blocked = true;
+ 		return;
+ 	}
+-	if (mkdir(RPC_SNAPSHOT_FILES, 0700) && errno != EEXIST) {
+-		syslog(LOG_ERR, "uci.checked: mkdir %s: %m", RPC_SNAPSHOT_FILES);
++	if (mkdir(RPC_CHECKED_SNAPSHOT_FILES, 0700) && errno != EEXIST) {
++		syslog(LOG_ERR, "uci.checked: mkdir %s: %m", RPC_CHECKED_SNAPSHOT_FILES);
+ 		checked_journal_blocked = true;
+ 		return;
+ 	}
+-	if (mkdir(RPC_SNAPSHOT_DELTA, 0700) && errno != EEXIST) {
+-		syslog(LOG_ERR, "uci.checked: mkdir %s: %m", RPC_SNAPSHOT_DELTA);
++	if (mkdir(RPC_CHECKED_SNAPSHOT_DELTA, 0700) && errno != EEXIST) {
++		syslog(LOG_ERR, "uci.checked: mkdir %s: %m", RPC_CHECKED_SNAPSHOT_DELTA);
+ 		checked_journal_blocked = true;
+ 	}
+ }
+@@ -1802,14 +1813,17 @@
+ 	return 0;
+ }
+ 
+-static void
++static int
+ rpc_uci_do_rollback(struct ubus_context *ctx, glob_t *gl)
+ {
+-	int i, deny;
++	int i, deny, ret = 0;
+ 	char tmp[PATH_MAX];
+ 	const char *dirname;
+ 	bool guarded = checked_active();
+ 	unsigned int restored = 0;
++	unsigned int expected = guarded ? checked_current.files : legacy_snapshot_files;
++	const char *snapshot_files = rpc_uci_snapshot_files(guarded);
++	const char *snapshot_delta = rpc_uci_snapshot_delta(guarded);
+ 
+ 	if (guarded) {
+ 		checked_io_failed = false;
+@@ -1839,34 +1853,43 @@
+ 		if (*config == '.')
+ 			continue;
+ 
+-		if (rpc_uci_copy_file(RPC_SNAPSHOT_FILES, RPC_UCI_DIR, config) && guarded)
++		ret = rpc_uci_copy_file(snapshot_files, RPC_UCI_DIR, config);
++		if (ret)
+ 			break;
+-		if (rpc_uci_apply_config(ctx, config) && guarded)
++		ret = rpc_uci_apply_config(ctx, config);
++		if (ret)
+ 			break;
+ 		restored++;
+ 
+ 		if (deny)
+ 			continue;
+ 
+-		rpc_uci_copy_file(RPC_SNAPSHOT_DELTA, tmp, config);
+-	}
+-
+-	if (guarded && (checked_io_failed || restored != checked_current.files)) {
++		ret = rpc_uci_copy_file(snapshot_delta, tmp, config);
++		if (ret)
++			break;
++	}
++
++	if (ret || !expected || restored != expected || (guarded && checked_io_failed)) {
+ 		/* Keep snapshots and ownership for an explicit recovery retry. */
+-		checked_current.state = CHECKED_UNKNOWN;
+-		checked_journal_write();
+-		return;
+-	}
+-
+-	if (rpc_uci_purge_dir(RPC_SNAPSHOT_FILES))
++		if (guarded) {
++			checked_current.state = CHECKED_UNKNOWN;
++			checked_journal_write();
++		}
++		syslog(LOG_ERR, "uci: incomplete rollback; snapshots retained");
++		return UBUS_STATUS_UNKNOWN_ERROR;
++	}
++
++	if (rpc_uci_purge_dir(snapshot_files))
+ 		checked_current.cleanup_pending = true;
+-	if (rpc_uci_purge_dir(RPC_SNAPSHOT_DELTA))
++	if (rpc_uci_purge_dir(snapshot_delta))
+ 		checked_current.cleanup_pending = true;
+ 
+ 	uloop_timeout_cancel(&apply_timer);
+ 	memset(apply_sid, 0, sizeof(apply_sid));
+ 	apply_ctx = NULL;
++	legacy_snapshot_files = 0;
+ 	checked_finish(CHECKED_ROLLED_BACK);
++	return 0;
+ }
+ 
+ static void
+@@ -1875,7 +1898,7 @@
+ 	glob_t gl;
+ 	char tmp[PATH_MAX];
+ 
+-	snprintf(tmp, sizeof(tmp), "%s/*", RPC_SNAPSHOT_FILES);
++	snprintf(tmp, sizeof(tmp), "%s/*", rpc_uci_snapshot_files(checked_active()));
+ 	if (glob(tmp, GLOB_PERIOD, NULL, &gl)) {
+ 		if (checked_active()) {
+ 			checked_current.state = CHECKED_UNKNOWN;
+@@ -1903,10 +1926,12 @@
+ 	char *sid;
+ 	glob_t gl;
+ 	bool guarded = request_id != NULL;
++	const char *snapshot_files = rpc_uci_snapshot_files(guarded);
++	const char *snapshot_delta = rpc_uci_snapshot_delta(guarded);
+ 	char id[33];
+ 	unsigned int files = 0;
+ 
+-	if (checked_active())
++	if (checked_active() || apply_sid[0])
+ 		return UBUS_STATUS_PERMISSION_DENIED;
+ 
+ 	blobmsg_parse(rpc_uci_apply_policy, __RPC_T_MAX, tb,
+@@ -1914,9 +1939,6 @@
+ 
+ 	if (tb[RPC_T_ROLLBACK])
+ 		rollback = blobmsg_get_bool(tb[RPC_T_ROLLBACK]);
+-
+-	if (apply_sid[0] && rollback)
+-		return UBUS_STATUS_PERMISSION_DENIED;
+ 
+ 	if (!tb[RPC_T_SESSION])
+ 		return UBUS_STATUS_INVALID_ARGUMENT;
+@@ -1933,9 +1955,9 @@
+ 		if (ret)
+ 			return ret;
+ 	}
+-	ret = rpc_uci_purge_dir(RPC_SNAPSHOT_FILES);
+-	ret |= rpc_uci_purge_dir(RPC_SNAPSHOT_DELTA);
+-	if (ret && guarded)
++	ret = rpc_uci_purge_dir(snapshot_files);
++	ret |= rpc_uci_purge_dir(snapshot_delta);
++	if (ret)
+ 		return UBUS_STATUS_UNKNOWN_ERROR;
+ 
+ 	if (!apply_sid[0]) {
+@@ -1946,9 +1968,9 @@
+ 
+ 		rpc_uci_set_savedir(tb[RPC_T_SESSION]);
+ 
+-		ret = mkdir(RPC_SNAPSHOT_FILES, 0700);
+-		ret |= mkdir(RPC_SNAPSHOT_DELTA, 0700);
+-		if (ret && guarded)
++		ret = mkdir(snapshot_files, 0700);
++		ret |= mkdir(snapshot_delta, 0700);
++		if (ret)
+ 			return UBUS_STATUS_UNKNOWN_ERROR;
+ 
+ 		snprintf(tmp, sizeof(tmp), RPC_UCI_SAVEDIR_PREFIX "%s/*", dirname);
+@@ -1963,28 +1985,28 @@
+ 			return ret;
+ 		}
+ 
++		checked_io_failed = false;
++		/* Both protocols require a complete snapshot before the first commit. */
++		for (i = 0; i < gl.gl_pathc; i++) {
++			char *config = basename(gl.gl_pathv[i]);
++			struct stat s;
++			if (*config == '.' || stat(gl.gl_pathv[i], &s) || !s.st_size)
++				continue;
++			ret = rpc_uci_copy_file(RPC_UCI_DIR, snapshot_files, config);
++			ret |= rpc_uci_copy_file(tmp, snapshot_delta, config);
++			if (ret) {
++				globfree(&gl);
++				rpc_uci_purge_dir(snapshot_files);
++				rpc_uci_purge_dir(snapshot_delta);
++				return UBUS_STATUS_UNKNOWN_ERROR;
++			}
++			files++;
++		}
++		if (!files) {
++			globfree(&gl);
++			return UBUS_STATUS_NO_DATA;
++		}
+ 		if (guarded) {
+-			checked_io_failed = false;
+-			/* Prepare every snapshot before committing the first config. */
+-			for (i = 0; i < gl.gl_pathc; i++) {
+-				char *config = basename(gl.gl_pathv[i]);
+-				struct stat s;
+-				if (*config == '.' || stat(gl.gl_pathv[i], &s) || !s.st_size)
+-					continue;
+-				ret = rpc_uci_copy_file(RPC_UCI_DIR, RPC_SNAPSHOT_FILES, config);
+-				ret |= rpc_uci_copy_file(tmp, RPC_SNAPSHOT_DELTA, config);
+-				if (ret) {
+-					globfree(&gl);
+-					rpc_uci_purge_dir(RPC_SNAPSHOT_FILES);
+-					rpc_uci_purge_dir(RPC_SNAPSHOT_DELTA);
+-					return UBUS_STATUS_UNKNOWN_ERROR;
+-				}
+-				files++;
+-			}
+-			if (!files) {
+-				globfree(&gl);
+-				return UBUS_STATUS_NO_DATA;
+-			}
+ 			memset(&checked_current, 0, sizeof(checked_current));
+ 			memcpy(checked_current.id, id, sizeof(id));
+ 			memcpy(checked_current.request, request_id, 33);
+@@ -2001,6 +2023,8 @@
+ 		/* copy SID early because rpc_uci_apply_config() will clobber buf */
+ 		if (rollback)
+ 			strncpy(apply_sid, sid, RPC_SID_LEN);
++		if (rollback && !guarded)
++			legacy_snapshot_files = files;
+ 
+ 		for (i = 0; i < gl.gl_pathc; i++) {
+ 			char *config = basename(gl.gl_pathv[i]);
+@@ -2012,11 +2036,9 @@
+ 			if (stat(gl.gl_pathv[i], &s) || !s.st_size)
+ 				continue;
+ 
+-			if (!guarded) {
+-				rpc_uci_copy_file(RPC_UCI_DIR, RPC_SNAPSHOT_FILES, config);
+-				rpc_uci_copy_file(tmp, RPC_SNAPSHOT_DELTA, config);
+-			}
+-			rpc_uci_apply_config(ctx, config);
++			ret = rpc_uci_apply_config(ctx, config);
++			if (ret)
++				break;
+ 		}
+ 
+ 		globfree(&gl);
+@@ -2041,7 +2063,7 @@
+ 		}
+ 	}
+ 
+-	return 0;
++	return ret;
+ }
+ 
+ static int
+@@ -2076,14 +2098,15 @@
+ 	if (strcmp(apply_sid, sid))
+ 		return UBUS_STATUS_PERMISSION_DENIED;
+ 
+-	if (rpc_uci_purge_dir(RPC_SNAPSHOT_FILES))
++	if (rpc_uci_purge_dir(rpc_uci_snapshot_files(guarded)))
+ 		checked_current.cleanup_pending = true;
+-	if (rpc_uci_purge_dir(RPC_SNAPSHOT_DELTA))
++	if (rpc_uci_purge_dir(rpc_uci_snapshot_delta(guarded)))
+ 		checked_current.cleanup_pending = true;
+ 
+ 	uloop_timeout_cancel(&apply_timer);
+ 	memset(apply_sid, 0, sizeof(apply_sid));
+ 	apply_ctx = NULL;
++	legacy_snapshot_files = 0;
+ 	checked_finish(CHECKED_CONFIRMED);
+ 
+ 	return 0;
+@@ -2105,6 +2128,7 @@
+ 	char tmp[PATH_MAX];
+ 	glob_t gl;
+ 	char *sid;
++	int ret;
+ 
+ 	if (checked_active() != guarded)
+ 		return UBUS_STATUS_PERMISSION_DENIED;
+@@ -2123,15 +2147,15 @@
+ 	if (strcmp(apply_sid, sid))
+ 		return UBUS_STATUS_PERMISSION_DENIED;
+ 
+-	snprintf(tmp, sizeof(tmp), "%s/*", RPC_SNAPSHOT_FILES);
++	snprintf(tmp, sizeof(tmp), "%s/*", rpc_uci_snapshot_files(guarded));
+ 	if (glob(tmp, GLOB_PERIOD, NULL, &gl))
+ 		return UBUS_STATUS_NOT_FOUND;
+ 
+-	rpc_uci_do_rollback(ctx, &gl);
++	ret = rpc_uci_do_rollback(ctx, &gl);
+ 
+ 	globfree(&gl);
+ 
+-	return 0;
++	return ret;
+ }
+ 
+ static int

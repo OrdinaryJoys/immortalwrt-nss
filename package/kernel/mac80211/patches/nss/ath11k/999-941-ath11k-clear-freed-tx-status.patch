@@ -1,0 +1,12 @@
+Subject: ath11k: 999-941-ath11k-clear-freed-tx-status.patch
+
+--- a/drivers/net/wireless/ath/ath11k/dp.c
++++ b/drivers/net/wireless/ath/ath11k/dp.c
+@@ -1126,6 +1126,7 @@
+ 
+ 	for (i = 0; i < DP_TCL_NUM_RING_MAX; i++) {
+ 		kfree(dp->tx_ring[i].tx_status);
++		dp->tx_ring[i].tx_status = NULL;
+ 	}
+ 
+ 	/* Deinit any SOC level resource */

@@ -47,6 +47,7 @@ static void host_napi_receive(struct napi_struct *napi, struct sk_buff *skb) {
     callback(RECEIVE,dp.dpc); dev_kfree_skb_any(skb);
 }
 static int host_ethtool(struct nss_gmac_hal_dev *ctx, uint64_t *data, struct nss_dp_gmac_stats *stats) { (void)ctx; (void)stats; *data=123; return 0; }
+static int host_sset_count(struct nss_gmac_hal_dev *ctx, int set) { (void)ctx; assert(set==ETH_SS_STATS); return 1; }
 static struct nss_dp_data_plane_ops old_ops = { .init=host_init, .open=host_open, .close=host_close, .link_state=host_link, .mac_addr=host_mac, .change_mtu=host_mtu, .xmit=host_xmit, .set_features=host_features, .pause_on_off=host_pause, .deinit=host_deinit, .rx_flow_steer=host_rfs, .get_stats=host_stats };
 static struct nss_dp_data_plane_ops new_ops;
 static struct nss_dp_data_plane_ops default_ops;
@@ -54,11 +55,17 @@ static struct nss_dp_data_plane_ctx dp_global_data_plane_ctx[NSS_DP_MAX_PORTS];
 static struct nss_dp_data_plane_ops *nss_dp_hal_get_data_plane_ops(void) { return &default_ops; }
 HOST_EXTRACTED_FUNCTIONS
 static const struct net_device_ops host_ndo={ .ndo_open=nss_dp_open, .ndo_stop=nss_dp_close };
-static struct nss_gmac_hal_ops host_gmac={ .getethtoolstats=host_ethtool };
+static struct nss_gmac_hal_ops host_gmac={ .getethtoolstats=host_ethtool, .getssetcount=host_sset_count };
 static bool initialized;
 static void setup(bool up, bool overridden) {
     if(initialized) { assert(pthread_mutex_destroy(&dp.plane_lock)==0); assert(pthread_mutex_destroy(&dp.plane_wait.lock)==0); assert(pthread_cond_destroy(&dp.plane_wait.cond)==0); }
+#ifdef HOST_DP_STATS_CACHE
+    if(initialized) assert(pthread_mutex_destroy(&dp.stats_lock)==0);
+#endif
     memset(&dev,0,sizeof(dev)); memset(&dp,0,sizeof(dp)); memset(&phy,0,sizeof(phy));
+#ifdef HOST_DP_STATS_CACHE
+    spin_lock_init(&dp.stats_lock);
+#endif
     old_ctx.dev=new_ctx.dev=&dev; dev.priv=&dp; dev.netdev_ops=&host_ndo; dev.mtu=1500;
     dev.features=0x11; dev.hw_features=0x22; dev.vlan_features=0x44; dev.wanted_features=0x88;
     dev.queue_started=dev.carrier=up; dev.device_present=true;
@@ -85,11 +92,12 @@ static void isolated(void) {
 static void detach(void) { rtnl_lock(); nss_dp_restore_data_plane(&dev); rtnl_unlock(); }
 static void passed(const char *name) { printf("PASS %s\n",name); }
 static void call_reader(enum read_kind kind, struct sk_buff *skb) {
-    struct ethtool_stats stats={0}; struct napi_struct napi={0}; uint64_t data=0;
+    struct ethtool_stats stats={0}; struct napi_struct napi={0};
+    struct { uint64_t data[5]; uint64_t canary; } sample={{0},0x12345678};
     if(kind==XMIT) assert(nss_dp_xmit(skb,&dev)==NETDEV_TX_OK);
     else if(kind==RFS) { int result=nss_dp_rx_flow_steer(&dev,skb,0,0); assert(result==0 || result==-ENODEV); }
     else if(kind==PHY) nss_dp_adjust_link(&dev);
-    else if(kind==STATS) nss_dp_get_ethtool_stats(&dev,&stats,&data);
+    else if(kind==STATS) { nss_dp_get_ethtool_stats(&dev,&stats,sample.data); assert(sample.canary==0x12345678); }
     else if(kind==RECEIVE) nss_dp_receive(&dev,skb,&napi);
     else assert(0);
 }

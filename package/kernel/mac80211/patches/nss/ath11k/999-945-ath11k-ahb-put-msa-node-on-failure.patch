@@ -1,0 +1,15 @@
+Subject: ath11k: release firmware node when MSA setup fails
+
+Backport Linux 0e120ee0822b7cc650bd7b29682a34e137cec10d.
+Original-commit: https://git.kernel.org/linus/0e120ee0822b7cc650bd7b29682a34e137cec10d
+
+--- a/drivers/net/wireless/ath/ath11k/ahb.c
++++ b/drivers/net/wireless/ath/ath11k/ahb.c
+@@ -1133,6 +1133,7 @@
+ 	ret = ath11k_ahb_setup_msa_resources(ab);
+ 	if (ret) {
+ 		ath11k_err(ab, "failed to setup msa resources\n");
++		of_node_put(node);
+ 		return ret;
+ 	}
+ 

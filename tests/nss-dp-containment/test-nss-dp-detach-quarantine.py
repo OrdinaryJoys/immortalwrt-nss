@@ -19,6 +19,7 @@ HAL = 'hal/include/nss_dp_hal_if.h'
 
 def declarations(prepared):
     return ''.join([
+        '#define HOST_DP_STATS_CACHE 1\n' if 'nss_dp_collect_stats' in prepared.read('nss_dp_main.c') else '',
         prepared.structure(API, 'nss_dp_data_plane_ctx'),
         prepared.structure(API, 'nss_dp_gmac_stats'),
         prepared.structure(API, 'nss_dp_vlan_append_info'),
@@ -37,6 +38,8 @@ def declarations(prepared):
 
 def baseline_program(prepared, *, other_soc=False):
     functions = []
+    if 'nss_dp_collect_stats' in prepared.read('nss_dp_main.c'):
+        functions.append(prepared.function('nss_dp_main.c', 'nss_dp_collect_stats'))
     for name in ('nss_dp_xmit', 'nss_dp_close', 'nss_dp_open', 'nss_dp_adjust_link', 'nss_dp_rx_flow_steer'):
         functions.append(prepared.function('nss_dp_main.c', name))
     functions.append(prepared.function('nss_dp_main.c', 'nss_dp_get_stats64', occurrence=-1))

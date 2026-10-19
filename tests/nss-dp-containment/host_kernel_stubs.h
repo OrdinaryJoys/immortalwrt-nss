@@ -71,6 +71,7 @@ struct nss_gmac_hal_platform_data;
 struct sk_buff;
 struct net_device;
 struct rtnl_link_stats64 { uint64_t tx_dropped, rx_dropped, tx_packets, rx_packets, tx_bytes, rx_bytes; };
+enum { ETH_SS_STATS = 1 };
 struct ethtool_stats { unsigned host_placeholder; };
 struct net_device_ops { int (*ndo_open)(struct net_device *); int (*ndo_stop)(struct net_device *); };
 struct rps_dev_flow { unsigned cpu; };

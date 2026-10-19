@@ -25,8 +25,17 @@ static struct nss_gmac_hal_ops host_gmac={ .getndostats=host_stats };
 static struct net_device dev;
 static struct nss_dp_dev dp;
 static struct nss_dp_data_plane_ctx old_ctx, new_ctx;
+#ifdef HOST_DP_STATS_CACHE
+static bool initialized;
+#endif
 static void setup(bool up) {
+#ifdef HOST_DP_STATS_CACHE
+    if(initialized) assert(pthread_mutex_destroy(&dp.stats_lock)==0);
+#endif
     memset(&dev,0,sizeof(dev)); memset(&dp,0,sizeof(dp));
+#ifdef HOST_DP_STATS_CACHE
+    spin_lock_init(&dp.stats_lock); initialized=true;
+#endif
     old_ctx.dev=new_ctx.dev=&dev;
     dev.priv=&dp; dev.netdev_ops=&host_ndo; dev.mtu=1500;
     dev.features=0x11; dev.hw_features=0x22; dev.vlan_features=0x44; dev.wanted_features=0x88;

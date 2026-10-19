@@ -1,0 +1,39 @@
+From: OrdinaryFun <ordinaryfun@localhost>
+Subject: [PATCH] wifi: ath11k: drain RX retry before common CE cleanup
+
+The RX replenishment retry callback can post buffers and rearm itself after
+an allocation or DMA mapping failure. Stopping CE IRQ tasklets alone does
+not drain this timer. Only native AHB stop currently deletes it; PCIC stop
+and core crash reconfiguration enter common CE cleanup without doing so.
+The callback can race RX buffer cleanup or survive into HAL ring reset.
+
+Move the existing synchronous timer deletion into common CE cleanup,
+before shadow timer and RX buffer cleanup. All callers must still quiesce
+IRQ/tasklet producers first. This is a restartable stop, not permanent
+timer shutdown: recovery reuses the timer without calling timer_setup().
+The callback, posting fast path and successful native AHB stop order are
+unchanged. This does not fix QMI_FAIL partial remove or prove that every
+hybrid recovery caller already quiesces all CE producers.
+
+---
+
+--- a/drivers/net/wireless/ath/ath11k/ahb.c
++++ b/drivers/net/wireless/ath/ath11k/ahb.c
+@@ -426,6 +426,5 @@ static void ath11k_ahb_stop(struct ath11k_base *ab)
+ {
+ 	ath11k_ahb_ce_irq_disable_sync(ab);
+-	timer_delete_sync(&ab->rx_replenish_retry);
+ 	ath11k_ce_cleanup_pipes(ab);
+ }
+ 
+--- a/drivers/net/wireless/ath/ath11k/ce.c
++++ b/drivers/net/wireless/ath/ath11k/ce.c
+@@ -889,6 +889,8 @@ void ath11k_ce_cleanup_pipes(struct ath11k_base *ab)
+ 	struct ath11k_ce_pipe *pipe;
+ 	int pipe_num;
+ 
++	/* IRQ/tasklet producers must already be quiesced by the caller. */
++	timer_delete_sync(&ab->rx_replenish_retry);
+ 	ath11k_ce_stop_shadow_timers(ab);
+ 
+ 	for (pipe_num = 0; pipe_num < ab->hw_params.ce_count; pipe_num++) {

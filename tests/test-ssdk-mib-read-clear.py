@@ -13,7 +13,7 @@ import subprocess
 
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('prepared', type=Path)
-parser.add_argument('--baseline', type=Path, required=True)
+parser.add_argument('--baseline', type=Path)
 parser.add_argument('--output', type=Path, required=True)
 args = parser.parse_args()
 args.output.mkdir(parents=True, exist_ok=False)
@@ -41,6 +41,9 @@ def generate(prepared, mutation=None):
     header = (prepared / 'include/fal/fal_mib.h').read_text()
     port_header = (prepared / 'include/fal/fal_type.h').read_text()
     errors = (prepared / 'include/common/sw_error.h').read_text()
+    config = (prepared / 'include/common/sw_config.h').read_text()
+    limits = {name: int(re.search(r'^#define\s+' + name + r'\s+(\d+)', config, re.M).group(1))
+              for name in ('SW_MAX_NR_DEV', 'SW_MAX_NR_PORT')}
     if mutation == 'no-invalidation':
         old = function(fal, '_fal_mib_counter_invalidate')
         fal = fal.replace(old, old.replace('= A_TRUE;', '= A_FALSE;'), 1)
@@ -69,14 +72,13 @@ typedef int sw_error_t;
 typedef int a_bool_t;
 #define A_TRUE 1
 #define A_FALSE 0
-#define SW_MAX_NR_DEV 1
-#define SW_MAX_NR_PORT 8
 #define GFP_KERNEL 0
 #define kzalloc(n,f) calloc(1,n)
 #define kfree free
 #define ADPT_DEV_ID_CHECK(d) do { if ((d)>=SW_MAX_NR_DEV) return SW_BAD_PARAM; } while (0)
 #define ADPT_NULL_POINT_CHECK(p) do { if (!(p)) return SW_BAD_PTR; } while (0)
 '''
+    prefix += ''.join('#define %s %d\n' % item for item in limits.items())
     prefix += '\n'.join('#define ' + name + ' ' + value for name, value in
                         re.findall(r'\b(SW_\w+)\s*=\s*(-?\d+)', errors)) + '\n'
     for name in ('fal_mib_info_t', 'fal_mib_counter_t'):
@@ -90,17 +92,24 @@ typedef int a_bool_t;
     helpers = sorted(set(re.findall(r'HPPE_MIB_GET\((hppe_\w+),', raw)))
     prefix += '#define REGISTER_COUNT ' + str(len(helpers)) + '\n'
     prefix += r'''
-static uint32_t registers[SW_MAX_NR_PORT][REGISTER_COUNT];
+static uint32_t registers[SW_MAX_NR_DEV][SW_MAX_NR_PORT][REGISTER_COUNT];
 static unsigned calls, fail_at, reads_cleared, fal_locked;
+#define fal_mib_lock fal_locked
+#define spin_lock_irqsave(lock, flags) do { \
+    (void)(lock); (flags)=0; assert(!fal_locked); fal_locked=1; \
+} while (0)
+#define spin_unlock_irqrestore(lock, flags) do { \
+    (void)(lock); (void)(flags); assert(fal_locked==1); fal_locked=0; \
+} while (0)
 static int flush_error;
 static int read_register(unsigned index, unsigned dev, unsigned port, void *value) {
-    (void)dev;
     assert(fal_locked==1);
+    if (dev>=SW_MAX_NR_DEV) return SW_BAD_PARAM;
     if (port>=6) return SW_OUT_OF_RANGE;
     ++calls;
     if (calls==fail_at) return SW_READ_ERROR;
-    *(uint32_t *)value=registers[port][index];
-    registers[port][index]=0;
+    *(uint32_t *)value=registers[dev][port][index];
+    registers[dev][port][index]=0;
     ++reads_cleared;
     return SW_OK;
 }
@@ -114,21 +123,25 @@ static int read_register(unsigned index, unsigned dev, unsigned port, void *valu
         prefix += f'static sw_error_t _fal_get_{full}_info(unsigned d,unsigned p,fal_mib_info_t *v) {{ return {lower}(d,p,v); }}\n'
     prefix += r'''
 static sw_error_t _fal_mib_port_flush_counters(unsigned dev, unsigned port) {
-    (void)dev;
     assert(fal_locked==1);
     if (flush_error) return flush_error;
-    memset(registers[port-1],0,sizeof(registers[port-1]));
+    memset(registers[dev][port-1],0,sizeof(registers[dev][port-1]));
     return SW_OK;
 }
 '''
     prefix += re.search(r'static fal_mib_counter_t \*g_mibcounter\[[^;]+;', fal).group() + '\n'
     if 'static a_bool_t g_mibcounter_invalid[' in fal:
+        prefix += '#define HAS_INVALID_EPOCH 1\n'
         prefix += re.search(r'static a_bool_t g_mibcounter_invalid\[[^;]+;', fal).group() + '\n'
         prefix += 'static void\n' + function(fal, '_fal_mib_counter_invalidate')
+    else:
+        prefix += '#define HAS_INVALID_EPOCH 0\n'
     for name in ('fal_mib_counter_alloc', 'fal_mib_counter_free'):
         prefix += 'sw_error_t\n' + function(fal, name)
     for name in ('_fal_rx_mib_update', '_fal_tx_mib_update'):
         prefix += 'static void\n' + function(fal, name)
+    if '__fal_mib_counter_get_locked(' in fal:
+        prefix += 'sw_error_t\n' + function(fal, '__fal_mib_counter_get_locked')
     for name in ('fal_get_mib_info', 'fal_get_rx_mib_info', 'fal_get_tx_mib_info',
                  'fal_mib_counter_get', 'fal_mib_port_flush_counters'):
         prefix += 'sw_error_t\n' + function(fal, name)
@@ -143,7 +156,7 @@ static void begin(void) {
     assert(!fal_locked);
     assert(fal_mib_counter_alloc(0,&allocation)==SW_OK);
     for(unsigned p=0;p<SW_MAX_NR_PORT;++p)
-        for(unsigned i=0;i<REGISTER_COUNT;++i) registers[p][i]=9;
+        for(unsigned i=0;i<REGISTER_COUNT;++i) registers[0][p][i]=9;
     calls=fail_at=reads_cleared=0;
     flush_error=0;
 }
@@ -210,7 +223,24 @@ int main(void) {
     check(fal_get_mib_info(0,1,NULL)==SW_BAD_PTR,"null raw output rejects before read");
     check(fal_mib_counter_get(0,1,&output)==SW_OK,"null caller error does not poison epoch");
     end();
-    printf("{\"checks\":%u,\"failures\":%u,\"failed_register_positions\":%u,\"hardware_mocked\":true,\"kernel_or_firmware_built\":false}\n",checks,failures,injected_positions);
+    unsigned software_slots=0;
+#if HAS_INVALID_EPOCH
+    for(unsigned dev=0;dev<SW_MAX_NR_DEV;++dev) {
+        a_uint64_t *storage=NULL;
+        check(fal_mib_counter_alloc(dev,&storage)==SW_OK,"each configured device allocates");
+        for(unsigned port=0;port<SW_MAX_NR_PORT;++port) {
+            _fal_mib_counter_invalidate(dev,port);
+            unsigned previous_calls=calls;
+            check(fal_mib_counter_get(dev,port,&output)==SW_READ_ERROR,"each software slot preserves unknown epoch");
+            check(calls==previous_calls,"unknown software slot does not consume hardware");
+            ++software_slots;
+        }
+        check(fal_mib_counter_free(dev,&storage)==SW_OK && !storage,"each configured device frees");
+    }
+#endif
+    check(fal_mib_counter_get(SW_MAX_NR_DEV,1,&output)==SW_BAD_PARAM,"first invalid device rejected");
+    check(fal_mib_counter_get(0,SW_MAX_NR_PORT,&output)==SW_BAD_PARAM,"first invalid slot rejected");
+    printf("{\"checks\":%u,\"failures\":%u,\"failed_register_positions\":%u,\"software_slots\":%u,\"configured_devices\":%u,\"configured_slots_per_device\":%u,\"hardware_mocked\":true,\"kernel_or_firmware_built\":false}\n",checks,failures,injected_positions,software_slots,SW_MAX_NR_DEV,SW_MAX_NR_PORT);
     return failures?1:0;
 }
 '''
@@ -218,12 +248,15 @@ int main(void) {
 
 
 results = []
-for label, tree, mutation, must_pass in [
-    ('candidate', args.prepared, None, True), ('before-g5', args.baseline, None, False),
+scenarios = [('candidate', args.prepared, None, True)]
+if args.baseline:
+    scenarios.append(('before-g5', args.baseline, None, False))
+scenarios += [
     ('no-invalidation', args.prepared, 'no-invalidation', False),
     ('good-read-heals', args.prepared, 'good-read-heals', False),
     ('failed-flush-heals', args.prepared, 'failed-flush-heals', False),
-]:
+]
+for label, tree, mutation, must_pass in scenarios:
     source, digest, helpers = generate(tree, mutation)
     c = args.output / (label + '.c')
     binary = c.with_suffix('')

@@ -1,0 +1,231 @@
+Subject: nss-dp: retain failed ndo snapshots and report MIB quality
+
+--- a/include/nss_dp_dev.h
++++ b/include/nss_dp_dev.h
+@@ -28,8 +28,8 @@
+ #include <linux/switch.h>
+ #include <linux/version.h>
+ #include <linux/ethtool.h>
++#include <linux/spinlock.h>
+ #ifdef NSS_DP_IPQ807X
+-#include <linux/spinlock.h>
+ #include <linux/wait.h>
+ #endif
+ 
+@@ -290,6 +290,12 @@
+ 	bool nss_dp_mht_dev;		/* Netdevice belongs to MHT switch */
+ #endif
+ 	uint32_t fixed_link_speed;	/* Fixed link speed for the port connected to the switch */
++	/* Statistics callbacks only; existing member offsets remain unchanged. */
++	spinlock_t stats_lock;
++	struct rtnl_link_stats64 last_stats;
++	u64 stats_read_failures;
++	bool stats_valid;
++	bool stats_stale;
+ };
+ 
+ /*
+--- a/nss_dp_main.c
++++ b/nss_dp_main.c
+@@ -310,6 +310,26 @@
+ 	return 0;
+ }
+ 
++/* Keep read order and last-good publication in one non-sleeping callback domain. */
++static void nss_dp_collect_stats(struct nss_dp_dev *dp_priv,
++				 struct rtnl_link_stats64 *stats)
++{
++	struct rtnl_link_stats64 fresh = { 0 };
++	unsigned long flags;
++
++	spin_lock_irqsave(&dp_priv->stats_lock, flags);
++	if (dp_priv->gmac_hal_ops->getndostats(dp_priv->gmac_hal_ctx, &fresh)) {
++		dp_priv->stats_read_failures++;
++		dp_priv->stats_stale = true;
++	} else {
++		dp_priv->last_stats = fresh;
++		dp_priv->stats_valid = true;
++		dp_priv->stats_stale = false;
++	}
++	*stats = dp_priv->last_stats;
++	spin_unlock_irqrestore(&dp_priv->stats_lock, flags);
++}
++
+ /*
+  * nss_dp_get_stats64()
+  */
+@@ -327,7 +347,7 @@
+ 	/*
+ 	 * Get the GMAC MIB statistics
+ 	 */
+-	dp_priv->gmac_hal_ops->getndostats(dp_priv->gmac_hal_ctx, stats);
++	nss_dp_collect_stats(dp_priv, stats);
+ 	return stats;
+ }
+ #else
+@@ -344,7 +364,7 @@
+ 	/*
+ 	 * Get the GMAC MIB statistics
+ 	 */
+-	dp_priv->gmac_hal_ops->getndostats(dp_priv->gmac_hal_ctx, stats);
++	nss_dp_collect_stats(dp_priv, stats);
+ }
+ #endif
+ 
+@@ -1176,6 +1196,7 @@
+ 
+ 	dp_priv = netdev_priv(netdev);
+ 	memset((void *)dp_priv, 0, sizeof(struct nss_dp_dev));
++	spin_lock_init(&dp_priv->stats_lock);
+ 
+ 	dp_priv->pdev = pdev;
+ 	dp_priv->netdev = netdev;
+--- a/nss_dp_ethtools.c
++++ b/nss_dp_ethtools.c
+@@ -25,6 +25,14 @@
+ #include "nss_dp_dev.h"
+ #include "fal/fal_port_ctrl.h"
+ 
++static const char nss_dp_stats_diag[][ETH_GSTRING_LEN] = {
++	"ndo_mib_read_failures",
++	"ndo_stats_valid",
++	"ndo_stats_stale",
++	"ethtool_mib_failed",
++};
++#define NSS_DP_STATS_DIAG_COUNT ARRAY_SIZE(nss_dp_stats_diag)
++
+ /*
+  * nss_dp_get_ethtool_stats()
+  */
+@@ -34,6 +42,13 @@
+ 	struct nss_dp_dev *dp_priv = (struct nss_dp_dev *)netdev_priv(netdev);
+ 	struct nss_dp_gmac_stats dp_stats;
+ 	struct nss_dp_plane_ref ref;
++	unsigned long flags;
++	int count, ret;
++
++	count = dp_priv->gmac_hal_ops->getssetcount(dp_priv->gmac_hal_ctx, ETH_SS_STATS);
++	if (count < 0)
++		return;
++	memset(data, 0, count * sizeof(*data));
+ 
+ 	/*
+ 	 * Get the DMA Driver statistics from the data plane if available
+@@ -49,7 +64,13 @@
+ 	 * Get and print the GMAC MIB statistics along with the
+ 	 * DMA driver statistics.
+ 	 */
+-	dp_priv->gmac_hal_ops->getethtoolstats(dp_priv->gmac_hal_ctx, data, &dp_stats);
++	spin_lock_irqsave(&dp_priv->stats_lock, flags);
++	ret = dp_priv->gmac_hal_ops->getethtoolstats(dp_priv->gmac_hal_ctx, data, &dp_stats);
++	data[count] = dp_priv->stats_read_failures;
++	data[count + 1] = dp_priv->stats_valid;
++	data[count + 2] = dp_priv->stats_stale;
++	data[count + 3] = ret != 0;
++	spin_unlock_irqrestore(&dp_priv->stats_lock, flags);
+ }
+ 
+ /*
+@@ -58,12 +79,16 @@
+ static int32_t nss_dp_get_strset_count(struct net_device *netdev, int32_t sset)
+ {
+ 	struct nss_dp_dev *dp_priv = (struct nss_dp_dev *)netdev_priv(netdev);
++	int count;
+ 
+ 	if (sset == ETH_SS_PRIV_FLAGS) {
+ 		return NSS_DP_MAX_ETHTOOL_PRIV_FLAGS;
+ 	}
+ 
+-	return dp_priv->gmac_hal_ops->getssetcount(dp_priv->gmac_hal_ctx, sset);
++	count = dp_priv->gmac_hal_ops->getssetcount(dp_priv->gmac_hal_ctx, sset);
++	if (sset == ETH_SS_STATS && count >= 0)
++		count += NSS_DP_STATS_DIAG_COUNT;
++	return count;
+ }
+ 
+ /*
+@@ -82,6 +107,11 @@
+ 			memcpy(data + (i * ETH_GSTRING_LEN),
+ 					nss_dp_priv_flg_str[i], ETH_GSTRING_LEN);
+ 		}
++	} else if (stringset == ETH_SS_STATS) {
++		int count = dp_priv->gmac_hal_ops->getssetcount(dp_priv->gmac_hal_ctx, stringset);
++		if (count >= 0)
++			memcpy(data + count * ETH_GSTRING_LEN, nss_dp_stats_diag,
++			       sizeof(nss_dp_stats_diag));
+ 	}
+ }
+ 
+--- a/hal/gmac_ops/qcom/qcom_if.c
++++ b/hal/gmac_ops/qcom/qcom_if.c
+@@ -221,11 +221,13 @@
+ 	stats->rx_crc_errors = hal_stats->RxFcsErr + hal_stats->RxJumboFcsErr;
+ 	stats->rx_frame_errors = hal_stats->RxAllignErr +
+ 				 hal_stats->RxJumboAligenErr;
+-	stats->rx_fifo_errors = hal_stats->RxRunt;
++	stats->rx_fifo_errors = hal_stats->RxOverFlow;
++	stats->rx_length_errors = hal_stats->RxRunt + hal_stats->RxTooLong;
+ 	stats->rx_errors = stats->rx_crc_errors + stats->rx_frame_errors +
+-			   stats->rx_fifo_errors;
+-
+-	stats->rx_dropped = hal_stats->RxTooLong + stats->rx_errors;
++			   stats->rx_fifo_errors + stats->rx_length_errors;
++
++	/* Hardware error totals are not Linux software/resource drops. */
++	stats->rx_dropped = 0;
+ 
+ 	/* TX errors */
+ 	stats->tx_fifo_errors = hal_stats->TxUnderRun;
+--- a/hal/gmac_ops/syn/gmac/syn_if.c
++++ b/hal/gmac_ops/syn/gmac/syn_if.c
+@@ -493,17 +493,19 @@
+ 	 */
+ 	stats->rx_crc_errors = hal_stats.RxFcsErr + hal_stats.RxJumboFcsErr;
+ 	stats->rx_frame_errors = hal_stats.RxAllignErr +
+-				 hal_stats.RxJumboAligenErr + hal_stats.RxRunt;
++				 hal_stats.RxJumboAligenErr;
++	stats->rx_length_errors = hal_stats.RxRunt + hal_stats.RxTooLong;
+ 	stats->rx_fifo_errors = hal_stats.RxOverFlow;
+ 	stats->rx_errors = stats->rx_crc_errors + stats->rx_frame_errors +
+-			   stats->rx_fifo_errors;
+-
+-	stats->rx_dropped = hal_stats.RxTooLong + stats->rx_errors;
++			   stats->rx_fifo_errors + stats->rx_length_errors;
++
++	/* No independent software/resource-drop counter is supplied by this MIB. */
++	stats->rx_dropped = 0;
+ 
+ 	/*
+ 	 * TX errors
+ 	 */
+-	stats->tx_fifo_errors = hal_stats.TxUnderRun + hal_stats.RxOverFlow;
++	stats->tx_fifo_errors = hal_stats.TxUnderRun;
+ 	stats->tx_aborted_errors = hal_stats.TxAbortCol;
+ 	stats->tx_errors = stats->tx_fifo_errors + stats->tx_aborted_errors;
+ 
+--- a/hal/gmac_ops/syn/xgmac/syn_if.c
++++ b/hal/gmac_ops/syn/xgmac/syn_if.c
+@@ -225,12 +225,12 @@
+ 	stats->rx_length_errors = hal_stats.RxLengthError;
+ 	stats->rx_errors = stats->rx_crc_errors + stats->rx_frame_errors
+ 		+ stats->rx_fifo_errors + stats->rx_length_errors;
+-	stats->rx_dropped = hal_stats.RxDropFrameGoodBad + stats->rx_errors;
++	stats->rx_dropped = hal_stats.RxDropFrameGoodBad;
+ 
+ 	/*
+ 	 * Tx error
+ 	 */
+-	stats->tx_fifo_errors = hal_stats.TxUnderFlowError + hal_stats.RxOverFlow;
++	stats->tx_fifo_errors = hal_stats.TxUnderFlowError;
+ 	stats->tx_errors = stats->tx_fifo_errors;
+ 
+ 	return 0;
+@@ -271,7 +271,7 @@
+ 		p = ((uint8_t *)(&mib_stats) +
+ 			syn_gstrings_xmib_stats[i_mib].stat_offset);
+ 		i = SYN_STATS_LEN + i_mib;
+-		data[i] = *(uint32_t *)p;
++		data[i] = *(uint64_t *)p;
+ 	}
+ 
+ 	return 0;

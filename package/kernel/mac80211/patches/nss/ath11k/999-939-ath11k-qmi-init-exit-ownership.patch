@@ -1,0 +1,102 @@
+Subject: ath11k: 999-939-ath11k-qmi-init-exit-ownership.patch
+
+--- a/drivers/net/wireless/ath/ath11k/qmi.c
++++ b/drivers/net/wireless/ath/ath11k/qmi.c
+@@ -2960,7 +2960,8 @@
+ 	event->data = data;
+ 
+ 	spin_lock(&qmi->event_lock);
+-	if (test_bit(ATH11K_FLAG_UNREGISTERING, &qmi->ab->dev_flags)) {
++	if (qmi->event_closing ||
++	    test_bit(ATH11K_FLAG_UNREGISTERING, &qmi->ab->dev_flags)) {
+ 		spin_unlock(&qmi->event_lock);
+ 		kfree(event);
+ 		return -ESHUTDOWN;
+@@ -3295,7 +3296,8 @@
+ 		list_del(&event->list);
+ 		spin_unlock(&qmi->event_lock);
+ 
+-		if (test_bit(ATH11K_FLAG_UNREGISTERING, &ab->dev_flags)) {
++		if (READ_ONCE(qmi->event_closing) ||
++		    test_bit(ATH11K_FLAG_UNREGISTERING, &ab->dev_flags)) {
+ 			kfree(event);
+ 			return;
+ 		}
+@@ -3398,31 +3400,34 @@
+ 	atomic_set(&ab->qmi.cb_active, 0);
+ 	ab->qmi.cb_closing = false;
+ 	ab->qmi.cb_initialized = true;
++	ab->qmi.event_closing = false;
++	INIT_LIST_HEAD(&ab->qmi.event_list);
++	spin_lock_init(&ab->qmi.event_lock);
++	INIT_WORK(&ab->qmi.event_work, ath11k_qmi_driver_event_work);
++
++	/* A handle callback must never observe an absent event queue. */
++	ab->qmi.event_wq = alloc_ordered_workqueue("ath11k_qmi_driver_event", 0);
++	if (!ab->qmi.event_wq) {
++		ath11k_err(ab, "failed to allocate workqueue\n");
++		return -ENOMEM;
++	}
+ 
+ 	ab->qmi.target_mem_mode = ab->hw_params.fw_mem_mode;
+ 	ret = qmi_handle_init(&ab->qmi.handle, ATH11K_QMI_RESP_LEN_MAX,
+ 			      &ath11k_qmi_ops, ath11k_qmi_msg_handlers);
+ 	if (ret < 0) {
+ 		ath11k_warn(ab, "failed to initialize qmi handle: %d\n", ret);
++		destroy_workqueue(ab->qmi.event_wq);
++		ab->qmi.event_wq = NULL;
+ 		return ret;
+ 	}
+-
+-	ab->qmi.event_wq = alloc_ordered_workqueue("ath11k_qmi_driver_event", 0);
+-	if (!ab->qmi.event_wq) {
+-		ath11k_err(ab, "failed to allocate workqueue\n");
+-		return -EFAULT;
+-	}
+-
+-	INIT_LIST_HEAD(&ab->qmi.event_list);
+-	spin_lock_init(&ab->qmi.event_lock);
+-	INIT_WORK(&ab->qmi.event_work, ath11k_qmi_driver_event_work);
+ 
+ 	ret = qmi_add_lookup(&ab->qmi.handle, ATH11K_QMI_WLFW_SERVICE_ID_V01,
+ 			     ATH11K_QMI_WLFW_SERVICE_VERS_V01,
+ 			     ab->qmi.service_ins_id);
+ 	if (ret < 0) {
+ 		ath11k_warn(ab, "failed to add qmi lookup: %d\n", ret);
+-		destroy_workqueue(ab->qmi.event_wq);
++		ath11k_qmi_deinit_service(ab);
+ 		return ret;
+ 	}
+ 
+@@ -3446,11 +3451,20 @@
+ 
+ void ath11k_qmi_deinit_service(struct ath11k_base *ab)
+ {
++	if (!ab->qmi.event_wq)
++		return;
++
++	spin_lock(&ab->qmi.event_lock);
++	ab->qmi.event_closing = true;
++	spin_unlock(&ab->qmi.event_lock);
+ 	ath11k_qmi_cb_close(&ab->qmi);
++	/* Drain users of the still-live handle before release invokes del_server. */
++	cancel_work_sync(&ab->qmi.event_work);
+ 	qmi_handle_release(&ab->qmi.handle);
+-	cancel_work_sync(&ab->qmi.event_work);
+ 	ath11k_qmi_driver_event_purge(&ab->qmi);
+ 	destroy_workqueue(ab->qmi.event_wq);
++	ab->qmi.event_wq = NULL;
++	ab->qmi.cb_initialized = false;
+ 	ath11k_qmi_m3_free(ab);
+ 	ath11k_qmi_free_target_mem_chunk(ab);
+ }
+--- a/drivers/net/wireless/ath/ath11k/qmi.h
++++ b/drivers/net/wireless/ath/ath11k/qmi.h
+@@ -154,6 +154,7 @@
+ 	atomic_t cb_active;
+ 	bool cb_closing;
+ 	bool cb_initialized;
++	bool event_closing;
+ 	struct ath11k_qmi_ce_cfg ce_cfg;
+ 	struct target_mem_chunk target_mem[ATH11K_QMI_WLANFW_MAX_NUM_MEM_SEG_V01];
+ 	u32 mem_seg_count;
