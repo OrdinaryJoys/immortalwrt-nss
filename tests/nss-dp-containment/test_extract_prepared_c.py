@@ -20,6 +20,17 @@ class ExtractionIntegrity(unittest.TestCase):
         actual = 'int wanted(void) {\n#if REAL_BRANCH\n return 1;\n#else\n return 2;\n#endif\n}\n'
         self.assertEqual(function(actual, 'wanted'), actual)
 
+    def test_split_return_type_preserves_original_bytes(self):
+        for separator in ('\n', '\r\n'):
+            actual = 'static void' + separator + 'wanted(void *p) { (void)p; }\n'
+            self.assertEqual(function(actual, 'wanted'), actual)
+
+    def test_split_return_type_still_rejects_ambiguity_and_prototype(self):
+        actual = 'static void\nwanted(void *p) { (void)p; }\n'
+        self.assertEqual(function('static void wanted(void *p);\n' + actual, 'wanted'), actual)
+        with self.assertRaises(ValueError):
+            function(actual + 'void wanted(void *p) { (void)p; }\n', 'wanted')
+
     def test_missing_or_ambiguous_definition_is_rejected(self):
         with self.assertRaises(ValueError):
             function('int different(void) { return 0; }\n', 'wanted')

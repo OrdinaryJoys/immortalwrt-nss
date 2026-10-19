@@ -1,0 +1,49 @@
+Subject: wifi: ath11k: roll back all resources owned by failed DP allocation
+
+The caller does not run dp_free() when dp_alloc() fails. Link descriptor
+setup unwinds its own partial banks/scatter buffers, but not the WBM idle
+ring allocated by dp_alloc(). Use the existing guarded link cleanup for
+that parent-owned ring as well.
+
+When a TX status allocation fails, release and clear only the earlier
+successful slots before common rings and link resources are reclaimed.
+Do not call the full dp_free() on a partially initialized DP: later TX
+locks and pools may not exist yet. Keep successful allocation unchanged.
+
+Upstream-Status: Pending
+
+---
+
+--- a/drivers/net/wireless/ath/ath11k/dp.c
++++ b/drivers/net/wireless/ath/ath11k/dp.c
+@@ -1164,7 +1164,7 @@ int ath11k_dp_alloc(struct ath11k_base *ab)
+ 					HAL_WBM_IDLE_LINK, srng, n_link_desc);
+ 	if (ret) {
+ 		ath11k_warn(ab, "failed to setup link desc: %d\n", ret);
+-		return ret;
++		goto fail_link_desc_cleanup;
+ 	}
+ 
+ 	ret = ath11k_dp_srng_common_setup(ab);
+@@ -1183,7 +1183,7 @@ int ath11k_dp_alloc(struct ath11k_base *ab)
+ 		dp->tx_ring[i].tx_status = kmalloc(size, GFP_KERNEL);
+ 		if (!dp->tx_ring[i].tx_status) {
+ 			ret = -ENOMEM;
+-			goto fail_cmn_srng_cleanup;
++			goto fail_tx_status_free;
+ 		}
+ 	}
+ 
+@@ -1194,7 +1194,11 @@ int ath11k_dp_alloc(struct ath11k_base *ab)
+ 
+ 	return 0;
+ 
+-fail_cmn_srng_cleanup:
++fail_tx_status_free:
++	while (i--) {
++		kfree(dp->tx_ring[i].tx_status);
++		dp->tx_ring[i].tx_status = NULL;
++	}
+ 	ath11k_dp_srng_common_cleanup(ab);
+ 
+ fail_link_desc_cleanup:

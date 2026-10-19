@@ -1,0 +1,50 @@
+Subject: wifi: ath11k: release DMA storage when SRNG setup fails
+
+Invalid DP ring types and HAL setup errors occur after DMA allocation.
+Return the original error only after releasing that allocation. Record
+the current allocation's cacheability before any such error, including
+reuse after cleanup, so the DMA free API matches the allocation API.
+
+Upstream-Status: Pending
+
+---
+
+--- a/drivers/net/wireless/ath/ath11k/dp.c
++++ b/drivers/net/wireless/ath/ath11k/dp.c
+@@ -281,6 +281,8 @@ int ath11k_dp_srng_setup(struct ath11k_base *ab, struct dp_srng *ring,
+ 	if (!ring->vaddr_unaligned)
+ 		return -ENOMEM;
+ 
++	ring->cached = cached;
++
+ 	ring->vaddr = PTR_ALIGN(ring->vaddr_unaligned, HAL_RING_BASE_ALIGN);
+ 	ring->paddr = ring->paddr_unaligned + ((unsigned long)ring->vaddr -
+ 		      (unsigned long)ring->vaddr_unaligned);
+@@ -334,7 +336,8 @@ int ath11k_dp_srng_setup(struct ath11k_base *ab, struct dp_srng *ring,
+ 		break;
+ 	default:
+ 		ath11k_warn(ab, "Not a valid ring type in dp :%d\n", type);
+-		return -EINVAL;
++		ret = -EINVAL;
++		goto err_free;
+ 	}
+ 
+ 	if (cached) {
+@@ -346,12 +349,16 @@ int ath11k_dp_srng_setup(struct ath11k_base *ab, struct dp_srng *ring,
+ 	if (ret < 0) {
+ 		ath11k_warn(ab, "failed to setup srng: %d ring_id %d\n",
+ 			    ret, ring_num);
+-		return ret;
++		goto err_free;
+ 	}
+ 
+ 	ring->ring_id = ret;
+ 
+ 	return 0;
++
++err_free:
++	ath11k_dp_srng_cleanup(ab, ring);
++	return ret;
+ }
+ 
+ void ath11k_dp_stop_shadow_timers(struct ath11k_base *ab)

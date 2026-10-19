@@ -85,7 +85,7 @@ def block_end(text, start):
 
 
 def function(text, name, *, occurrence=None):
-    pattern = re.compile(r'^[A-Za-z_][A-Za-z_0-9 \t*]*\b' + re.escape(name) +
+    pattern = re.compile(r'^[A-Za-z_][A-Za-z_0-9 \t*]*(?:\r?\n[ \t]*)?\b' + re.escape(name) +
                          r'[ \t]*\([^;{}]*\)[ \t\r\n]*\{', re.M)
     matches = list(pattern.finditer(code_mask(text)))
     if not matches or (occurrence is None and len(matches) != 1):
