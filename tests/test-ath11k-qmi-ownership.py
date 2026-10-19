@@ -5,6 +5,7 @@ import hashlib
 import importlib.util
 import json
 import re
+import shlex
 from pathlib import Path
 import subprocess
 
@@ -16,6 +17,8 @@ parser=argparse.ArgumentParser(description=__doc__)
 parser.add_argument('prepared',type=Path)
 parser.add_argument('--baseline',type=Path)
 parser.add_argument('--output',type=Path,required=True)
+parser.add_argument('--cc',default='cc',help='host compiler command, for GCC/Clang qualification')
+parser.add_argument('--sanitize',action='store_true')
 args=parser.parse_args();args.output.mkdir(parents=True,exist_ok=False)
 
 def definition(text,name):
@@ -27,6 +30,7 @@ def definition(text,name):
 PREFIX=r'''
 #include <assert.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -75,12 +79,15 @@ static void list_splice_init(struct list_head *h,struct list_head *d) {
 enum ath11k_qmi_event_type {TEST_EVENT};
 struct ath11k_qmi_driver_event {enum ath11k_qmi_event_type type;void *data;struct list_head list;};
 struct target_info {int unused;};
-struct target_mem_chunk {int unused;};
+typedef uint32_t u32;
+typedef uint64_t dma_addr_t;
+#define __iomem
+HOST_TARGET_MEMORY_LAYOUT
 struct qmi_handle {int live;};
 struct work_struct {int queued;};
 struct ath11k_base;
 struct ath11k_qmi {struct ath11k_base *ab;struct qmi_handle handle;struct target_info target;
-    struct target_mem_chunk target_mem[4];void *event_wq;struct work_struct event_work;
+    struct target_mem_chunk target_mem[ATH11K_QMI_WLANFW_MAX_NUM_MEM_SEG_V01];void *event_wq;struct work_struct event_work;
     struct list_head event_list;int target_mem_mode,service_ins_id,event_lock,cb_lock,cb_waitq,cb_active;
     bool cb_closing,cb_initialized,event_closing;};
 struct ath11k_base {struct ath11k_qmi qmi;unsigned long dev_flags;struct {int fw_mem_mode;bool cbcal_restart_fw;} hw_params;};
@@ -165,7 +172,13 @@ records=[]
 for label,tree,must_pass in [('candidate',args.prepared,True)]+([('baseline',args.baseline,False)] if args.baseline else []):
     wifi=tree/'drivers/net/wireless/ath/ath11k'
     qmi=(wifi/'qmi.c').read_text();ahb=(wifi/'ahb.c').read_text()
-    pieces=[PREFIX]
+    header=(wifi/'qmi.h').read_text()
+    limit=re.search(r'^#define ATH11K_QMI_WLANFW_MAX_NUM_MEM_SEG_V01\s+\d+\s*$',header,re.M)
+    if limit is None:raise ValueError('missing target memory array limit')
+    # Keep the actual array element layout: shrinking it to int[4] creates a
+    # GCC memset-elt-size diagnostic absent from the real prepared structure.
+    layout=limit.group()+'\n'+extract.structure(header,'target_mem_chunk')
+    pieces=[PREFIX.replace('HOST_TARGET_MEMORY_LAYOUT',layout)]
     for name in ('ath11k_qmi_driver_event_post','ath11k_qmi_cb_close','ath11k_qmi_driver_event_purge','ath11k_qmi_deinit_service','ath11k_qmi_init_service'):
         pieces.append(definition(qmi,name))
     for name in ('ath11k_ahb_remove','ath11k_ahb_shutdown'):
@@ -183,12 +196,18 @@ for label,tree,must_pass in [('candidate',args.prepared,True)]+([('baseline',arg
     pieces.append('static void tx_status_free(struct test_dp *dp) {int i;'+block+'}\n')
     pieces.append(MAIN)
     c=args.output/(label+'.c');c.write_text('\n'.join(pieces))
-    result=subprocess.run(['cc','-std=gnu11','-Wall','-Wextra','-Werror','-Wno-unused-parameter',str(c),'-o',str(c.with_suffix(''))],capture_output=True)
+    command=shlex.split(args.cc)+['-std=gnu11','-Wall','-Wextra','-Werror','-Wno-unused-parameter',str(c),'-o',str(c.with_suffix(''))]
+    if args.sanitize:command+=['-fsanitize=address,undefined','-fno-sanitize-recover=all','-fno-omit-frame-pointer']
+    result=subprocess.run(command,capture_output=True,timeout=60)
     (args.output/(label+'-compile.stderr')).write_bytes(result.stderr)
     if result.returncode:raise SystemExit(result.stderr.decode())
-    result=subprocess.run([str(c.with_suffix(''))],capture_output=True)
+    result=subprocess.run([str(c.with_suffix(''))],capture_output=True,timeout=30)
     (args.output/(label+'.stdout')).write_bytes(result.stdout);(args.output/(label+'.stderr')).write_bytes(result.stderr)
     if (result.returncode==0)!=must_pass:raise SystemExit('unexpected '+label+' result: '+result.stderr.decode())
-    records.append(dict(label=label,returncode=result.returncode,expected=True,qmi_sha256=hashlib.sha256(qmi.encode()).hexdigest(),ahb_sha256=hashlib.sha256(ahb.encode()).hexdigest()))
+    if re.search(rb'AddressSanitizer|UndefinedBehaviorSanitizer|runtime error:',result.stderr):
+        raise SystemExit('sanitizer failure is not a valid assertion negative control: '+label)
+    records.append(dict(label=label,returncode=result.returncode,expected_pass=must_pass,command=command,
+        qmi_sha256=hashlib.sha256(qmi.encode()).hexdigest(),ahb_sha256=hashlib.sha256(ahb.encode()).hexdigest(),
+        qmi_header_sha256=hashlib.sha256(header.encode()).hexdigest(),layout_sha256=hashlib.sha256(layout.encode()).hexdigest()))
 (args.output/'RESULT.json').write_text(json.dumps(dict(results=records,scope='actual functions and resource effects; work/locks modeled, not kernel concurrency or full recovery qualification'),indent=2)+'\n')
 print(json.dumps(records,indent=2))

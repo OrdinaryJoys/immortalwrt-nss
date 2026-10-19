@@ -166,7 +166,10 @@ static void ath11k_ahb_init_qmi_ce_config(struct ath11k_base *ab) {(void)ab;}
 static int ath11k_core_get_rproc(struct ath11k_base *ab) {(void)ab;return failed(RPROC);}
 static int ath11k_core_init(struct ath11k_base *ab) {
     (void)ab;core_calls++;if(!live_irqs&&!pcic_live)core_before_irq++;
-    if(failed(CORE_INIT))return -EIO;core_live=true;return 0;
+    if(failed(CORE_INIT))
+        return -EIO;
+    core_live=true;
+    return 0;
 }
 static void ath11k_core_free(struct ath11k_base *ab) {(void)ab;if(core_live)free_live_core++;release(BASE_ALLOC);}
 /* The IRQ-only fixture never acquires providers: any release is unexpected. */
@@ -196,7 +199,10 @@ static struct iommu_domain *iommu_paging_domain_alloc(struct device *d) {
 static int iommu_attach_device(struct iommu_domain *d,struct device *dev) {(void)d;(void)dev;if(failed(DOMAIN_ATTACH))return -EIO;attached++;return 0;}
 static int iommu_map(struct iommu_domain *d,uint64_t iova,uint64_t pa,size_t size,int access,int flags) {
     (void)d;(void)pa;(void)size;(void)access;(void)flags;
-    if(failed(iova==0x1000?MAP_MSA:MAP_CE))return -EIO;mappings++;return 0;
+    if(failed(iova==0x1000?MAP_MSA:MAP_CE))
+        return -EIO;
+    mappings++;
+    return 0;
 }
 static size_t iommu_unmap(struct iommu_domain *d,uint64_t iova,size_t size) {(void)d;(void)iova;if(!mappings)bad_api++;else mappings--;return size;}
 static void iommu_detach_device(struct iommu_domain *d,struct device *dev) {(void)d;(void)dev;if(!attached)bad_api++;else attached--;}

@@ -95,7 +95,7 @@ for label,root,expected in variants:
         'mutant-napi-del': ('netif_napi_del(&irq_grp->napi);',';'),
         'mutant-pci-caller': ('ath11k_pci_set_irq_affinity_hint(ab_pci, NULL);\n\tath11k_pcic_free_irq(ab);',
                               'ath11k_pci_set_irq_affinity_hint(ab_pci, NULL);'),
-        'mutant-ahb-caller': ('if (ret)\n\t\t\tath11k_pcic_free_irq(ab);','if (ret)\n\t\t\t;'),
+        'mutant-ahb-caller': ('if (ret)\n\t\t\tath11k_pcic_free_irq(ab);','if (ret)\n\t\t\t(void)ab;'),
         'mutant-affinity-order': ('ath11k_pci_set_irq_affinity_hint(ab_pci, NULL);\n\tath11k_pcic_free_irq(ab);',
                                   'ath11k_pcic_free_irq(ab);\n\tath11k_pci_set_irq_affinity_hint(ab_pci, NULL);'),
     }
