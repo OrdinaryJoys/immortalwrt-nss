@@ -1,0 +1,44 @@
+From: Wei Zhang <wei.zhang@oss.qualcomm.com>
+Subject: wifi: ath11k: cancel SSR work items during PCI shutdown
+
+Backport the functional changes of upstream commit
+8c79aac429b583301f387374ff37c59be671df87. Keep the local copyright
+header and NSS context unchanged. PCI shutdown must close RDDM admission
+under the same base_lock as its producer, then drain reset/dump work
+before powering down MHI DMA resources.
+
+This is the upstream PCI/MHI shutdown scope, not a claim that AHB/hybrid
+remove, debugfs reset admission or general recovery teardown is complete.
+
+Upstream-Status: Backport [https://github.com/torvalds/linux/commit/8c79aac429b583301f387374ff37c59be671df87]
+
+--- a/drivers/net/wireless/ath/ath11k/mhi.c
++++ b/drivers/net/wireless/ath/ath11k/mhi.c
+@@ -312,8 +312,10 @@ static void ath11k_mhi_op_status_cb(struct mhi_controller *mhi_cntrl,
+ 			break;
+ 		}
+ 
++		spin_lock_bh(&ab->base_lock);
+ 		if (!(test_bit(ATH11K_FLAG_UNREGISTERING, &ab->dev_flags)))
+ 			queue_work(ab->workqueue_aux, &ab->reset_work);
++		spin_unlock_bh(&ab->base_lock);
+ 
+ 		break;
+ 	case MHI_CB_EE_SBL_MODE:
+--- a/drivers/net/wireless/ath/ath11k/pci.c
++++ b/drivers/net/wireless/ath/ath11k/pci.c
+@@ -1235,6 +1235,14 @@ static void ath11k_pci_shutdown(struct pci_dev *pdev)
+ 	struct ath11k_pci *ab_pci = ath11k_pci_priv(ab);
+ 
+ 	ath11k_pci_set_irq_affinity_hint(ab_pci, NULL);
++
++	spin_lock_bh(&ab->base_lock);
++	set_bit(ATH11K_FLAG_UNREGISTERING, &ab->dev_flags);
++	spin_unlock_bh(&ab->base_lock);
++
++	cancel_work_sync(&ab->reset_work);
++	cancel_work_sync(&ab->dump_work);
++
+ 	ath11k_pci_power_down(ab, false);
+ }
+ 
