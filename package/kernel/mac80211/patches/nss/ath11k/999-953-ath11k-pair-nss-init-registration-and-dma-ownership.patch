@@ -1,9 +1,9 @@
 Subject: wifi: ath11k: pair NSS init rejection and descriptor ownership
 
-Check the exported NSS context before allocating descriptors or publishing
-the SoC callback. Keep the post-registration check for a state transition,
-but unwind the registration when that second check rejects initialization.
-The pinned NSS getter returns the same global context as registration.
+Unwind the SoC registration when the existing state check rejects NSS
+initialization. Preserve the original admission point: NSS may become ready
+during descriptor allocation, so rejecting it earlier can regress startup.
+The unregister API also returns an external interface reservation.
 
 Use the coherent allocation's CPU pointer as the ownership predicate and
 clear all descriptor metadata after release. This also preserves a valid
@@ -38,20 +38,7 @@ Upstream-Status: Pending
 +		ab->nss.tx_desc_paddr[i] = 0;
 +		ab->nss.tx_desc_size[i] = 0;
  	}
-@@ -4451,6 +4451,12 @@ static int ath11k_nss_init(struct ath11k_base *ab)
- 	if (target_type == ATH11K_WIFILI_TARGET_TYPE_UNKNOWN)
- 		return -ENOTSUPP;
- 
-+	nss_contex = nss_wifili_get_context();
-+	if (nss_cmn_get_state(nss_contex) != NSS_STATE_INITIALIZED) {
-+		ath11k_warn(ab, "nss core is not ready for initialization\n");
-+		return -EINVAL;
-+	}
-+
- 	wlmsg = kzalloc(sizeof(struct nss_wifili_msg), GFP_ATOMIC);
- 	if (!wlmsg)
- 		return -ENOMEM;
-@@ -4527,6 +4533,6 @@ static int ath11k_nss_init(struct ath11k_base *ab)
+@@ -4527,6 +4527,6 @@ static int ath11k_nss_init(struct ath11k_base *ab)
  	if (nss_cmn_get_state(nss_contex) != NSS_STATE_INITIALIZED) {
  		ath11k_warn(ab, "nss state in default init state\n");
 -		goto free;

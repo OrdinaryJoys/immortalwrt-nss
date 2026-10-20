@@ -12,9 +12,10 @@ python3 tests/test-ath11k-nss-init-ownership.py PREPARED_BACKPORTS \
 
 Covered contracts:
 
-- Reject an unready core before DMA allocation, external-interface reservation
-  or callback publication; a later retry on the same host object can succeed.
-- If readiness changes after publication, unregister exactly that interface.
+- If the existing initialization-state check rejects the published interface,
+  unregister exactly that interface and release its external reservation.
+- Preserve the original admission point: readiness may arrive during sleeping
+  descriptor allocation, and a later retry on the same object must still work.
 - Preserve a foreign external interface when using/releasing the second slot.
 - Descriptor CPU ownership, a successful DMA address zero, failed handles left
   untouched/zero/error-valued, metadata clearing and repeated host cleanup.
@@ -23,7 +24,8 @@ Covered contracts:
 - Preserve the normal initialization resource/message signature.
 
 The baseline must fail independently in N01 and N02 assertions. Five mutations
-isolate admission, unregister, zero-address ownership, metadata and DMA release.
+isolate premature readiness rejection, unregister, zero-address ownership,
+metadata and DMA release.
 Compiler/sanitizer errors are not accepted as assertion-based negative controls.
 
 Limits:

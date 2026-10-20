@@ -87,7 +87,7 @@ struct ath11k_base {
         u32 *tx_desc_vaddr[ATH11K_NSS_MAX_NUMBER_OF_PAGE];
         u32 tx_desc_size[ATH11K_NSS_MAX_NUMBER_OF_PAGE]; } nss;
 };
-enum fault { HEALTHY, NOT_READY, LOST_AFTER_PUBLICATION, MSG_NOMEM, SEND_REJECT, REPLY_TIMEOUT, REPLY_NACK };
+enum fault { HEALTHY, NOT_READY, LOST_AFTER_PUBLICATION, MSG_NOMEM, SEND_REJECT, REPLY_TIMEOUT, REPLY_NACK, LATE_READY };
 static enum fault fault;
 static struct ath11k_base *active;
 static unsigned messages, message_live, dma_attempts, fail_at, handle_mode, invalid_dma, free_calls, count;
@@ -114,6 +114,7 @@ static void kfree(void *p) { if (p) { BUG_ON(!message_live); message_live--; fre
 static void *dma_alloc_coherent(struct device *dev, size_t size, dma_addr_t *dma, int flags)
 {
     (void)dev; (void)flags;
+    if (fault == LATE_READY) nss_top_main.nss[0].state = NSS_CORE_STATE_INITIALIZED;
     if (++dma_attempts == fail_at) {
         if (handle_mode == 1) *dma = 0;
         if (handle_mode == 2) *dma = UINT64_MAX;
@@ -204,7 +205,7 @@ static void init_cases(int radios, enum ath11k_hw_rev hw, int desc)
             normal_signature = normal_signature * 131 + ab.nss.if_num * 17 + ab.nss.tx_desc_limit * 3 + live_dma();
             dispose_success(&ab);
         }
-        if (fault == NOT_READY) check_n02(count == 0 && messages == 0);
+        if (fault == NOT_READY) check_n02(messages == 0);
         if (fault == LOST_AFTER_PUBLICATION) check_n02(messages == 0);
         check_clean(&ab);
         /* Repeat cleanup without concealing any failed assertion in the ledger. */
@@ -220,6 +221,12 @@ static void init_cases(int radios, enum ath11k_hw_rev hw, int desc)
     check_n02(ath11k_nss_init(&ab) == -EINVAL);
     fault = HEALTHY; nss_top_main.nss[0].state = NSS_CORE_STATE_INITIALIZED;
     check_n02(ath11k_nss_init(&ab) == 0); dispose_success(&ab); check_clean(&ab); scenarios++;
+    /* A sleeping GFP_KERNEL allocation may overlap provider readiness. */
+    reset_case(&ab, radios, hw); property = desc; fault = LATE_READY; nss_top_main.nss[0].state = 0;
+    int ret = ath11k_nss_init(&ab);
+    check_n02(ret == 0);
+    if (!ret) dispose_success(&ab);
+    check_clean(&ab); scenarios++;
 }
 static void allocation_cases(int radios, int desc)
 {
@@ -256,7 +263,7 @@ static void busy_external_cases(void)
                 check_n02(ab.nss.if_num == NSS_WIFILI_EXTERNAL_INTERFACE1 && registrations() == 2);
                 dispose_success(&ab);
             }
-            if (fault == NOT_READY) check_n02(count == 0 && messages == 0);
+            if (fault == NOT_READY) check_n02(messages == 0);
             check_clean(&ab); scenarios++;
         }
     }

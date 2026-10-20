@@ -12,14 +12,17 @@ NO-FLASH and NO-RELEASE remain in force.
 
 ## Initialization contract
 
-The pinned NSS driver exports `nss_wifili_get_context()`. Both that getter and
-`nss_register_wifili_if()` resolve the Wi-Fi NSS core through the existing driver
-global. The module dependency already requires the NSS provider to be loaded.
+The pinned `nss_register_wifili_if()` publishes the host object before returning
+the context. If the existing subsequent state check rejects initialization, use
+the common unregister label, which also releases an external reservation owned
+by that initialization. Previously the rejection went straight to memory free.
 
-Check its initialized state before allocating descriptors or publishing a host
-callback. Preserve the existing post-registration check, because state can change
-after admission. On that later rejection, use the common unregister label, which
-also releases any external-interface reservation owned by this initialization.
+Preserve the original admission point. The first local draft queried the exported
+getter and rejected an unready core before allocating descriptors. A new positive
+control demonstrates why that is too eager: NSS can become ready during sleeping
+descriptor allocation, after which the original startup would succeed. The
+early guard is removed, retained only as a failing mutation; it was never pushed
+or deployed. No new provider API reference remains in production code.
 
 No new ownership flag, global lock, callback API or packet-path operation is
 introduced. Unsupported hardware and the existing return-code contract remain.
@@ -45,17 +48,18 @@ Fresh complete mac80211/SSDK/ECM patch preparation uses exact pinned inputs,
 zero fuzz. Of 2891 prepared mac80211 files only `ath11k/nss.c` changes relative
 to r18; prepared SSDK and ECM are identical.
 
-GCC16 and Clang ASan/UBSan each pass 2614 scenario combinations and 263216
+GCC16 and Clang ASan/UBSan each pass 2689 scenario combinations and 270716
 assertions. Many assertions repeatedly inspect 96 metadata slots; these are not
-263216 independent faults or hardware tests. Real r18 fails 65365 assertions
-(N01 metadata/API boundary 65010, N02 admission/registry 355). Five mutations
-fail 77/109/75/61568/2416 assertions. Normal host signatures match throughout.
+270716 independent faults or hardware tests. Real r18 fails 66898 assertions
+(N01 metadata/API boundary 66620, N02 registry 278). Five mutations fail
+75/278/75/64822/2568 assertions. Normal host signatures match throughout.
 
 Sixteen existing recovery/QMI/IRQ/provider/CE/PCI/DP/SRNG/core/SSDK/ECM/extractor
 groups pass on the final prepared tree. These remain bounded API/host tests.
-The actual accepted r15 NSS module contains an AArch64 PREL32 export record
-for the getter, not just an unverified header declaration; r19 target linking
-and execution are still untested.
+The proposed getter was checked against the actual accepted r15 NSS module's
+AArch64 PREL32 export record, then intentionally not used because preserving
+startup semantics matters more than early rejection. r19 target linking and
+execution are still untested.
 
 ## Open gates
 

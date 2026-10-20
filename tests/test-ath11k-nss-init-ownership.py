@@ -50,7 +50,7 @@ if args.baseline:
     variants.append(('baseline', args.baseline, False))
 if args.mutations:
     variants += [(v, args.prepared, False) for v in
-        ('skip-precheck', 'skip-post-reject-unregister', 'zero-dma-skipped', 'retain-metadata', 'forget-dma-free')]
+        ('eager-readiness-reject', 'skip-post-reject-unregister', 'zero-dma-skipped', 'retain-metadata', 'forget-dma-free')]
 records = []
 for variant, root, expected in variants:
     tree = extract.Prepared(root)
@@ -68,8 +68,9 @@ for variant, root, expected in variants:
         ('ath11k_nss_tx_desc_mem_free', 'ath11k_nss_tx_desc_mem_alloc', 'ath11k_nss_get_tx_desc_limit',
          'ath11k_nss_fill_tx_desc_info', 'ath11k_nss_get_target_type', 'ath11k_nss_get_interface_type', 'ath11k_nss_init'))
     edits = {
-        'skip-precheck': ('\tnss_contex = nss_wifili_get_context();\n\tif (nss_cmn_get_state(nss_contex) != NSS_STATE_INITIALIZED) {\n'
-            '\t\tath11k_warn(ab, "nss core is not ready for initialization\\n");\n\t\treturn -EINVAL;\n\t}\n', ''),
+        'eager-readiness-reject': ('\twlmsg = kzalloc(sizeof(struct nss_wifili_msg), GFP_ATOMIC);',
+            '\tnss_contex = nss_wifili_get_context();\n\tif (nss_cmn_get_state(nss_contex) != NSS_STATE_INITIALIZED)\n'
+            '\t\treturn -EINVAL;\n\twlmsg = kzalloc(sizeof(struct nss_wifili_msg), GFP_ATOMIC);'),
         'skip-post-reject-unregister': ('"nss state in default init state\\n");\n\t\tgoto unregister;',
             '"nss state in default init state\\n");\n\t\tgoto free;'),
         'zero-dma-skipped': ('if (ab->nss.tx_desc_vaddr[i])', 'if (ab->nss.tx_desc_vaddr[i] && ab->nss.tx_desc_paddr[i])'),
@@ -105,7 +106,7 @@ for variant, root, expected in variants:
     assert (ran.returncode == 0) == expected and (result['failures'] == 0) == expected, (variant, result)
     if variant == 'baseline':
         assert result['n01_failures'] and result['n02_failures']
-    if variant in ('skip-precheck', 'skip-post-reject-unregister'):
+    if variant in ('eager-readiness-reject', 'skip-post-reject-unregister'):
         assert result['n02_failures'] and not result['n01_failures']
     records.append(dict(variant=variant, expected_pass=expected, command=command,
         generated_sha256=hashlib.sha256(code.encode()).hexdigest(), **result, **tree.manifest()))
