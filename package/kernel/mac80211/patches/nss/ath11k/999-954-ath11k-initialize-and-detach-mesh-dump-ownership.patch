@@ -1,0 +1,36 @@
+Subject: wifi: ath11k: initialize and detach NSS mesh dump ownership
+
+Initialize the radio's NSS dump lock with the radio object, before it is
+published. Unlike pdev setup, allocation is skipped for an already
+registered radio during recovery, so this does not reinitialize a lock
+that may still have users. Keep the NSS-disabled configuration buildable.
+
+Detach stale mesh-path entries with list_splice_tail_init() before freeing
+them outside the lock. list_splice_tail() leaves the reusable source head
+pointing at entries that the request then frees, including on TX failure.
+The next reply or request must see an empty, valid source head instead.
+
+This repairs conditional mesh dump ownership, not NSS control teardown,
+firmware DMA quiescence, concurrent dump transactions or stock throughput.
+The current AX6 stock configuration does not enable NSS mesh support.
+
+Upstream-Status: Pending
+
+---
+
+--- a/drivers/net/wireless/ath/ath11k/mac.c
++++ b/drivers/net/wireless/ath/ath11k/mac.c
+@@ -11300,3 +11300,6 @@ int ath11k_mac_allocate(struct ath11k_base *ab)
+ 		ar->num_rx_chains = get_num_chains(pdev->cap.rx_chain_mask);
+ 
++#ifdef CPTCFG_ATH11K_NSS_SUPPORT
++		spin_lock_init(&ar->nss.dump_lock);
++#endif
+ 		pdev->ar = ar;
+--- a/drivers/net/wireless/ath/ath11k/nss.c
++++ b/drivers/net/wireless/ath/ath11k/nss.c
+@@ -1833,3 +1833,3 @@ int ath11k_nss_dump_mpath_request(struct ath11k_vif *arvif)
+ 	spin_lock_bh(&ar->nss.dump_lock);
+-	list_splice_tail(&nss->mpath_dump, &local_entry);
++	list_splice_tail_init(&nss->mpath_dump, &local_entry);
+ 	arvif->nss.mpath_dump_num_entries = 0;
