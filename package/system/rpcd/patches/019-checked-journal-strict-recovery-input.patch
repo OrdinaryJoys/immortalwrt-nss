@@ -1,0 +1,181 @@
+Subject: rpcd: reject ambiguous or incomplete checked recovery journals
+
+Keep version-1 writer compatibility, but validate every field exactly once.
+Read the complete bounded regular file, retry interrupted reads, and retain
+malformed evidence while blocking writes. This is not a durable recovery
+or power-loss guarantee; checked support remains disabled by default.
+
+---
+
+--- a/uci.c
++++ b/uci.c
+@@ -183,15 +183,42 @@
+ 	}
+ }
+ 
++static bool checked_journal_uint(const char *text, unsigned long long maximum,
++				 unsigned long long *value)
++{
++	unsigned long long number;
++	char *end;
++
++	if (!text || *text < '0' || *text > '9')
++		return false;
++	errno = 0;
++	number = strtoull(text, &end, 10);
++	if (errno || *end || number > maximum)
++		return false;
++	if (value)
++		*value = number;
++	return true;
++}
++
+ static void checked_journal_load(void)
+ {
+-	char data[1024], *line, *save, *id = NULL, *request = NULL, *sid = NULL;
+-	char *state = NULL, *files = NULL, *cleanup = NULL;
++	enum { J_VERSION, J_ID, J_REQUEST, J_SID, J_STATE, J_FILES,
++	       J_CLEANUP, J_CREATED, J_COUNT };
++	static const char *const keys[J_COUNT] = {
++		"version", "id", "request", "sid", "state", "files",
++		"cleanup", "created_ms"
++	};
++	char data[1024], *fields[J_COUNT] = { NULL };
++	char *line, *next, *value;
++	unsigned long long files;
+ 	enum checked_state st;
+-	int fd;
++	struct stat info;
++	size_t length = 0;
+ 	ssize_t n;
+-
+-	fd = open(RPC_CHECKED_JOURNAL, O_RDONLY);
++	int fd, i;
++
++	fd = open(RPC_CHECKED_JOURNAL,
++		  O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+ 	if (fd < 0) {
+ 		if (errno != ENOENT) {
+ 			syslog(LOG_ERR, "uci.checked: open journal: %m");
+@@ -199,54 +226,80 @@
+ 		}
+ 		return;
+ 	}
+-	n = read(fd, data, sizeof(data) - 1);
+-	close(fd);
+-	if (n <= 0) {
+-		syslog(LOG_ERR, "uci.checked: empty/short journal");
+-		checked_journal_blocked = true;
+-		return;
+-	}
+-	data[n] = 0;
+-	for (line = strtok_r(data, "\n", &save); line; line = strtok_r(NULL, "\n", &save)) {
+-		if (!strncmp(line, "id=", 3)) id = line + 3;
+-		else if (!strncmp(line, "request=", 8)) request = line + 8;
+-		else if (!strncmp(line, "sid=", 4)) sid = line + 4;
+-		else if (!strncmp(line, "state=", 6)) state = line + 6;
+-		else if (!strncmp(line, "files=", 6)) files = line + 6;
+-		else if (!strncmp(line, "cleanup=", 8)) cleanup = line + 8;
+-	}
+-	st = state ? checked_state_parse(state) : CHECKED_NONE;
+-	if (!id || !request || !sid || !state || !files || !cleanup ||
+-	    !checked_hex(id, 32) || !checked_hex(request, 32) ||
+-	    strlen(sid) != RPC_SID_LEN || st == CHECKED_NONE) {
+-		syslog(LOG_ERR, "uci.checked: malformed journal; writes blocked");
+-		checked_journal_blocked = true;
+-		return;
+-	}
+-	{
+-		char *end;
+-		unsigned long fv = strtoul(files, &end, 10);
+-		if (*end || fv > UINT_MAX || (strcmp(cleanup, "0") && strcmp(cleanup, "1"))) {
+-			syslog(LOG_ERR, "uci.checked: malformed journal fields; writes blocked");
+-			checked_journal_blocked = true;
+-			return;
+-		}
+-	}
++	if (fstat(fd, &info) || !S_ISREG(info.st_mode) ||
++	    info.st_size <= 0 || info.st_size >= (off_t)(sizeof(data) - 1))
++		goto read_failed;
++
++	while (length < sizeof(data) - 1) {
++		n = read(fd, data + length, sizeof(data) - 1 - length);
++		if (n < 0 && errno == EINTR)
++			continue;
++		if (n < 0)
++			goto read_failed;
++		if (!n)
++			break;
++		length += n;
++	}
++	if (close(fd))
++		goto invalid;
++	if (length != (size_t)info.st_size || !length || length >= sizeof(data) - 1 ||
++	    data[length - 1] != '\n' || memchr(data, '\0', length))
++		goto invalid;
++	data[length] = '\0';
++
++	next = data;
++	while ((line = strsep(&next, "\n")) != NULL) {
++		if (!*line) {
++			if (next)
++				goto invalid;
++			break;
++		}
++		value = strchr(line, '=');
++		if (!value)
++			goto invalid;
++		*value++ = '\0';
++		for (i = 0; i < J_COUNT; i++)
++			if (!strcmp(line, keys[i]))
++				break;
++		if (i == J_COUNT || fields[i])
++			goto invalid;
++		fields[i] = value;
++	}
++	for (i = 0; i < J_COUNT; i++)
++		if (!fields[i])
++			goto invalid;
++
++	st = checked_state_parse(fields[J_STATE]);
++	if (strcmp(fields[J_VERSION], "1") ||
++	    !checked_hex(fields[J_ID], 32) ||
++	    !checked_hex(fields[J_REQUEST], 32) ||
++	    !checked_hex(fields[J_SID], RPC_SID_LEN) || st == CHECKED_NONE ||
++	    !checked_journal_uint(fields[J_FILES], UINT_MAX, &files) ||
++	    (strcmp(fields[J_CLEANUP], "0") && strcmp(fields[J_CLEANUP], "1")) ||
++	    !checked_journal_uint(fields[J_CREATED], ULLONG_MAX, NULL))
++		goto invalid;
++
+ 	if (st == CHECKED_APPLYING || st == CHECKED_PENDING || st == CHECKED_UNKNOWN) {
+ 		memset(&checked_current, 0, sizeof(checked_current));
+-		memcpy(checked_current.id, id, 33);
+-		memcpy(checked_current.request, request, 33);
+-		memcpy(checked_current.sid, sid, RPC_SID_LEN + 1);
+-		checked_current.files = (unsigned int)strtoul(files, NULL, 10);
+-		checked_current.cleanup_pending = atoi(cleanup) != 0;
+-		/* Never turn a crash-interrupted transaction into a success. */
++		memcpy(checked_current.id, fields[J_ID], 33);
++		memcpy(checked_current.request, fields[J_REQUEST], 33);
++		memcpy(checked_current.sid, fields[J_SID], RPC_SID_LEN + 1);
++		checked_current.files = (unsigned int)files;
++		checked_current.cleanup_pending = fields[J_CLEANUP][0] == '1';
++		/* Recovery never certifies an interrupted transaction as successful. */
+ 		checked_current.state = CHECKED_UNKNOWN;
+-		memcpy(apply_sid, sid, RPC_SID_LEN + 1);
++		memcpy(apply_sid, fields[J_SID], RPC_SID_LEN + 1);
+ 		syslog(LOG_WARNING, "uci.checked: recovered journal as unknown");
+ 	} else {
+-		/* Terminal journal is stale; clear it, or block if that fails. */
+ 		checked_journal_clear();
+ 	}
++	return;
++
++read_failed:
++	close(fd);
++invalid:
++	syslog(LOG_ERR, "uci.checked: invalid or unreadable journal; writes blocked");
++	checked_journal_blocked = true;
+ }
+ 
+ static void checked_finish(enum checked_state state)
