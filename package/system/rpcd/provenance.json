@@ -2,7 +2,7 @@
   "schema": 1,
   "base_commit": "28faf6403792d25b9826043aaf37880624c19568",
   "upstream_commit": "d99f703e4035d03fbcfbada3cb697db346c2b984",
-  "package_release": 7,
+  "package_release": 8,
   "default_checked_support": false,
   "patches": [
     {
@@ -44,6 +44,10 @@
     {
       "name": "019-checked-journal-strict-recovery-input.patch",
       "sha256": "d5a94a5a4add3322b78df0acedeb043669fa7ad509611659c2b2402001efdbaf"
+    },
+    {
+      "name": "020-checked-storage-directory-contract.patch",
+      "sha256": "e1fc15852d69d118e324e96dc1d7070af45980725d775089ea7df8ae70764276"
     }
   ],
   "prepared_files": {
@@ -62,10 +66,10 @@
     "rc.c": "86358cab44dcad555f36671c87d2020de85437b4c66a148fbc1efae2f9f4203c",
     "session.c": "78b8778107847ab5314661038b8b2a85883f380ea840c6e4cc13bd533aaafcd3",
     "sys.c": "8419e1b1115b5423b5638c74caecbb4abaf2f63692faf2268f0392adf5c081e5",
-    "uci.c": "e4ede606591b1cf5563338843cc6f6a1c8daec6046bf9985fd5fea610c1a9dca",
+    "uci.c": "e5f3d619654c55d7a1bccc685b1276c5c0159fa7f02231ca8f310c6f1f6f6530",
     "ucode.c": "1cfc5a4ab072941a02c21154a4e3361c31956940226a880d43f46791736f9bb0",
     "unauthenticated.json": "f9ffec0554e0dd2e429f7c1fc843393c6bd97c4af843ba8f4c0d1020a7d22a67"
   },
   "exact_files": 18,
-  "claim_boundary": "Official backports plus experimental checked backend, OFF by default. Legacy snapshot isolation retains prior isolated r6 daemon evidence; journal019 strict recovery is locally host-tested only. Durable recovery, frontend and new r7 AX6 target/runtime qualification remain open."
+  "claim_boundary": "Official backports plus experimental checked backend, OFF by default. Prior r6 isolated daemon evidence is unchanged; r7 journal019 and r8 directory020 are locally host-tested only. Durable recovery, frontend and new AX6 target/runtime qualification remain open."
 }

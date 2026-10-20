@@ -1,0 +1,73 @@
+Subject: rpcd: validate checked storage directories before use
+
+EEXIST does not certify a directory. Require a non-symlink directory owned
+by the effective user, protect snapshots from other users and fail closed
+on inaccessible or uncertain metadata. This is not a path-race, durable
+snapshot or recovery authorization guarantee; checked remains OFF.
+
+---
+
+--- a/uci.c
++++ b/uci.c
+@@ -165,20 +165,39 @@
+ 	return 0;
+ }
+ 
++static bool checked_storage_dir(const char *path, bool private)
++{
++	struct stat info;
++	char name[PATH_MAX];
++	int fd, rc, len;
++
++	len = snprintf(name, sizeof(name), "%s", path);
++	if (len < 0 || (size_t)len >= sizeof(name))
++		return false;
++	/* Keep the checked directory as the final component for O_NOFOLLOW. */
++	while (len > 1 && name[len - 1] == '/')
++		name[--len] = '\0';
++	if (mkdir(name, 0700) && errno != EEXIST)
++		return false;
++	fd = open(name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC |
++		  O_NONBLOCK);
++	if (fd < 0)
++		return false;
++	rc = fstat(fd, &info);
++	if (!rc && (!S_ISDIR(info.st_mode) || info.st_uid != geteuid() ||
++		    (info.st_mode & (private ? 0077 : 0022))))
++		rc = -1;
++	if (close(fd))
++		rc = -1;
++	return rc == 0;
++}
++
+ static void checked_storage_init(void)
+ {
+-	if (mkdir(RPC_CHECKED_DIR, 0700) && errno != EEXIST) {
+-		syslog(LOG_ERR, "uci.checked: mkdir %s: %m", RPC_CHECKED_DIR);
+-		checked_journal_blocked = true;
+-		return;
+-	}
+-	if (mkdir(RPC_CHECKED_SNAPSHOT_FILES, 0700) && errno != EEXIST) {
+-		syslog(LOG_ERR, "uci.checked: mkdir %s: %m", RPC_CHECKED_SNAPSHOT_FILES);
+-		checked_journal_blocked = true;
+-		return;
+-	}
+-	if (mkdir(RPC_CHECKED_SNAPSHOT_DELTA, 0700) && errno != EEXIST) {
+-		syslog(LOG_ERR, "uci.checked: mkdir %s: %m", RPC_CHECKED_SNAPSHOT_DELTA);
++	if (!checked_storage_dir(RPC_CHECKED_DIR, false) ||
++	    !checked_storage_dir(RPC_CHECKED_SNAPSHOT_FILES, true) ||
++	    !checked_storage_dir(RPC_CHECKED_SNAPSHOT_DELTA, true)) {
++		syslog(LOG_ERR, "uci.checked: unsafe or inaccessible storage directory");
+ 		checked_journal_blocked = true;
+ 	}
+ }
+@@ -2493,7 +2512,8 @@
+ 
+ 	if (RPCD_CHECKED_UCI_SUPPORT) {
+ 		checked_storage_init();
+-		checked_journal_load();
++		if (!checked_journal_blocked)
++			checked_journal_load();
+ 	}
+ 	rpc_session_destroy_cb(&cb);
+ 
