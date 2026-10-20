@@ -1,0 +1,61 @@
+Subject: wifi: ath11k: pair NSS init rejection and descriptor ownership
+
+Check the exported NSS context before allocating descriptors or publishing
+the SoC callback. Keep the post-registration check for a state transition,
+but unwind the registration when that second check rejects initialization.
+The pinned NSS getter returns the same global context as registration.
+
+Use the coherent allocation's CPU pointer as the ownership predicate and
+clear all descriptor metadata after release. This also preserves a valid
+DMA address of zero. NULL calls were already guarded by the Linux DMA
+wrapper; this is not a claim of a reproduced low-level double free.
+
+These changes do not establish firmware quiescence or callback draining
+after a command timeout. The shared completion and final teardown contract
+still require a joint lifecycle repair; do not force-free those resources.
+
+Upstream-Status: Pending
+
+---
+
+--- a/drivers/net/wireless/ath/ath11k/nss.c
++++ b/drivers/net/wireless/ath/ath11k/nss.c
+@@ -4156,10 +4156,10 @@ static void ath11k_nss_tx_desc_mem_free(struct ath11k_base *ab)
+ 	for (i = 0; i < ATH11K_NSS_MAX_NUMBER_OF_PAGE; i++) {
+-		if (!ab->nss.tx_desc_paddr[i])
+-			continue;
+-
+-		dma_free_coherent(ab->dev,
+-				  ab->nss.tx_desc_size[i],
+-				  ab->nss.tx_desc_vaddr[i],
+-				  ab->nss.tx_desc_paddr[i]);
++		if (ab->nss.tx_desc_vaddr[i])
++			dma_free_coherent(ab->dev,
++					  ab->nss.tx_desc_size[i],
++					  ab->nss.tx_desc_vaddr[i],
++					  ab->nss.tx_desc_paddr[i]);
+ 		ab->nss.tx_desc_vaddr[i] = NULL;
++		ab->nss.tx_desc_paddr[i] = 0;
++		ab->nss.tx_desc_size[i] = 0;
+ 	}
+@@ -4451,6 +4451,12 @@ static int ath11k_nss_init(struct ath11k_base *ab)
+ 	if (target_type == ATH11K_WIFILI_TARGET_TYPE_UNKNOWN)
+ 		return -ENOTSUPP;
+ 
++	nss_contex = nss_wifili_get_context();
++	if (nss_cmn_get_state(nss_contex) != NSS_STATE_INITIALIZED) {
++		ath11k_warn(ab, "nss core is not ready for initialization\n");
++		return -EINVAL;
++	}
++
+ 	wlmsg = kzalloc(sizeof(struct nss_wifili_msg), GFP_ATOMIC);
+ 	if (!wlmsg)
+ 		return -ENOMEM;
+@@ -4527,6 +4533,6 @@ static int ath11k_nss_init(struct ath11k_base *ab)
+ 	if (nss_cmn_get_state(nss_contex) != NSS_STATE_INITIALIZED) {
+ 		ath11k_warn(ab, "nss state in default init state\n");
+-		goto free;
++		goto unregister;
+ 	}
+ 
+ 	/* The registered soc context is stored in ab, and will be used for
