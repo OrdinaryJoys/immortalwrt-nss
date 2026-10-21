@@ -1,0 +1,17 @@
+IGS: preserve signed interface lookup errors before filling messages
+
+Both NSS device lookup APIs return int32_t and use negative values on failure.
+Keeping the result unsigned made both existing negative checks unreachable.
+Preserve the existing bool failure contract and all normal message fields;
+the driver send path's range guard remains an independent backstop.
+
+--- a/nss_qdisc/igs/nss_ifb.c
++++ b/nss_qdisc/igs/nss_ifb.c
+@@ -189,6 +189,6 @@ static bool nss_ifb_config_msg_fill(struct
+ 		int32_t ifb_num, enum nss_ifb_if_config config, void *cb)
+ {
+-	uint32_t if_src_num;
++	int32_t if_src_num;
+ 
+ 	if (netif_is_ifb_dev(dev)) {
+ 		if_src_num = nss_cmn_get_interface_number_by_dev_and_type(dev, NSS_DYNAMIC_INTERFACE_TYPE_IGS);
