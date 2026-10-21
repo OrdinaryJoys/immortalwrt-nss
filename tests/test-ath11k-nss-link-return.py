@@ -44,12 +44,18 @@ def macro(text, name):
     return matches[0] + '\n'
 
 
+def replace_once(text, before, after):
+    assert text.count(before) == 1, before
+    return text.replace(before, after, 1)
+
+
 variants = [('candidate', args.prepared, True)]
 if args.baseline:
     variants.append(('baseline', args.baseline, False))
 if args.mutations:
     variants += [(name, args.prepared, False) for name in
-        ('plain-unlock', 'double-enable', 'missing-unlock', 'early-enable', 'missing-access-end', 'missing-descriptor')]
+        ('plain-unlock', 'double-enable', 'missing-unlock', 'early-enable', 'missing-access-end', 'missing-descriptor',
+         'bh-enable-before-unlock', 'publish-before-descriptor', 'omit-source-module')]
 records = []
 for label, root, expected in variants:
     tree = extract.Prepared(root)
@@ -64,26 +70,35 @@ for label, root, expected in variants:
     structures += ''.join(macro(desc, name) for name in
         ('HAL_WBM_RELEASE_INFO0_REL_SRC_MODULE', 'HAL_WBM_RELEASE_INFO0_BM_ACTION', 'HAL_WBM_RELEASE_INFO0_DESC_TYPE'))
     source = tree.function(relative + 'hal.c', 'ath11k_hal_srng_src_get_next_entry')
-    source += tree.function(relative + 'nss.c', 'ath11k_nss_wifili_link_desc_set')
+    setter = tree.function(relative + 'nss.c', 'ath11k_nss_wifili_link_desc_set')
     returning = tree.function(relative + 'nss.c', 'ath11k_nss_wifili_link_desc_return')
     if label not in ('candidate', 'baseline'):
         original = 'spin_unlock_bh(&srng->lock);'
-        assert returning.count(original) == 1
         if label == 'plain-unlock':
-            returning = returning.replace(original, 'spin_unlock(&srng->lock);', 1)
+            returning = replace_once(returning, original, 'spin_unlock(&srng->lock);')
         elif label == 'double-enable':
-            returning = returning.replace(original, original + '\n\tlocal_bh_enable();', 1)
+            returning = replace_once(returning, original, original + '\n\tlocal_bh_enable();')
         elif label == 'missing-unlock':
-            returning = returning.replace(original, '(void)srng;', 1)
+            returning = replace_once(returning, original, '(void)srng;')
         elif label == 'early-enable':
-            returning = returning.replace('spin_lock_bh(&srng->lock);', 'spin_lock(&srng->lock);', 1)
+            returning = replace_once(returning, 'spin_lock_bh(&srng->lock);', 'spin_lock(&srng->lock);')
         elif label == 'missing-access-end':
-            returning = returning.replace('ath11k_hal_srng_access_end(ab, srng);', '(void)ab;', 1)
+            returning = replace_once(returning, 'ath11k_hal_srng_access_end(ab, srng);', '(void)ab;')
         elif label == 'missing-descriptor':
             before = 'ath11k_nss_wifili_link_desc_set(ab, desc, buf_addr_info, HAL_WBM_REL_BM_ACT_PUT_IN_IDLE);'
-            assert returning.count(before) == 1
-            returning = returning.replace(before, '(void)desc; (void)buf_addr_info;', 1)
-    code = assets[fixture].decode().replace('HOST_STRUCTURES', structures).replace('HOST_FUNCTIONS', source + returning)
+            returning = replace_once(returning, before, '(void)desc; (void)buf_addr_info;')
+        elif label == 'bh-enable-before-unlock':
+            returning = replace_once(returning, original, 'local_bh_enable();\n\tspin_unlock(&srng->lock);')
+        elif label == 'publish-before-descriptor':
+            end = '\tath11k_hal_srng_access_end(ab, srng);'
+            before = '\tdesc = ath11k_hal_srng_src_get_next_entry(ab, srng);'
+            returning = replace_once(returning, end, '')
+            returning = replace_once(returning, before, before + '\n' + end)
+        elif label == 'omit-source-module':
+            before = ('FIELD_PREP(HAL_WBM_RELEASE_INFO0_REL_SRC_MODULE,\n'
+                      '\t\t\t\t      HAL_WBM_REL_SRC_MODULE_SW) |\n\t\t\t   ')
+            setter = replace_once(setter, before, '')
+    code = assets[fixture].decode().replace('HOST_STRUCTURES', structures).replace('HOST_FUNCTIONS', source + setter + returning)
     file = args.output / (label + '.c')
     file.write_text(code)
     command = shlex.split(args.cc) + ['-std=gnu11', '-Wall', '-Wextra', '-Werror', '-Wno-unused-parameter',
@@ -98,15 +113,26 @@ for label, root, expected in variants:
     (args.output / (label + '.stderr')).write_bytes(ran.stderr)
     assert not ran.stderr, (label, ran.stderr.decode())
     result = json.loads(ran.stdout)
-    assert (ran.returncode == 0 and result['failures'] == 0) == expected, (label, result)
-    assert ran.returncode in (0, 1), label
+    assert ran.returncode == (0 if expected else 1), (label, ran.returncode)
+    assert (result['failures'] == 0) == expected, (label, result)
+    if label == 'bh-enable-before-unlock':
+        assert result['bh_order_failures'] > 0, (label, result)
+    if label in ('publish-before-descriptor', 'omit-source-module'):
+        assert result['publication_failures'] > 0, (label, result)
     records.append(dict(label=label, command=command, generated_sha256=hashlib.sha256(code.encode()).hexdigest(),
         **result, **tree.manifest()))
 if args.baseline:
     assert records[0]['normal_signature'] == records[1]['normal_signature'], 'normal ring/descriptor behavior changed'
+for row in records[1:]:
+    if row['label'] not in ('missing-descriptor', 'omit-source-module'):
+        assert row['normal_signature'] == records[0]['normal_signature'], (row['label'], 'normal signature changed')
+    else:
+        assert row['normal_signature'] != records[0]['normal_signature'], (row['label'], 'descriptor mutation was masked')
 assert all(path.read_bytes() == data for path, data in assets.items())
 (args.output / 'RESULT.json').write_text(json.dumps(dict(records=records,
     assets={str(path): hashlib.sha256(data).hexdigest() for path, data in assets.items()},
-    scope='Three complete prepared functions and exact SRNG/descriptor declarations. BH/spinlock/lockdep and MMIO begin/end are explicit contracts, not a Linux scheduler, DMA or firmware. Not callback-lifetime, target or throughput qualification.',
+    baseline_signature_compared=args.baseline is not None,
+    scope='Three complete prepared functions and exact SRNG/descriptor declarations. Host contracts check the last BH enable against held locks and inspect an independent expected descriptor/slot at access_end, across 68 seeds. These are not a Linux scheduler, DMA or firmware. Not callback-lifetime, target or throughput qualification.',
     hardware_accessed=False, target_compiled=False), indent=2) + '\n')
-print(json.dumps([{key: row[key] for key in ('label', 'scenarios', 'calls', 'checks', 'failures', 'normal_signature')} for row in records], indent=2))
+print(json.dumps([{key: row[key] for key in ('label', 'seeds', 'scenarios', 'calls', 'checks', 'failures',
+    'bh_order_failures', 'publication_failures', 'normal_signature')} for row in records], indent=2))
