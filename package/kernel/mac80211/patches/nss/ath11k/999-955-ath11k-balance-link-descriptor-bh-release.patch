@@ -1,0 +1,21 @@
+Subject: wifi: ath11k: balance bottom halves when returning NSS link descriptors
+
+The NSS link-descriptor notification uses spin_lock_bh() before accessing
+the WBM release ring. Both the successful publication and no-entry paths
+share an exit which only drops the spinlock, leaving this acquisition's
+bottom-half disable nesting in effect. Pair it with spin_unlock_bh().
+
+Keep ring access, descriptor contents and firmware policy unchanged. This
+does not qualify callback lifetime, teardown DMA quiescence or throughput.
+
+Upstream-Status: Pending
+
+--- a/drivers/net/wireless/ath/ath11k/nss.c
++++ b/drivers/net/wireless/ath/ath11k/nss.c
+@@ -137,5 +137,5 @@ static void ath11k_nss_wifili_link_desc_return(struct ath11k_base *ab,
+ 
+ exit:
+ 	ath11k_hal_srng_access_end(ab, srng);
+-	spin_unlock(&srng->lock);
++	spin_unlock_bh(&srng->lock);
+ }
