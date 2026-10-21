@@ -55,7 +55,7 @@ if args.baseline:
 if args.mutations:
     variants += [(name, args.prepared, False) for name in
         ('plain-unlock', 'double-enable', 'missing-unlock', 'early-enable', 'missing-access-end', 'missing-descriptor',
-         'bh-enable-before-unlock', 'publish-before-descriptor', 'omit-source-module')]
+         'bh-enable-before-unlock', 'publish-before-descriptor', 'omit-source-module', 'unlock-window')]
 records = []
 for label, root, expected in variants:
     tree = extract.Prepared(root)
@@ -98,6 +98,12 @@ for label, root, expected in variants:
             before = ('FIELD_PREP(HAL_WBM_RELEASE_INFO0_REL_SRC_MODULE,\n'
                       '\t\t\t\t      HAL_WBM_REL_SRC_MODULE_SW) |\n\t\t\t   ')
             setter = replace_once(setter, before, '')
+        elif label == 'unlock-window':
+            before = '\tdesc = ath11k_hal_srng_src_get_next_entry(ab, srng);'
+            returning = replace_once(returning, before, before + '\n\tspin_unlock(&srng->lock);')
+            before = 'exit:\n\tath11k_hal_srng_access_end(ab, srng);'
+            returning = replace_once(returning, before,
+                'exit:\n\tspin_lock(&srng->lock);\n\tath11k_hal_srng_access_end(ab, srng);')
     code = assets[fixture].decode().replace('HOST_STRUCTURES', structures).replace('HOST_FUNCTIONS', source + setter + returning)
     file = args.output / (label + '.c')
     file.write_text(code)
@@ -119,6 +125,9 @@ for label, root, expected in variants:
         assert result['bh_order_failures'] > 0, (label, result)
     if label in ('publish-before-descriptor', 'omit-source-module'):
         assert result['publication_failures'] > 0, (label, result)
+    if label == 'unlock-window':
+        assert result['failures'] == result['unlock_window_failures'] == result['calls'], (label, result)
+        assert result['transaction_state_failures'] == result['bh_order_failures'] == result['publication_failures'] == 0, (label, result)
     records.append(dict(label=label, command=command, generated_sha256=hashlib.sha256(code.encode()).hexdigest(),
         **result, **tree.manifest()))
 if args.baseline:
@@ -132,7 +141,8 @@ assert all(path.read_bytes() == data for path, data in assets.items())
 (args.output / 'RESULT.json').write_text(json.dumps(dict(records=records,
     assets={str(path): hashlib.sha256(data).hexdigest() for path, data in assets.items()},
     baseline_signature_compared=args.baseline is not None,
-    scope='Three complete prepared functions and exact SRNG/descriptor declarations. Host contracts check the last BH enable against held locks and inspect an independent expected descriptor/slot at access_end, across 68 seeds. These are not a Linux scheduler, DMA or firmware. Not callback-lifetime, target or throughput qualification.',
+    scope='Three complete prepared functions and exact SRNG/descriptor declarations. Host contracts reject unlocking the selected ring between access_begin/access_end, check the last BH enable against held locks and inspect an independent expected descriptor/slot at access_end, across 68 seeds. The extracted setter is not instrumented. These are not a Linux scheduler, concurrency, DMA or firmware. Not callback-lifetime, target or throughput qualification.',
     hardware_accessed=False, target_compiled=False), indent=2) + '\n')
 print(json.dumps([{key: row[key] for key in ('label', 'seeds', 'scenarios', 'calls', 'checks', 'failures',
-    'bh_order_failures', 'publication_failures', 'normal_signature')} for row in records], indent=2))
+    'bh_order_failures', 'publication_failures', 'transaction_state_failures', 'unlock_window_failures',
+    'normal_signature')} for row in records], indent=2))

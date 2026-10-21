@@ -16,9 +16,16 @@ typedef struct { bool held; } spinlock_t;
 
 static unsigned checks, failures, scenarios, calls, begins, ends;
 static unsigned held_locks, bh_order_failures, publication_failures;
+static unsigned transaction_state_failures, unlock_window_failures;
+static spinlock_t *transaction_lock;
 static int bh_depth;
 static u64 signature = UINT64_C(1469598103934665603);
 static void check(bool ok) { checks++; failures += !ok; }
+static void check_transaction(bool ok)
+{
+    check(ok);
+    transaction_state_failures += !ok;
+}
 static void digest(const void *ptr, size_t size)
 {
     const unsigned char *bytes = ptr;
@@ -38,6 +45,8 @@ static void spin_lock(spinlock_t *lock)
 static void spin_unlock(spinlock_t *lock)
 {
     check(lock->held && held_locks > 0);
+    check(transaction_lock != lock);
+    unlock_window_failures += transaction_lock == lock;
     if (lock->held) {
         lock->held = false;
         if (held_locks)
@@ -77,6 +86,9 @@ static void ath11k_hal_srng_access_begin(struct ath11k_base *ab, struct hal_srng
     (void)ab;
     check(ring->lock.held && bh_depth > 0);
     check(ring == publication.ring && begins == ends);
+    check_transaction(transaction_lock == NULL);
+    if (!transaction_lock)
+        transaction_lock = &ring->lock;
     begins++;
 }
 static void ath11k_hal_srng_access_end(struct ath11k_base *ab, struct hal_srng *ring)
@@ -84,12 +96,15 @@ static void ath11k_hal_srng_access_end(struct ath11k_base *ab, struct hal_srng *
     (void)ab;
     check(ring->lock.held && bh_depth > 0);
     check(begins == ends + 1);
+    check_transaction(transaction_lock == &ring->lock);
     check_publication(ring == publication.ring);
     check_publication(ring->u.src_ring.hp == publication.hp);
     check_publication(ring->u.src_ring.reap_hp == publication.reap_hp);
     check_publication(ring->ring_base_vaddr + publication.slot_word == publication.slot);
     check_publication(!memcmp(publication.slot, &publication.descriptor, sizeof(publication.descriptor)));
     ends++;
+    if (transaction_lock == &ring->lock)
+        transaction_lock = NULL;
 }
 
 HOST_FUNCTIONS
@@ -132,6 +147,7 @@ int main(void)
         struct hal_srng *ring = &ab.hal.srng_list[selected];
         bh_depth = nesting[depth];
         held_locks = 0;
+        transaction_lock = NULL;
         begins = ends = 0;
         scenarios++;
         for (unsigned repeat = 0; repeat < 4; repeat++) {
@@ -161,6 +177,7 @@ int main(void)
             check(held_locks == 0);
             check(bh_depth == nesting[depth]);
             check(begins == repeat + 1 && ends == repeat + 1);
+            check_transaction(transaction_lock == NULL);
             check(ring->u.src_ring.hp == (full ? hp : next));
             check(ring->u.src_ring.reap_hp == (full ? previous_reap : next));
             if (!full)
@@ -174,8 +191,10 @@ int main(void)
         }
     }
     printf("{\"seeds\":%u,\"scenarios\":%u,\"calls\":%u,\"checks\":%u,\"failures\":%u,"
-           "\"bh_order_failures\":%u,\"publication_failures\":%u,\"normal_signature\":\"%016llx\"}\n",
+           "\"bh_order_failures\":%u,\"publication_failures\":%u,"
+           "\"transaction_state_failures\":%u,\"unlock_window_failures\":%u,\"normal_signature\":\"%016llx\"}\n",
            seed_count, scenarios, calls, checks, failures, bh_order_failures,
-           publication_failures, (unsigned long long)signature);
+           publication_failures, transaction_state_failures, unlock_window_failures,
+           (unsigned long long)signature);
     return failures ? 1 : 0;
 }

@@ -19,14 +19,80 @@ path=root/'package/kernel/mac80211/files/qca-nss-pbuf.init'
 source=path.read_text()
 
 def wrappers(text):
-    result=''
+    # Deliberately support only the current column-zero, final simple wrappers.
+    lines=text.splitlines()
+    spans=[]
     for name in ('reload','restart'):
-        found=re.findall(r'^'+name+r'\(\) \{\n.*?^\}',text,re.M|re.S)
-        if len(found)!=1:raise ValueError(name)
-        result+=found[0]+'\n'
-    return result
+        declaration=r'^[ \t]*(?:function[ \t]+'+name+r'\b|'+name+r'[ \t]*\()'
+        found=[i for i,line in enumerate(lines) if re.match(declaration,line)]
+        if len(found)!=1:raise ValueError(name+': definition count')
+        begin=found[0]
+        if lines[begin]!=name+'() {':raise ValueError(name+': unsupported header')
+        for end in range(begin+1,len(lines)):
+            line=lines[end]
+            if line.lstrip().startswith('}'):
+                if line!='}':raise ValueError(name+': unsupported closing line')
+                break
+            if line.strip() and not line[0].isspace():
+                raise ValueError(name+': unsupported body line')
+        else:
+            raise ValueError(name+': missing closing line')
+        spans.append((begin,end))
+    if spans[0][1]>=spans[1][0]:raise ValueError('wrapper order or overlap')
+    outside=lines[spans[0][1]+1:spans[1][0]]+lines[spans[1][1]+1:]
+    if any(line.strip() for line in outside):raise ValueError('extra wrapper-tail content')
+    return ''.join('\n'.join(lines[begin:end+1])+'\n' for begin,end in spans)
+
+def extraction_controls(source,candidate):
+    def changed(old,new):
+        if source.count(old)!=1:raise ValueError('extraction control context: '+old)
+        return source.replace(old,new,1)
+
+    guard='  start || return $?\n'
+    controls=[
+        ('current',source,candidate),
+        ('old-start-body',changed(guard,'  start\n'),candidate.replace(guard,'  start\n')),
+        ('blank-separators',changed('\n\nrestart() {','\n\n\nrestart() {')+'\n',candidate),
+    ]
+    for name,last in (('reload','  reload_wifi'),('restart','  reload')):
+        header=name+'() {'
+        closing=last+'\n}'
+        for label,old,new in [
+            ('header-redirection',header,header+' < /dev/null'),
+            ('header-inline-command',header,header+' :'),
+            ('header-spaced-parentheses',header,name+' () {'),
+            ('header-function-keyword',header,'function '+header),
+            ('header-indentation',header,' '+header),
+            ('closing-redirection',closing,closing+' < "$PBUF_INPUT"'),
+            ('closing-extra-command',closing,closing+'; :'),
+            ('closing-comment',closing,closing+' # unsupported'),
+            ('missing-closing-line',closing,last),
+        ]:
+            controls.append((name+'-'+label,changed(old,new),None))
+        controls += [
+            (name+'-duplicate',source+'\n'+header+'\n  :\n}\n',None),
+            (name+'-duplicate-alternate',source+'\nfunction '+name+' {\n  :\n}\n',None),
+        ]
+    controls += [
+        ('interstitial-command',changed('\n\nrestart() {','\n:\nrestart() {'),None),
+        ('trailing-command',source+'\n:\n',None),
+    ]
+    records=[]
+    for label,text,expected in controls:
+        try:
+            extracted=wrappers(text)
+        except ValueError as error:
+            if expected is not None:raise SystemExit('unexpected extraction rejection: '+label)
+            records.append(dict(label=label,result='rejected',reason=str(error)))
+        else:
+            if expected is None or extracted!=expected:
+                raise SystemExit('unexpected extraction acceptance/content: '+label)
+            records.append(dict(label=label,result='accepted'))
+    return dict(cases=len(records),accepted=sum(r['result']=='accepted' for r in records),
+        rejected=sum(r['result']=='rejected' for r in records),failures=0,records=records)
 
 candidate=wrappers(source)
+extraction=extraction_controls(source,candidate)
 variants=[('candidate',candidate,True)]
 if args.baseline:variants.append(('baseline',wrappers(args.baseline.read_text()),False))
 if args.mutations:
@@ -76,6 +142,7 @@ for label,body,expected in variants:
     records.append(dict(label=label,command=command,**result))
 assert path.read_text()==source
 (args.output/'RESULT.json').write_text(json.dumps(dict(records=records,
+    extraction_controls=extraction,
     init_sha256=hashlib.sha256(source.encode()).hexdigest(),
     test_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
     scope='actual wrappers only; start/Wi-Fi are status/call models; no production init is sourced or executed'),indent=2)+'\n')

@@ -21,15 +21,29 @@ for the last transition. At access_end, the contract checks the selected
 ring, original slot, expected head/reap indices and descriptor bytes before
 publication. The caller builds these expectations independently of the
 extracted setter, including the no-write expectation for a full ring.
+The begin/end contract also tracks the selected ring's lock as an open
+transaction. Unlocking that lock before access_end finishes is a failure,
+even if it is acquired again before publication. Releasing an unrelated
+ring lock does not violate this selected-lock contract. Transaction state
+is checked at begin/end and after each return, including the full-ring
+path. The host still performs an invalid unlock after recording it, so the
+negative's final storage signature remains comparable. The actual extracted
+getter, setter and candidate/baseline return functions are not instrumented.
 
 An old-tree baseline must fail while preserving its normal ring/descriptor
 signature. The six original compiled negatives remain: plain-unlock,
 double-enable, missing-unlock, early-enable (missing the entry BH disable),
 missing-access-end and missing-descriptor. Three additional precise negatives
 exercise the independently reviewed gaps: bh-enable-before-unlock,
-publish-before-descriptor and omit-source-module. All nine must compile,
+publish-before-descriptor and omit-source-module. A tenth negative,
+unlock-window, releases the selected lock after the getter and reacquires
+it at the common exit before access_end; its real setter is unchanged.
+All ten must compile,
 exit 1 and report failures; the new order negatives must also fail their
-specific BH-order or publication checks. Descriptor-mutating negatives must
+specific BH-order or publication checks. The unlock-window negative must
+fail only the dedicated unlock_window_failures check, once per call, with
+transaction_state_failures, BH-order and publication counters still zero.
+Descriptor-mutating negatives must
 change the normal signature; order-only negatives must preserve it.
 
 The larger seed/address set changes the signature. No historical signature,
@@ -37,7 +51,9 @@ including cf5364152bbdd55a, qualifies this expanded suite. Every --baseline
 run recomputes and compares candidate and baseline signatures using the same
 current fixture; without --baseline there is no cross-version comparison.
 The digest still samples final storage/head/reap state, not temporal order.
-The boundary and BH-order checks provide separate observations.
+The boundary, BH-order and transaction-lock checks provide separate
+observations. The lock-window extension preserves the 68-seed normal
+signature 236422c1ac845043; it adds observations, not descriptor semantics.
 
 Use a new output directory and a completely package-prepared input:
 
