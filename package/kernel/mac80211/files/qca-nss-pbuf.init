@@ -424,7 +424,7 @@ start() {
 }
 
 reload() {
-  start
+  start || return $?
   reload_wifi
 }
 
