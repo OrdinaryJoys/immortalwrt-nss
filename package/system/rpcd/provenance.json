@@ -2,7 +2,7 @@
   "schema": 1,
   "base_commit": "28faf6403792d25b9826043aaf37880624c19568",
   "upstream_commit": "d99f703e4035d03fbcfbada3cb697db346c2b984",
-  "package_release": 8,
+  "package_release": 9,
   "default_checked_support": false,
   "patches": [
     {
@@ -48,6 +48,10 @@
     {
       "name": "020-checked-storage-directory-contract.patch",
       "sha256": "e1fc15852d69d118e324e96dc1d7070af45980725d775089ea7df8ae70764276"
+    },
+    {
+      "name": "021-checked-journal-exclusive-temporary.patch",
+      "sha256": "6951327fc50725b9c7cb2a4105e1f02e96ad0bfa29959a9c52df2334d3f95ec7"
     }
   ],
   "prepared_files": {
@@ -66,10 +70,10 @@
     "rc.c": "86358cab44dcad555f36671c87d2020de85437b4c66a148fbc1efae2f9f4203c",
     "session.c": "78b8778107847ab5314661038b8b2a85883f380ea840c6e4cc13bd533aaafcd3",
     "sys.c": "8419e1b1115b5423b5638c74caecbb4abaf2f63692faf2268f0392adf5c081e5",
-    "uci.c": "e5f3d619654c55d7a1bccc685b1276c5c0159fa7f02231ca8f310c6f1f6f6530",
+    "uci.c": "e27405518ca8d0c2c1e09c881fe1dc93c4314523f64b83ba857656ceb9de9547",
     "ucode.c": "1cfc5a4ab072941a02c21154a4e3361c31956940226a880d43f46791736f9bb0",
     "unauthenticated.json": "f9ffec0554e0dd2e429f7c1fc843393c6bd97c4af843ba8f4c0d1020a7d22a67"
   },
   "exact_files": 18,
-  "claim_boundary": "Official backports plus experimental checked backend, OFF by default. Prior r6 isolated daemon evidence is unchanged; r7 journal019 and r8 directory020 are locally host-tested only. Durable recovery, frontend and new AX6 target/runtime qualification remain open."
+  "claim_boundary": "Official backports plus experimental checked backend, OFF by default. Prior r6 isolated daemon evidence is unchanged; r7-r9 journal/storage/publication repairs have local host tests only. Directory races, durable recovery, frontend and new AX6 target/runtime qualification remain open."
 }

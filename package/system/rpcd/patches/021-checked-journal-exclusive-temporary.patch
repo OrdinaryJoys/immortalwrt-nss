@@ -1,0 +1,19 @@
+Subject: rpcd: never reuse a preexisting checked journal temporary
+
+Directory validation does not certify the fixed temporary filename. Create it
+exclusively rather than truncating a preexisting file or following a link.
+Keep unknown residue intact and fail closed; recovery authorization and full
+directory anchoring remain separate requirements. Checked stays OFF by default.
+
+--- a/uci.c
++++ b/uci.c
+@@ -137,7 +137,8 @@
+ 	}
+ 
+ 	snprintf(tmp, sizeof(tmp), "%s.tmp", RPC_CHECKED_JOURNAL);
+-	fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0600);
++	fd = open(tmp, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC,
++		  0600);
+ 	if (fd < 0) {
+ 		syslog(LOG_ERR, "uci.checked: open journal: %m");
+ 		checked_journal_blocked = true;
