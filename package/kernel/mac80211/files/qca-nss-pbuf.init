@@ -354,50 +354,70 @@ apply_nss_config() {
   pbuf_config_applied=1
 }
 
-set_stats_disable() {
+pbuf_write_value() {
+  printf '%s\n' "$2" > "$1"
+}
 
-  local stats_disable
+set_stats_disable() {
+  local stats_disable stats_files stats_file stats_msg_prefix rc=0 write_rc
   config_load pbuf
   config_get stats_disable opt stats_disable 1
   [ -d /sys/kernel/debug/ath11k ] || return 0
+  stats_files=$(find /sys/kernel/debug/ath11k -name stats_disable) || return $?
 
-  find /sys/kernel/debug/ath11k -name stats_disable | while read -r stats_file; do
+  # Keep the first write error in this shell, including when later writes work.
+  while IFS= read -r stats_file; do
+    [ -n "$stats_file" ] || continue
     stats_msg_prefix="Disabling"
     [ "$stats_disable" -eq 0 ] && stats_msg_prefix="Enabling"
     logger -t "$NAME" -p user.notice "$stats_msg_prefix ath11k stats"
-    echo "$stats_disable" > "$stats_file"
-  done
+    if pbuf_write_value "$stats_file" "$stats_disable"; then
+      :
+    else
+      write_rc=$?
+      [ "$rc" -ne 0 ] || rc=$write_rc
+    fi
+  done <<PBUF_STATS_FILES
+$stats_files
+PBUF_STATS_FILES
+  return "$rc"
 }
 
 set_scaling_governor() {
 
-  local scaling_governor num_cpus governor_file
+  local scaling_governor num_cpus governor_file num=0
+  local available_file available_governors
   config_load pbuf
   config_get scaling_governor opt scaling_governor
 
-  scaling_available_governors=/sys/devices/system/cpu/cpu0/cpufreq/scaling_available_governors
+  [ -n "$scaling_governor" ] || return 0
+  available_file=/sys/devices/system/cpu/cpu0/cpufreq/scaling_available_governors
+  [ -r "$available_file" ] || return 0
+  available_governors=$(cat "$available_file") || return $?
+  [ -n "$available_governors" ] || return 0
 
-  if [ -r "$scaling_available_governors" ]; then
-    scaling_available_governors=$(cat "$scaling_available_governors")
-  else
-    return 0
-  fi
-
-  if [ -n "$scaling_available_governors" ] && [ -n "$scaling_governor" ]; then
-    case " $scaling_available_governors " in
+  case " $available_governors " in
     *" $scaling_governor "*)
       logger -t "$NAME" -p user.notice "Setting CPU scaling governor to '$scaling_governor'"
-      num_cpus=$(get_num_cpus)
-      for num in $(seq 0 $((num_cpus - 1))); do
+      num_cpus=$(get_num_cpus) || return $?
+      case "$num_cpus" in
+        '' | *[!0-9]* | 0) return 1 ;;
+      esac
+      while [ "$num" -lt "$num_cpus" ]; do
         governor_file="/sys/devices/system/cpu/cpu${num}/cpufreq/scaling_governor"
-        [ -w "$governor_file" ] && echo "$scaling_governor" > "$governor_file"
+        if [ -e "$governor_file" ]; then
+          [ -w "$governor_file" ] || return 1
+          pbuf_write_value "$governor_file" "$scaling_governor" || return $?
+        fi
+        num=$((num + 1))
       done
       ;;
     *)
-      logger -t "$NAME" -p user.error "'$scaling_governor' not available in CPU governors [ $scaling_available_governors ]"
+      logger -t "$NAME" -p user.error "'$scaling_governor' not available in CPU governors [ $available_governors ]"
+      return 1
       ;;
-    esac
-  fi
+  esac
+  return 0
 }
 
 start() {
@@ -418,8 +438,9 @@ start() {
     write_sysctl_exact dev.nss.rps.hash_bitmap "$hash_bitmap" || return 1
   fi
 
-  set_scaling_governor
-  set_stats_disable
+  set_scaling_governor || return $?
+  set_stats_disable || return $?
+  return 0
 
 }
 
