@@ -1,0 +1,45 @@
+From: OpenWrt Build System <openwrt@localhost>
+Subject: [PATCH] nss-drv: propagate extra pbuf sysctl failures as errno
+
+Both sysctl handlers return nss_n2h_buf_pool_cfg's NSS status directly.
+NSS_TX_FAILURE is positive, whereas proc handlers must use negative errno
+for errors. They also print the successful-addition message after failure.
+Reflect the allocated-byte readback as before, return -EIO on NSS failure,
+and only print the success message after NSS_TX_SUCCESS.
+
+Do not change buffer allocation, DMA, ACK/timeout, concurrency, or firmware
+policy. The shared-message/transaction ownership defect remains open.
+
+Upstream-Status: Pending
+Base: NSS driver 6aa14c78e097b29c493ff2fef87e4d35906b2b5a plus local 023
+
+--- a/nss_n2h.c
++++ b/nss_n2h.c
+@@ -1387,8 +1387,12 @@ static int nss_n2h_buf_cfg_core0_handler(const struct ctl_table *ctl, int write, void
+ 		dev_info(nss_ctx->dev, "Configuring additional NSS pbufs\n");
+ 		ret = nss_n2h_buf_pool_cfg(nss_ctx, nss_n2h_core0_add_buf_pool_size, NSS_CORE_0);
+ 		nss_n2h_core0_add_buf_pool_size = nss_ctx->buf_sz_allocated;
++		if (ret != NSS_TX_SUCCESS) {
++			dev_warn(nss_ctx->dev, "Additional pbuf configuration failed (allocated %d bytes)\n", nss_ctx->buf_sz_allocated);
++			return -EIO;
++		}
+ 		dev_info(nss_ctx->dev, "Additional pbufs of size %d got added to NSS\n", nss_ctx->buf_sz_allocated);
+-		return ret;
++		return 0;
+ 	}
+ 
+ 	dev_info(nss_ctx->dev, "Invalid input value. should be greater than 1 and less than %d\n", NSS_N2H_MAX_BUF_POOL_SIZE);
+@@ -1426,8 +1430,12 @@ static int nss_n2h_buf_cfg_core1_handler(const struct ctl_table *ctl, int write, void
+ 		dev_info(nss_ctx->dev, "Configuring additional NSS pbufs\n");
+ 		ret = nss_n2h_buf_pool_cfg(nss_ctx, nss_n2h_core1_add_buf_pool_size, NSS_CORE_1);
+ 		nss_n2h_core1_add_buf_pool_size = nss_ctx->buf_sz_allocated;
++		if (ret != NSS_TX_SUCCESS) {
++			dev_warn(nss_ctx->dev, "Additional pbuf configuration failed (allocated %d bytes)\n", nss_ctx->buf_sz_allocated);
++			return -EIO;
++		}
+ 		dev_info(nss_ctx->dev, "Additional pbufs of size %d got added to NSS\n", nss_ctx->buf_sz_allocated);
+-		return ret;
++		return 0;
+ 	}
+ 
+ 	dev_info(nss_ctx->dev, "Invalid input value. should be greater than 1 and less than %d\n", NSS_N2H_MAX_BUF_POOL_SIZE);
