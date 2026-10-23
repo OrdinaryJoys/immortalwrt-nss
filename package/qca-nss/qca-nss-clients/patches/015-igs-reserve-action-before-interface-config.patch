@@ -1,0 +1,173 @@
+nss-clients: reserve modern IGS actions before interface configuration
+
+Move action lookup/allocation ahead of NSS side effects, and unwind the
+acquired action on every subsequent failure. Reuse bound actions without
+configuring another mapping. Unfinished new actions own no device.
+
+This fixes action admission only. Firmware transaction compensation and
+registration ownership remain separate unresolved contracts.
+
+--- a/nss_qdisc/igs/nss_mirred.c
++++ b/nss_qdisc/igs/nss_mirred.c
+@@ -41,7 +41,7 @@
+ {
+ 	struct nss_mirred_tcf *act = nss_mirred_get(tc_act);
+ 	struct net_device *dev = rcu_dereference_protected(act->tcfm_dev, 1);
+-	struct nss_ifb_info *ifb_info = nss_ifb_find_dev(dev);
++	struct nss_ifb_info *ifb_info = dev ? nss_ifb_find_dev(dev) : NULL;
+ 
+ 	/*
+ 	 * Unlink the action from the nss mirred action list FIRST and
+@@ -57,6 +57,11 @@
+ 	}
+ 	spin_unlock_bh(&nss_mirred_list_lock);
+ 
++	/* No mapped device was acquired by an unfinished action. */
++	if (!dev) {
++		return;
++	}
++
+ 	if (!ifb_info) {
+ 		nss_igs_error("IFB device %s not found in the linked list \n",
+ 				dev ? dev->name : "(null)");
+@@ -166,12 +171,40 @@
+ 		return -ENODEV;
+ 	}
+ 
++#if (LINUX_VERSION_CODE >= KERNEL_VERSION(5, 4, 0))
++	/* Reserve the action before any NSS interface or mapping side effect. */
++	index = parm->index;
++	ret = tcf_idr_check_alloc(tn, &index, tc_act, bind);
++	if (ret < 0) {
++		return ret;
++	}
++
++	if (ret && bind) {
++		return 0;
++	}
++
++	if (!ret) {
++		ret = tcf_idr_create(tn, index, est, tc_act, &nss_mirred_act_ops,
++				bind, true, 0);
++		if (ret) {
++			tcf_idr_cleanup(tn, index);
++			return ret;
++		}
++	}
++
++	act = nss_mirred_get(*tc_act);
++	if (!ret) {
++		INIT_LIST_HEAD(&act->tcfm_list);
++	}
++#endif
++
+ 	ifb_info = nss_ifb_find_map_dev(from_dev);
+ 	if (ifb_info) {
+ 		if (nss_ifb_is_mapped(ifb_info)) {
+ 			nss_igs_error("%s device is already mapped to the other IFB device\n",
+ 					from_dev->name);
+-			return -EEXIST;
++			ret = -EEXIST;
++			goto init_failed;
+ 		}
+ 	}
+ 
+@@ -180,7 +213,8 @@
+ 		if (nss_ifb_is_mapped(ifb_info)) {
+ 			nss_igs_error("%s IFB device is already mapped to the other device\n",
+ 					to_dev->name);
+-			return -EEXIST;
++			ret = -EEXIST;
++			goto init_failed;
+ 		}
+ 	}
+ 
+@@ -192,7 +226,8 @@
+ 		ifb_num = nss_ifb_create_if(to_dev);
+ 		if (ifb_num < 0) {
+ 			nss_igs_error("failure in IFB creation\n");
+-			return -EINVAL;
++			ret = -EINVAL;
++			goto init_failed;
+ 		}
+ 	}
+ 
+@@ -201,7 +236,8 @@
+ 	 */
+ 	if (nss_ifb_config_msg_tx_sync(from_dev, ifb_num, NSS_IFB_SET_IGS_NODE, NULL) < 0) {
+ 		nss_igs_error("Sending config to %s dev failed\n", from_dev->name);
+-		return -EINVAL;
++		ret = -EINVAL;
++		goto init_failed;
+ 	}
+ 
+ 	/*
+@@ -209,7 +245,8 @@
+ 	 */
+ 	if (nss_ifb_config_msg_tx_sync(from_dev, ifb_num, NSS_IFB_SET_NEXTHOP, NULL) < 0) {
+ 		nss_igs_error("Sending next hop config to %s dev failed\n", from_dev->name);
+-		return -EINVAL;
++		ret = -EINVAL;
++		goto init_failed;
+ 	}
+ 
+ 	/*
+@@ -219,7 +256,7 @@
+ 	if (ret < 0) {
+ 		nss_igs_error(" Binding an IFB device failed\n");
+ 		nss_ifb_delete_if(ifb_num);
+-		return ret;
++		goto init_failed;
+ 	}
+ 
+ 	/*
+@@ -237,35 +274,6 @@
+ 	}
+ 
+ 	act = nss_mirred_get(tc_act);
+-#else
+-	index = parm->index;
+-	ret = tcf_idr_check_alloc(tn, &index, tc_act, bind);
+-	if (ret < 0) {
+-		return ret;
+-	}
+-
+-	if (ret && bind) {
+-		return 0;
+-	}
+-
+-	if (!ret) {
+-		ret = tcf_idr_create(tn, index, est, tc_act, &nss_mirred_act_ops,
+-				bind, true, 0);
+-		if (ret) {
+-			tcf_idr_cleanup(tn, index);
+-			return ret;
+-		}
+-	}
+-
+-	act = nss_mirred_get(*tc_act);
+-	if (!ret) {
+-		/*
+-		 * Freshly created action: make the list entry a valid
+-		 * empty node so the (guarded) add and delete below stay
+-		 * balanced on every path.
+-		 */
+-		INIT_LIST_HEAD(&act->tcfm_list);
+-	}
+ #endif
+ 	/*
+ 	 * Fill up the nss mirred tc parameters to
+@@ -292,6 +300,13 @@
+ #endif
+ 
+ 	return ACT_P_CREATED;
++
++init_failed:
++#if (LINUX_VERSION_CODE >= KERNEL_VERSION(5, 4, 0))
++	/* Release only the action reference acquired above, not unknown FW state. */
++	tcf_idr_release(*tc_act, bind);
++#endif
++	return ret;
+ }
+ 
+ /*
