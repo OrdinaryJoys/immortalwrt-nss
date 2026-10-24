@@ -33,7 +33,8 @@ python3 -B tests/test-nss-igs-action-admission.py \
 ```
 
 `clients` is positional; `--output` is required. `--cc` defaults to
-`/opt/homebrew/bin/gcc-16`; Clang is `/usr/bin/clang`. Compiler commands may contain
+the host `cc` from PATH; local GCC16 is `/opt/homebrew/bin/gcc-16` and Clang is
+`/usr/bin/clang`. CI explicitly passes `--cc cc`. Compiler commands may contain
 arguments (parsed with `shlex`). `--baseline`, `--mutations`, and `--sanitize` are
 optional, but omit them only for narrower local investigations, not final
 baseline/mutation qualification. Both modern version selections, 5.4.0 and

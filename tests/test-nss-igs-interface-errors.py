@@ -93,7 +93,7 @@ struct net_device { bool ifb; const char *name; };
 struct nss_subsystem_dataplane_register { struct net_device *ndev; uint32_t type; };
 struct nss_ctx_instance { struct nss_subsystem_dataplane_register subsys_dp_register[NSS_MAX_NET_INTERFACES]; };
 static struct { int num_nss; struct nss_ctx_instance nss[2]; } nss_top_main;
-static struct { int sem, wq; enum nss_cmn_response response; bool cond; } msg_response;
+static struct { int sem, wq, done; enum nss_cmn_response response; bool cond; } msg_response;
 static unsigned checks, failures, cases, context_checks, sends, waits, downs, ups;
 static nss_tx_status_t send_status;
 static bool wait_success;
@@ -114,6 +114,10 @@ static void down(int *sem) { ++downs; ++*sem; }
 static void up(int *sem) { ++ups; --*sem; }
 static unsigned model_wait(void) { ++waits; msg_response.response = reply; msg_response.cond = 0; return wait_success; }
 #define wait_event_timeout(wq, condition, timeout) ((void)(wq), (void)(timeout), model_wait())
+/* This payload/range regression substitutes synchronization. The separate
+ * sync-completion regression executes the actual callback and wait contract. */
+#define reinit_completion(done) ((void)(*(done) = 0))
+#define wait_for_completion_timeout(done, timeout) ((void)(done), (void)(timeout), model_wait())
 static void nss_ifb_wake_up_cb(void *data, struct nss_if_msg *msg) { (void)data; (void)msg; }
 static void nss_ifb_clear_config_cb(void *data, struct nss_if_msg *msg) { (void)data; (void)msg; }
 static void nss_ifb_async_cb(void *data, struct nss_if_msg *msg) { (void)data; (void)msg; }

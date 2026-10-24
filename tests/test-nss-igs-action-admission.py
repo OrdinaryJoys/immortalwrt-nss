@@ -608,7 +608,7 @@ def variants(candidate, baseline, mutations):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('clients', type=Path)
-    parser.add_argument('--cc', default=GCC16,
+    parser.add_argument('--cc', default='cc',
                         help='compiler command (default: %(default)s); Clang: ' + CLANG)
     parser.add_argument('--sanitize', action='store_true')
     parser.add_argument('--mutations', action='store_true')
