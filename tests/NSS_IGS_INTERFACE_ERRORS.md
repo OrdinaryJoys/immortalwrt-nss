@@ -32,7 +32,11 @@ exercise both missing checks, unsigned/narrow types, interface and callback data
 
 This is an isolated host contract, not a full ABI or module test. The context,
 net_device, reduced message union, synchronization/wait, callbacks and actual
-command send are substitutes. NSS_NBUF_PAYLOAD_SIZE is a model value; common
+command send are substitutes. NSS_NBUF_PAYLOAD_SIZE is a model value.
+Synchronization substitution includes the 018 reply-guard fields and irqsave
+lock operations: this payload/range model neither executes nor qualifies the
+actual callback admission/retirement. The separate sync regression covers that
+bounded control-flow contract with its own explicit lock substitutes. The common
 message version is the current contract value. The full NSS payload union,
 callback execution, wait scheduling, late ACK, device lifetime, firmware, DMA,
 kernel concurrency, target compile and performance are not qualified. No real

@@ -1,0 +1,113 @@
+nss-clients: validate and atomically retire IGS reply admission
+
+Match the interface and command envelope; reject notify/out-of-range responses.
+Serialize first-reply publication with host admission retirement.
+Keep static completion storage, callbacks, app_data and timeout unchanged.
+
+This is not request identity: a delayed reply with the same interface
+and command can still satisfy a later request. Firmware cancellation,
+module lifetime and complete registration rollback remain unresolved.
+
+--- a/nss_qdisc/igs/nss_ifb.c
++++ b/nss_qdisc/igs/nss_ifb.c
+@@ -37,7 +37,11 @@
+ static struct nss_ifb_msg_response {
+ 	struct semaphore sem;
+ 	struct completion done;
++	spinlock_t lock;
+ 	enum nss_cmn_response response;
++	uint32_t expected_interface;
++	uint32_t expected_type;
++	bool pending;
+ } msg_response;
+ 
+ /*
+@@ -176,8 +180,22 @@
+  */
+ static void nss_ifb_wake_up_cb(void *app_data, struct nss_if_msg *nim)
+ {
++	unsigned long flags;
++
++	spin_lock_irqsave(&msg_response.lock, flags);
++	if (!msg_response.pending ||
++			nim->cm.interface != msg_response.expected_interface ||
++			nim->cm.type != msg_response.expected_type ||
++			nim->cm.response >= NSS_CMN_RESPONSE_NOTIFY) {
++		spin_unlock_irqrestore(&msg_response.lock, flags);
++		return;
++	}
++
++	/* Claim the first matching reply; publish and wake before retiring the lock. */
++	msg_response.pending = false;
+ 	msg_response.response = nim->cm.response;
+ 	complete(&msg_response.done);
++	spin_unlock_irqrestore(&msg_response.lock, flags);
+ }
+ 
+ /*
+@@ -277,6 +295,8 @@
+ 		 enum nss_ifb_if_config config, void *cb)
+ {
+ 	struct nss_if_msg nim;
++	enum nss_cmn_response response;
++	unsigned long flags;
+ 	int32_t ret;
+ 
+ 	if ((ret = nss_ifb_config_msg_fill(&nim, dev, ifb_num, config, cb))) {
+@@ -286,26 +306,38 @@
+ 
+ 	down(&msg_response.sem);
+ 	/* A reply may arrive before transmission returns or waiting starts. */
++	spin_lock_irqsave(&msg_response.lock, flags);
+ 	reinit_completion(&msg_response.done);
++	msg_response.expected_interface = nim.cm.interface;
++	msg_response.expected_type = nim.cm.type;
++	msg_response.response = NSS_CMN_RESPONSE_LAST;
++	msg_response.pending = true;
++	spin_unlock_irqrestore(&msg_response.lock, flags);
+ 	ret = nss_if_tx_msg(nss_igs_get_context(), &nim);
+ 	if (ret != NSS_TX_SUCCESS) {
+-		up(&msg_response.sem);
+ 		nss_igs_error("failed to send config message\n");
+-		return -1;
++		ret = -1;
++		goto sync_done;
+ 	}
+ 
+ 	if (!wait_for_completion_timeout(&msg_response.done, NSS_IFB_MSG_TIMEOUT)) {
+ 		nss_igs_error("config for attach interface msg timeout\n");
+-		up(&msg_response.sem);
+-		return -1;
+-	} else if (msg_response.response != NSS_CMN_RESPONSE_ACK) {
+-		up(&msg_response.sem);
+-		nss_igs_error("config for attach interface msg return with response: %d\n", msg_response.response);
+-		return -1;
++		ret = -1;
++	}
++
++sync_done:
++	/* This retires host admission only; it does not cancel firmware work. */
++	spin_lock_irqsave(&msg_response.lock, flags);
++	msg_response.pending = false;
++	response = msg_response.response;
++	spin_unlock_irqrestore(&msg_response.lock, flags);
++	if (!ret && response != NSS_CMN_RESPONSE_ACK) {
++		nss_igs_error("config for attach interface msg return with response: %d\n", response);
++		ret = -1;
+ 	}
+ 
+ 	up(&msg_response.sem);
+-	return 0;
++	return ret;
+ }
+ 
+ /*
+@@ -447,6 +479,8 @@
+ void nss_ifb_init()
+ {
+ 	sema_init(&msg_response.sem, 1);
++	spin_lock_init(&msg_response.lock);
++	msg_response.pending = false;
+ 	init_completion(&msg_response.done);
+ }
+ 
