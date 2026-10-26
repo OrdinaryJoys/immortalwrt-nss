@@ -13,7 +13,7 @@ kernel/module/package, or commit anything.
 The 017 extension covers private host binding preflight as well as the prior
 015 action-admission contract. Its explicit baseline must contain 015 admission
 but predate 017 preflight (the author's baseline includes 016). With a baseline
-and all thirteen runtime negative controls there are thirty compiled/running
+and all fourteen runtime negative controls there are thirty-two compiled/running
 variants per compiler, covering both modern version selections. These are
 bounded host tests, not target or deployment qualification. Consult the actual
 invocation's RESULT.json for execution status, rather than this usage document.
@@ -71,6 +71,8 @@ map conflicts, normal new bind/nonbind and existing nonbind success are included
 Additional cases keep an unmapped borrowed entry usable with allocation disabled,
 keep existing-bind independent of allocation failure, and preserve borrowed
 storage on SET_IGS failure and three repeated existing-nonbind SET_NEXTHOP failures.
+The borrowed unmapped entry starts with a different old source device: failure
+must preserve it, while success must replace it with the requested source.
 Release also runs directly on empty/linked NULL-dev objects, a live mapping, a
 missing map entry, and failed reset/clear replies. NULL-dev release is repeated.
 
@@ -79,21 +81,24 @@ side effect. Allocation failure must leave both new and borrowed registrations
 untouched. Later errors free only private unpublished host storage; borrowing an
 unmapped local entry allocates and frees nothing. Successful configuration is
 followed by nonallocating binding publication, then dev_hold and action
-publication (existing map reuse need not allocate or republish a map). Actual
-private initialization and list publication are checked. The 016 baseline must
+publication (existing map reuse need not allocate or republish a map). Private
+list initialization and publication are checked. The allocator's storage is
+initially zero, so these oracles do not separately qualify the three scalar
+initial values before bind overwrites them. The 016 baseline must
 fail new/borrowed allocation-failure and normal-new ordering sensitivity cases
 while preserving the successful-state signature. That signature deliberately
 excludes reservation/IDR timing. Existing successful nonbind behavior is only a
 contrast against the old implementation; no new replace semantics, device-ref
 rebalance, idempotency or expanded replace correctness is claimed.
 
-Thirteen strict-context source mutations must compile and then fail their intended
+Fourteen strict-context source mutations must compile and then fail their intended
 runtime cases: missing acquired-reference return, early release of an existing
 bound action, missing list initialization, NULL-dev release reset/clear side
 effects, NSS configuration before IDR, missing placeholder cleanup, and an
 inverted release bind flag; plus late host reservation, missing private abort,
 freeing borrowed storage, lost private ownership, claiming borrowed ownership,
-and omitted binding publication. The original source bodies remain untouched for
+omitted binding publication, and omitted borrowed map-device update. The original
+source bodies remain untouched for
 candidate/baseline; mutated bodies are generated only in the new output folder.
 Missing-cleanup/abort/publication mutations retain void references to their
 omitted helper symbols (not calls). The older baseline similarly retains a

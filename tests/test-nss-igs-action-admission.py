@@ -170,7 +170,7 @@ static struct list_head nss_mirred_list;
 '''
 
 MODEL = r'''
-static struct net_device from, to, old_to;
+static struct net_device from, to, old_to, old_from;
 static struct nss_mirred_tcf fresh, old;
 static struct nss_ifb_info info, sentinel, *local_info;
 static struct nss_ctx_instance context;
@@ -367,6 +367,7 @@ static void setup(bool have_old, int conflict, bool borrowed) {
     from=(struct net_device){.name="host-from",.ifindex=1};
     to=(struct net_device){.name="host-ifb",.ifindex=2,.ifb=true};
     old_to=(struct net_device){.name="host-old",.ifindex=3,.ifb=true,.refs=1};
+    old_from=(struct net_device){.name="host-old-from",.ifindex=4};
     parms=(struct tc_nss_mirred){.index=have_old ? 37u : 0u,
                                .from_ifindex=1,.to_ifindex=2,.action=9};
     attribute.data=&parms; existing=have_old; slot=have_old ? 3 : 0;
@@ -379,7 +380,7 @@ static void setup(bool have_old, int conflict, bool borrowed) {
     if (conflict) {
         local_info=&info; info.is_mapped=conflict!=3;
         info.ifb_dev=conflict==1 ? &old_to : &to;
-        info.map_dev=conflict==2 ? &old_to : &from;
+        info.map_dev=conflict==2 ? &old_to : conflict==3 ? &old_from : &from;
         INIT_LIST_HEAD(&info.map_list);
     }
     registered=allocated=borrowed; from_known=true;
@@ -502,7 +503,7 @@ static void run_case(const char *name, enum mode mode, bool have_old, bool bind,
                 check(!host_allocs && !host_frees && !host_live && !map_publishes);
             }
             if (mode==REUSE_IGS_FAIL || mode==REUSE_NH_FAIL) {
-                check(local_info==&info && !info.is_mapped && info.ifb_dev==&to && info.map_dev==&from);
+                check(local_info==&info && !info.is_mapped && info.ifb_dev==&to && info.map_dev==&old_from);
             }
         } else if (have_old && bind) {
             check(a==&old.common && old.common.refs==3 && old.common.binds==2);
@@ -683,6 +684,12 @@ def variants(candidate, baseline, mutations):
             ('omit-binding-publication', changed(init, bind_call,
                 '\t(void)nss_ifb_bind; (void)prepared_binding;'),
              release, helpers, False, 'normal_new_bind'),
+            ('omit-borrowed-map-update', init, release,
+             changed(helpers, '\t\tspin_lock_bh(&nss_ifb_list_lock);\n'
+                     '\t\tifb_info->map_dev = from_dev;',
+                     '\t\tspin_lock_bh(&nss_ifb_list_lock);\n'
+                     '\t\t(void)from_dev;'),
+             False, 'normal_reuse_entry'),
         ])
     return expanded
 
