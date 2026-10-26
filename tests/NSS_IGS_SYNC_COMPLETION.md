@@ -110,6 +110,19 @@ This cannot prove kernel concurrency, IRQ exclusion, publication ordering or a
 Linux spinlock/completion implementation. `HZ=100` is a
 host-model constant; no 600-second wait occurs.
 
+The model does not observe the sender's individual C assignments while retiring.
+A separate lexical source gate therefore requires the reviewed `sync_done`
+sequence: one irqsave lock, pending=false, response snapshot, matching unlock.
+It uses the shared comment/string mask and whitespace normalization, not an
+arbitrary C control-flow parser. Any redesign requires a reviewed gate update.
+It checks the actual source and a comment/whitespace-only positive; with
+`--mutations` it rejects three static negatives: both assignments before lock,
+pending retirement before lock, and a bad sequence with a correct-looking comment
+decoy. Those fragments are saved as data, not compiled or run. They are **three
+static controls separate from the 18 compiled runtime controls**, not extra
+runtime variants, schedules or kernel concurrency qualification. Runtime mutated
+variants remain deliberately generated separately from the actual-source gate.
+
 `nss_igs_error` forwards evaluated arguments to a no-output variadic model.
 Compilation uses `-std=gnu11 -O0 -g -Wall -Wextra -Werror
 -Wno-unused-parameter`. The sole warning-category exception is explicit because

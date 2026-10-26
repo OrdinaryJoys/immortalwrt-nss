@@ -714,6 +714,52 @@ def mutate(fragments, name, edits, extract):
     return changed, records
 
 
+def locked_retirement(body, extract):
+    """Fail closed on the reviewed literal C sequence, not arbitrary control flow."""
+    code = re.sub(r'\s+', '', extract.code_mask(body))
+    sequence = ('sync_done:spin_lock_irqsave(&msg_response.lock,flags);'
+                'msg_response.pending=false;response=msg_response.response;'
+                'spin_unlock_irqrestore(&msg_response.lock,flags);')
+    return (code.count(sequence) == 1 and code.count('sync_done:') == 1 and
+            code.count('msg_response.pending=false;') == 1 and
+            code.count('response=msg_response.response;') == 1)
+
+
+def retirement_source_gate(fragments, output, extract, negatives):
+    sync = FUNCTIONS[2]
+    original = fragments[sync]
+    comment_only = original.replace('sync_done:', 'sync_done: /* placement gate spacing */\n', 1)
+    cases = [('actual', original, True), ('comment-whitespace', comment_only, True)]
+    if negatives:
+        lock = '\tspin_lock_irqsave(&msg_response.lock, flags);\n'
+        assignments = '\tmsg_response.pending = false;\n\tresponse = msg_response.response;\n'
+        unlock = '\tspin_unlock_irqrestore(&msg_response.lock, flags);\n'
+        before = lock + assignments + unlock
+        replacements = [
+            ('both-before-lock', assignments + lock + unlock),
+            ('retire-before-lock', '\tmsg_response.pending = false;\n' + lock +
+             '\tresponse = msg_response.response;\n' + unlock),
+        ]
+        for name, after in replacements:
+            modified, _ = mutate(fragments, name, [(sync, before, after)], extract)
+            cases.append((name, modified[sync], False))
+        # A correct-looking sequence hidden in a comment must not satisfy the gate.
+        decoy = cases[-2][1] + '\n/* sync_done:\n' + before + '*/\n'
+        cases.append(('comment-decoy', decoy, False))
+    records = []
+    for name, body, expected in cases:
+        observed = locked_retirement(body, extract)
+        (output / ('retirement-' + name + '.c.txt')).write_text(body, encoding='utf-8')
+        records.append(dict(name=name, expected=expected, observed=observed,
+                            sha256=digest(body.encode()), accepted=observed == expected))
+    result = dict(scope='Lexical exact-sequence placement only; no C compilation or concurrency proof',
+                  records=records, accepted=all(row['accepted'] for row in records))
+    write_json(output / 'retirement-source-gate.json', result)
+    if not result['accepted']:
+        raise ValueError('sender retirement source placement gate failed')
+    return result
+
+
 def mutations():
     sync, wake, init = FUNCTIONS[2], FUNCTIONS[1], FUNCTIONS[0]
     reset = '\treinit_completion(&msg_response.done);\n'
@@ -936,6 +982,7 @@ def main():
         extract = load_extractor()
         _, fragments = extract_input(args.clients, output / 'candidate-original', extract,
                                      True, prepared_inputs)
+        result['retirement_source_gate'] = retirement_source_gate(fragments, output, extract, args.mutations)
         normal = execute_variant(output, 'candidate', fragments, True, args)
         result['variants'].append(normal)
         if args.baseline:
