@@ -1,0 +1,32 @@
+nss-clients: initialize private IFB synchronization before publication
+
+Registration can expose callbacks before the module init function returns.
+Construct the IFB semaphore, reply lock and completion before registering
+the netdevice notifier or action. Keep registration/unwind/owner/exit order.
+
+This does not establish owner publication, late callback drain or complete
+module lifetime, firmware cancellation or request correlation.
+
+--- a/nss_qdisc/igs/nss_mirred.c
++++ b/nss_qdisc/igs/nss_mirred.c
+@@ -745,7 +745,11 @@
+  */
+ static int __init nss_mirred_init_module(void)
+ {
+-	int err = register_netdevice_notifier(&nss_mirred_device_notifier);
++	int err;
++
++	/* Initialize private synchronization before publishing any entry point. */
++	nss_ifb_init();
++	err = register_netdevice_notifier(&nss_mirred_device_notifier);
+ 	if (err) {
+ 		return err;
+ 	}
+@@ -777,7 +781,6 @@
+ 	 */
+ 	nss_igs_module_save(&nss_mirred_act_ops, THIS_MODULE);
+ 
+-	nss_ifb_init();
+ 	return 0;
+ }
+ 
