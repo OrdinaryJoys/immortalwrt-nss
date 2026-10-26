@@ -106,8 +106,15 @@ def load(root, output, label):
     prepared.extracted.append(dict(source='nss_qdisc/igs/nss_ifb.h',
                                    enum='nss_ifb_if_config',
                                    bytes=len(config_enum.encode()), sha256=digest(config_enum)))
-    helpers = ''.join(prepared.function(IFB, name) for name in
-                      ('nss_ifb_bind', 'nss_ifb_delete_if', 'nss_ifb_create_if'))
+    if label == 'baseline':
+        if ('tcf_idr_release(*tc_act, bind);' not in raw['nss_mirred_init'] or
+                'prepared_binding' in raw['nss_mirred_init']):
+            raise ValueError('baseline must contain action admission but predate binding preflight')
+        helper_names = ('nss_ifb_bind', 'nss_ifb_delete_if', 'nss_ifb_create_if')
+    else:
+        helper_names = ('nss_ifb_prepare_bind', 'nss_ifb_abort_bind', 'nss_ifb_bind',
+                        'nss_ifb_delete_if', 'nss_ifb_create_if')
+    helpers = ''.join(prepared.function(IFB, name) for name in helper_names)
     return dict(prepared=prepared, raw=raw, code=code, types=types, helpers=helpers,
                 records=records)
 
@@ -178,6 +185,8 @@ static unsigned checks, failures, total_failures;
 static unsigned idr_checks, creates, cleanups, releases, callbacks, mutations;
 static unsigned allocs, registers, deletes, deallocs, holds, dev_puts, null_lookups;
 static unsigned set_igs, set_nh, resets, clears, adds;
+static unsigned host_allocs, host_frees, map_publishes;
+static bool host_live;
 /* FW values: 0 absent, 1 reported ACK, 2 unknown failed configuration effect. */
 static int fw_igs, fw_nh;
 static const char *case_name;
@@ -216,6 +225,7 @@ static struct nss_mirred_tcf *nss_mirred_get(struct tc_action *a) {
 static void admission(void) {
     ++mutations;
     check(active && active->alive && active->refs > 0 && slot >= 2);
+    check(host_live || local_info);
     if (active == &fresh.common) {
         check(valid_list(&fresh.tcfm_list)); check(fresh.tcfm_dev == NULL);
         check(fresh.tcfm_list.next==&fresh.tcfm_list && fresh.tcfm_list.prev==&fresh.tcfm_list);
@@ -281,12 +291,23 @@ static int32_t nss_ifb_config_msg_tx_sync(struct net_device *dev, int32_t number
     *fw=config_fail==config ? 2 : 1; return config_fail==config ? -1 : 0;
 }
 static void *model_kmalloc(size_t size, int flags) {
-    check(size==sizeof(info) && flags==GFP_KERNEL); admission(); event("bind");
-    return bind_fail ? NULL : &info;
+    check(size==sizeof(info) && flags==GFP_KERNEL);
+    check(active && active->alive && !host_live && !local_info);
+    ++host_allocs; event("reserve");
+    if (bind_fail) return NULL;
+    host_live=true; return &info;
 }
 #define kmalloc model_kmalloc
+static void model_kfree(void *pointer) {
+    ++host_frees; event("cancel");
+    check(pointer==&info && host_live && local_info!=pointer);
+    host_live=false;
+}
+#define kfree model_kfree
 static void nss_ifb_list_add(struct nss_ifb_info *i) {
-    admission(); local_info=i; event("map_publish");
+    admission(); check(host_live && i==&info && local_info==NULL);
+    check(valid_list(&i->map_list) && i->is_mapped && i->ifb_dev==&to && i->map_dev==&from);
+    ++map_publishes; local_info=i; event("map_publish");
 }
 static bool nss_ifb_reset_nexthop(struct nss_ifb_info *i) {
     check(in_release); ++resets; event("reset"); i->is_mapped=false; return reset_ok;
@@ -359,6 +380,7 @@ static void setup(bool have_old, int conflict, bool borrowed) {
         local_info=&info; info.is_mapped=conflict!=3;
         info.ifb_dev=conflict==1 ? &old_to : &to;
         info.map_dev=conflict==2 ? &old_to : &from;
+        INIT_LIST_HEAD(&info.map_list);
     }
     registered=allocated=borrowed; from_known=true;
     alloc_fail=register_fail=bind_fail=check_fail=create_fail=missing_parms=in_release=false;
@@ -366,6 +388,7 @@ static void setup(bool have_old, int conflict, bool borrowed) {
     checks=failures=0; idr_checks=creates=cleanups=releases=callbacks=mutations=0;
     allocs=registers=deletes=deallocs=holds=dev_puts=null_lookups=0;
     set_igs=set_nh=resets=clears=adds=0; fw_igs=fw_nh=0;
+    host_allocs=host_frees=map_publishes=0; host_live=false;
     trace_used=0; trace[0]=0;
 }
 static void report(int rc) {
@@ -376,7 +399,8 @@ static void report(int rc) {
            "\"delete_calls\":%u,\"idr_check_calls\":%u,\"create_calls\":%u,"
            "\"alloc_calls\":%u,\"register_calls\":%u,\"dealloc_calls\":%u,"
            "\"dev_holds\":%u,\"dev_puts\":%u,\"null_lookups\":%u,"
-           "\"list_initialized\":%s,\"device_target\":%u,\"trace\":\"%s\"}\n",
+           "\"list_initialized\":%s,\"device_target\":%u,\"host_allocs\":%u,"
+           "\"host_frees\":%u,\"host_live\":%s,\"map_publishes\":%u,\"trace\":\"%s\"}\n",
            case_name,rc,checks,failures,slot,module_refs,
            existing ? old.common.refs : fresh.common.refs,
            existing ? old.common.binds : fresh.common.binds,
@@ -385,7 +409,8 @@ static void report(int rc) {
            holds,dev_puts,null_lookups,
            valid_list(existing ? &old.tcfm_list : &fresh.tcfm_list) ? "true" : "false",
            (existing ? old.tcfm_dev : fresh.tcfm_dev) ?
-               (existing ? old.tcfm_dev : fresh.tcfm_dev)->ifindex : 0u,trace);
+               (existing ? old.tcfm_dev : fresh.tcfm_dev)->ifindex : 0u,
+           host_allocs,host_frees,host_live ? "true" : "false",map_publishes,trace);
 }
 static void old_preserved(void) {
     check(old.common.alive && old.common.refs==2 && old.common.binds==1);
@@ -398,10 +423,12 @@ static void old_preserved(void) {
 /* Each listed mode selects an actual init error branch or success contrast. */
 enum mode { NORMAL, NO_NLA, PARSE, NO_PARMS, ZERO_FROM, ZERO_TO, MISSING_FROM,
     UNKNOWN_FROM, FROM_IFB, MISSING_TO, TO_NOT_IFB, IDR_RACE, IDR_NOMEM,
-    FROM_CONFLICT, TO_CONFLICT, ALLOC, REGISTER, IGS, NH, BIND, REUSE };
+    FROM_CONFLICT, TO_CONFLICT, ALLOC, REGISTER, IGS, NH, BIND, REUSE,
+    REUSE_ALLOC_FAIL, REUSE_IGS_FAIL, REUSE_NH_FAIL };
 static void run_case(const char *name, enum mode mode, bool have_old, bool bind, bool borrowed) {
     case_name=name;
-    int conflict=mode==FROM_CONFLICT ? 1 : mode==TO_CONFLICT ? 2 : mode==REUSE ? 3 : 0;
+    int conflict=mode==FROM_CONFLICT ? 1 : mode==TO_CONFLICT ? 2 :
+        (mode==REUSE || mode==REUSE_ALLOC_FAIL || mode==REUSE_IGS_FAIL || mode==REUSE_NH_FAIL) ? 3 : 0;
     setup(have_old,conflict,borrowed);
     switch (mode) {
     case PARSE: parse_error=-ERANGE; break;
@@ -417,14 +444,15 @@ static void run_case(const char *name, enum mode mode, bool have_old, bool bind,
     case IDR_NOMEM: create_fail=true; break;
     case ALLOC: alloc_fail=true; break;
     case REGISTER: register_fail=true; break;
-    case IGS: config_fail=NSS_IFB_SET_IGS_NODE; break;
-    case NH: config_fail=NSS_IFB_SET_NEXTHOP; break;
-    case BIND: bind_fail=true; break;
+    case IGS: case REUSE_IGS_FAIL: config_fail=NSS_IFB_SET_IGS_NODE; break;
+    case NH: case REUSE_NH_FAIL: config_fail=NSS_IFB_SET_NEXTHOP; break;
+    case BIND: case REUSE_ALLOC_FAIL: bind_fail=true; break;
     default: break;
     }
     int expected=ACT_P_CREATED;
     if (mode==NO_NLA || mode==NO_PARMS || mode==ZERO_FROM || mode==ZERO_TO ||
-        mode==ALLOC || mode==REGISTER || mode==IGS || mode==NH) expected=-EINVAL;
+        mode==ALLOC || mode==REGISTER || mode==IGS || mode==NH ||
+        mode==REUSE_IGS_FAIL || mode==REUSE_NH_FAIL) expected=-EINVAL;
     if (mode==PARSE) expected=-ERANGE;
     if (mode>=MISSING_FROM && mode<=TO_NOT_IFB) expected=-ENODEV;
     if (mode==IDR_RACE) expected=-EAGAIN;
@@ -460,13 +488,26 @@ static void run_case(const char *name, enum mode mode, bool have_old, bool bind,
             if (mode==ALLOC) check(!registered && !allocated && allocs==attempt+1 && !registers);
             if (mode==REGISTER) check(!registered && !allocated && registers==attempt+1 && deallocs==attempt+1);
             /* OPEN S01: retain unknown effects, never invent rollback. */
-            if (mode==IGS) check(registered && fw_igs==2 && fw_nh==0 && !deletes && !deallocs);
-            if (mode==NH) check(registered && fw_igs==1 && fw_nh==2 && !deletes && !deallocs);
-            /* OPEN S03: existing code still deletes even borrowed registration. */
-            if (mode==BIND) check(!registered && deletes==attempt+1 && fw_igs==1 && fw_nh==1);
+            if (mode==IGS || mode==REUSE_IGS_FAIL) check(registered && fw_igs==2 && fw_nh==0 && !deletes && !deallocs);
+            if (mode==NH || mode==REUSE_NH_FAIL) check(registered && fw_igs==1 && fw_nh==2 && !deletes && !deallocs);
+            /* No firmware side effect may precede fallible host reservation. */
+            if (mode==BIND) {
+                check(registered==borrowed && allocated==borrowed && !allocs && !registers);
+                check(!set_igs && !set_nh && !deletes && !deallocs && !fw_igs && !fw_nh);
+                check(host_allocs==attempt+1 && !host_frees && !host_live && !map_publishes);
+            } else if (mode==ALLOC || mode==REGISTER || mode==IGS || mode==NH) {
+                check(host_allocs==attempt+1 && host_frees==attempt+1 && !host_live && !map_publishes);
+                check(local_info==NULL);
+            } else {
+                check(!host_allocs && !host_frees && !host_live && !map_publishes);
+            }
+            if (mode==REUSE_IGS_FAIL || mode==REUSE_NH_FAIL) {
+                check(local_info==&info && !info.is_mapped && info.ifb_dev==&to && info.map_dev==&from);
+            }
         } else if (have_old && bind) {
             check(a==&old.common && old.common.refs==3 && old.common.binds==2);
             check(!mutations && !creates && !cleanups && !releases && !callbacks && !holds && !adds);
+            check(!host_allocs && !host_frees && !host_live && !map_publishes);
             check(old.tcfm_dev==&old_to && old.common.tcfa_action==4 && sentinel.is_mapped);
             /* The caller owns the added reference; init must not release it. */
             tcf_idr_release(a,bind); old_preserved(); check(!callbacks);
@@ -477,7 +518,8 @@ static void run_case(const char *name, enum mode mode, bool have_old, bool bind,
             check(!cleanups && !releases && !callbacks && holds==1 && to.refs==1);
             check(act->tcfm_dev==&to && act->tcfm_from_ifindex==1 && act->tcfm_to_ifindex==2);
             check(act->common.tcfa_action==9 && local_info && local_info->is_mapped);
-            check(local_info->ifb_dev==&to && local_info->map_dev==&from && registered);
+            if (local_info) check(local_info->ifb_dev==&to && local_info->map_dev==&from && registered);
+            else check(false);
             check(set_igs==1 && set_nh==1 && fw_igs==1 && fw_nh==1);
             check(adds==(have_old ? 0u : 1u) && module_refs==1);
             /* Compare successful observable behavior with baseline, not IDR position. */
@@ -487,9 +529,12 @@ static void run_case(const char *name, enum mode mode, bool have_old, bool bind,
             const char *igs=strstr(trace,"set_igs"), *nh=strstr(trace,"set_nh");
             const char *hold=strstr(trace,"dev_hold");
             check(igs && nh && hold && igs<nh && nh<hold);
-            if (mode!=REUSE) {
-                const char *binding=strstr(trace,"bind");
-                check(binding && nh<binding && binding<hold);
+            if (mode!=REUSE && mode!=REUSE_ALLOC_FAIL) {
+                const char *reserved=strstr(trace,"reserve"), *published=strstr(trace,"map_publish");
+                check(reserved && igs && reserved<igs && published && nh<published && published<hold);
+                check(host_allocs==1 && !host_frees && host_live && map_publishes==1);
+            } else {
+                check(!host_allocs && !host_frees && !host_live && !map_publishes);
             }
             if (!borrowed) {
                 const char *create=strstr(trace,",create,"), *reg=strstr(trace,"register");
@@ -525,10 +570,15 @@ static void release_case(const char *name, bool linked, bool device, bool mapped
     report(0);
 }
 int main(void) {
+    /* Older source never frees preflight storage; keep its stub type-checked. */
+    (void)model_kfree;
     run_case("normal_new_bind",NORMAL,false,true,false);
     run_case("normal_new_nonbind",NORMAL,false,false,false);
     run_case("normal_borrowed",NORMAL,false,true,true);
     run_case("normal_reuse_entry",REUSE,false,true,true);
+    run_case("normal_reuse_allocation_disabled",REUSE_ALLOC_FAIL,false,true,true);
+    run_case("reuse_borrowed_set_igs_failure",REUSE_IGS_FAIL,false,true,true);
+    run_case("reuse_existing_nonbind_set_nh_failure",REUSE_NH_FAIL,true,false,true);
     run_case("normal_existing_nonbind",NORMAL,true,false,true);
     const char *names[]={"no_nla","parse_error","missing_parms","zero_from","zero_to",
         "missing_from","unknown_from","from_ifb","missing_to","to_not_ifb"};
@@ -551,6 +601,7 @@ int main(void) {
     run_case("borrowed_set_nh_failure",NH,false,true,true);
     run_case("existing_nonbind_borrowed_binding_replay",BIND,true,false,true);
     run_case("existing_bind",NORMAL,true,true,false);
+    run_case("existing_bind_allocation_disabled",BIND,true,true,true);
     run_case("existing_bind_from_conflict",FROM_CONFLICT,true,true,true);
     run_case("existing_bind_to_conflict",TO_CONFLICT,true,true,true);
     release_case("release_empty_null",false,false,false,false);
@@ -577,7 +628,7 @@ def variants(candidate, baseline, mutations):
     rows = [('candidate', init, release, True, None)]
     if baseline:
         rows.append(('baseline', baseline['code']['nss_mirred_init'],
-                     baseline['code']['nss_mirred_release'], False, 'idr_check_race'))
+                     baseline['code']['nss_mirred_release'], False, 'borrowed_binding_failure'))
     if mutations:
         rows.extend([
             ('omit-return-reference', changed(init, 'tcf_idr_release(*tc_act, bind);',
@@ -602,7 +653,38 @@ def variants(candidate, baseline, mutations):
                                            'tcf_idr_release(*tc_act, !bind);'),
              release, False, 'new_from_conflict_bind'),
         ])
-    return rows
+    expanded = [(label, init_code, release_code,
+                 (baseline if label == 'baseline' else candidate)['helpers'], expected, sensitive)
+                for label, init_code, release_code, expected, sensitive in rows]
+    if mutations:
+        helpers = candidate['helpers']
+        reserve = ('\t/* Reserve all fallible local binding storage before any NSS side effect. */\n'
+                   '\tprepared_binding = nss_ifb_prepare_bind(ifb_info, &new_binding);\n'
+                   '\tif (!prepared_binding) {\n\t\tret = -ENOMEM;\n\t\tgoto init_failed;\n\t}\n\n')
+        bind_call = '\tnss_ifb_bind(prepared_binding, from_dev, to_dev, new_binding);'
+        late = changed(changed(init, reserve, ''), bind_call, reserve + bind_call)
+        expanded.extend([
+            ('late-host-reservation', late, release, helpers, False, 'new_binding_failure_bind'),
+            ('omit-private-abort', changed(init,
+                'nss_ifb_abort_bind(prepared_binding, new_binding);',
+                '(void)nss_ifb_abort_bind; (void)prepared_binding;'),
+             release, helpers, False, 'new_set_igs_failure_bind'),
+            ('abort-borrowed-storage', init, release,
+             changed(helpers, 'if (new_entry) {\n\t\tkfree(ifb_info);',
+                     'if (new_entry || ifb_info) {\n\t\tkfree(ifb_info);'),
+             False, 'reuse_borrowed_set_igs_failure'),
+            ('lose-private-ownership', init, release,
+             changed(helpers, '*new_entry = true;', '*new_entry = false;'),
+             False, 'new_set_igs_failure_bind'),
+            ('claim-borrowed-storage', init, release,
+             changed(helpers, 'if (ifb_info) {\n\t\treturn ifb_info;',
+                     'if (ifb_info) {\n\t\t*new_entry = true;\n\t\treturn ifb_info;'),
+             False, 'reuse_borrowed_set_igs_failure'),
+            ('omit-binding-publication', changed(init, bind_call,
+                '\t(void)nss_ifb_bind; (void)prepared_binding;'),
+             release, helpers, False, 'normal_new_bind'),
+        ])
+    return expanded
 
 
 def main():
@@ -622,17 +704,17 @@ def main():
     rows = variants(candidate, baseline, args.mutations)
     records = []
     result_path = args.output / 'RESULT.json'
-    metadata = dict(status='INCOMPLETE', records=records, expected_cases_per_variant=50,
+    metadata = dict(status='INCOMPLETE', records=records, expected_cases_per_variant=54,
                     script_sha256=digest(Path(__file__).read_text()),
                     extractor_sha256=digest((HERE / 'nss-dp-containment/extract_prepared_c.py').read_text()),
                     host_adaptations=dict(prefix=PREFIX, model=MODEL,
                                           compiler_flags=['-std=gnu11', '-O1', '-g', '-Wall', '-Wextra', '-Werror'],
                                           versions=['5.4.0', '6.18.38']),
                     open_findings=['S01 failed configuration FW effect UNKNOWN; registration may remain',
-                                   'S03 bind failure still deletes borrowed registration',
+                                   'S03 host-allocation trigger removed; full registration ownership OPEN',
                                    'complete SQM transaction OPEN; no automatic unknown FW cleanup'],
-                    scope='Complete actual modern init/release and IFB create/delete/bind; '
-                          'host IDR/ref/bind/module/list/dev/FW substitutes. No real kernel, ABI, '
+                    scope='Complete actual modern init/release and IFB prepare/abort/bind/create/delete; '
+                          'host IDR/ref/bind/module/list/dev/FW and private-allocation substitutes. No real kernel, ABI, '
                           'concurrency, target build, firmware or successful replace expansion.')
 
     def save():
@@ -644,11 +726,11 @@ def main():
     try:
         for version in ((5, 4, 0), (6, 18, 38)):
             normal = None
-            for label, init, release, expected, sensitive_case in rows:
+            for label, init, release, helpers, expected, sensitive_case in rows:
                 source = baseline if label == 'baseline' else candidate
                 stem = label + '-' + '.'.join(map(str, version))
                 path = args.output / (stem + '.c')
-                program = PREFIX + source['types'] + MODEL + source['helpers'] + release + init + MAIN
+                program = PREFIX + source['types'] + MODEL + helpers + release + init + MAIN
                 path.write_text(program)
                 command = shlex.split(args.cc) + metadata['host_adaptations']['compiler_flags'] + [
                     '-DLINUX_VERSION_CODE=' + str((version[0] << 16) | (version[1] << 8) | version[2]),
@@ -690,7 +772,7 @@ def main():
                 if label == 'baseline':
                     if summary['normal_signature'] != normal:
                         raise ValueError('old successful nonbind/new behavior changed')
-                    for required in ('idr_create_failure', 'existing_bind'):
+                    for required in ('new_binding_failure_bind', 'normal_new_bind'):
                         if not any(row['case'] == required and row['failures'] for row in cases):
                             raise ValueError('baseline insensitive to ' + required)
                 save()

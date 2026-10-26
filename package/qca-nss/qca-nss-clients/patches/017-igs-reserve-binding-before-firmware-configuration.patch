@@ -1,0 +1,155 @@
+nss-clients: reserve IGS host binding storage before configuring firmware
+
+Separate private host allocation from publication. Allocation failure must
+not reach NSS or delete an interface registration borrowed by this attempt.
+On later errors only cancel private unpublished storage. Binding publication
+after the acknowledged steps cannot fail due to a new host allocation.
+
+This does not establish firmware rollback, request generations, complete
+registration ownership or nonbind replacement semantics.
+
+--- a/nss_qdisc/igs/nss_ifb.c
++++ b/nss_qdisc/igs/nss_ifb.c
+@@ -489,22 +489,49 @@
+ }
+ 
+ /*
++ * nss_ifb_prepare_bind()
++ *	Reserve private mapping storage before configuring NSS.
++ */
++struct nss_ifb_info *nss_ifb_prepare_bind(struct nss_ifb_info *ifb_info, bool *new_entry)
++{
++	*new_entry = false;
++	if (ifb_info) {
++		return ifb_info;
++	}
++
++	ifb_info = kmalloc(sizeof(*ifb_info), GFP_KERNEL);
++	if (!ifb_info) {
++		nss_igs_error("kmalloc failed\n");
++		return NULL;
++	}
++
++	ifb_info->ifb_dev = NULL;
++	ifb_info->map_dev = NULL;
++	ifb_info->is_mapped = false;
++	INIT_LIST_HEAD(&ifb_info->map_list);
++	*new_entry = true;
++	return ifb_info;
++}
++
++/*
++ * nss_ifb_abort_bind()
++ *	Only free unpublished storage allocated by this attempt, not a NSS node.
++ */
++void nss_ifb_abort_bind(struct nss_ifb_info *ifb_info, bool new_entry)
++{
++	if (new_entry) {
++		kfree(ifb_info);
++	}
++}
++
++/*
+  * nss_ifb_bind()
+- *	API to bind an IFB device with its requested mapped interface.
+- */
+-int32_t nss_ifb_bind(struct nss_ifb_info *ifb_info, struct net_device *from_dev,
+-		struct net_device *to_dev)
+-{
+-	if (!ifb_info) {
+-		/*
+-		 * IFB not present in local LL.
+-		 * Add the entry in LL.
+-		 */
+-		ifb_info = kmalloc(sizeof(*ifb_info), GFP_KERNEL);
+-		if (!ifb_info) {
+-			nss_igs_error("kmalloc failed\n");
+-			return -ENOMEM;
+-		}
++ *	Publish a prepared binding; no fallible allocation remains after NSS config.
++ */
++void nss_ifb_bind(struct nss_ifb_info *ifb_info, struct net_device *from_dev,
++		struct net_device *to_dev, bool new_entry)
++{
++	if (new_entry) {
+ 		ifb_info->ifb_dev = to_dev;
+ 		ifb_info->map_dev = from_dev;
+ 		ifb_info->is_mapped = true;
+@@ -519,7 +546,6 @@
+ 		ifb_info->is_mapped = true;
+ 		spin_unlock_bh(&nss_ifb_list_lock);
+ 	}
+-	return 0;
+ }
+ 
+ /*
+--- a/nss_qdisc/igs/nss_ifb.h
++++ b/nss_qdisc/igs/nss_ifb.h
+@@ -119,11 +119,15 @@
+ extern struct nss_ifb_info *nss_ifb_find_dev(struct net_device *dev);
+ 
+ /*
+- * nss_ifb_bind()
+- *	API to bind an IFB device with its requested mapped interface.
++ * Reserve private mapping storage before firmware configuration. Existing
++ * list entries are borrowed and must not be freed by abort_bind().
+  */
+-extern int32_t nss_ifb_bind(struct nss_ifb_info *ifb_info, struct net_device *from_dev,
+-		struct net_device *to_dev);
++extern struct nss_ifb_info *nss_ifb_prepare_bind(struct nss_ifb_info *ifb_info, bool *new_entry);
++extern void nss_ifb_abort_bind(struct nss_ifb_info *ifb_info, bool new_entry);
++
++/* Publish prepared storage only after the required NSS configuration succeeds. */
++extern void nss_ifb_bind(struct nss_ifb_info *ifb_info, struct net_device *from_dev,
++		struct net_device *to_dev, bool new_entry);
+ 
+ /*
+  * nss_ifb_delete_if()
+--- a/nss_qdisc/igs/nss_mirred.c
++++ b/nss_qdisc/igs/nss_mirred.c
+@@ -116,6 +116,8 @@
+ 	struct nss_mirred_tcf *act;
+ 	struct net_device *to_dev, *from_dev;
+ 	struct nss_ifb_info *ifb_info;
++	struct nss_ifb_info *prepared_binding = NULL;
++	bool new_binding = false;
+ 	int32_t ret, ifb_num;
+ 
+ 	if (!nla) {
+@@ -216,6 +218,13 @@
+ 			ret = -EEXIST;
+ 			goto init_failed;
+ 		}
++	}
++
++	/* Reserve all fallible local binding storage before any NSS side effect. */
++	prepared_binding = nss_ifb_prepare_bind(ifb_info, &new_binding);
++	if (!prepared_binding) {
++		ret = -ENOMEM;
++		goto init_failed;
+ 	}
+ 
+ 	ifb_num = nss_cmn_get_interface_number_by_dev_and_type(to_dev, NSS_DYNAMIC_INTERFACE_TYPE_IGS);
+@@ -252,12 +261,7 @@
+ 	/*
+ 	 * Bind an IFB device with its requested mapped interface.
+ 	 */
+-	ret = nss_ifb_bind(ifb_info, from_dev, to_dev);
+-	if (ret < 0) {
+-		nss_igs_error(" Binding an IFB device failed\n");
+-		nss_ifb_delete_if(ifb_num);
+-		goto init_failed;
+-	}
++	nss_ifb_bind(prepared_binding, from_dev, to_dev, new_binding);
+ 
+ 	/*
+ 	 * Return error if nss mirred action index is present in the hash.
+@@ -302,6 +306,8 @@
+ 	return ACT_P_CREATED;
+ 
+ init_failed:
++	/* This only cancels private host storage; unknown FW state is not freed. */
++	nss_ifb_abort_bind(prepared_binding, new_binding);
+ #if (LINUX_VERSION_CODE >= KERNEL_VERSION(5, 4, 0))
+ 	/* Release only the action reference acquired above, not unknown FW state. */
+ 	tcf_idr_release(*tc_act, bind);
