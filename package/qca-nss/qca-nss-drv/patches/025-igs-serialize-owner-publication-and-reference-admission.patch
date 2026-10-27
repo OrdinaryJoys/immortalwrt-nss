@@ -1,0 +1,70 @@
+nss-drv: serialize IGS owner publication and reference admission
+
+An unpublished owner is not a built-in owner: try_module_get(NULL) succeeds.
+Reject absent owners explicitly and serialize save/get/put with the same
+short irqsave lock. Preserve the existing client publication and cleanup
+order and successful reference pairing. No firmware or dataplane change.
+
+This does not provide a per-request callback pin, transport drain, forced
+unload safety or owner replacement while references are outstanding.
+
+--- a/nss_igs.c
++++ b/nss_igs.c
+@@ -24,6 +24,7 @@
+ #endif
+ 
+ static struct module *nss_igs_module;
++static DEFINE_SPINLOCK(nss_igs_module_lock);
+ 
+ /*
+  * nss_igs_verify_if_num()
+@@ -176,8 +177,12 @@
+  */
+ void nss_igs_module_save(struct tc_action_ops *act, struct module *module)
+ {
++	unsigned long flags;
++
+ 	nss_assert(act);
++	spin_lock_irqsave(&nss_igs_module_lock, flags);
+ 	nss_igs_module = module;
++	spin_unlock_irqrestore(&nss_igs_module_lock, flags);
+ }
+ EXPORT_SYMBOL(nss_igs_module_save);
+ #endif
+@@ -188,8 +193,16 @@
+  */
+ bool nss_igs_module_get(void)
+ {
+-	nss_assert(nss_igs_module);
+-	return try_module_get(nss_igs_module);
++	unsigned long flags;
++	bool acquired = false;
++
++	/* NULL means no published owner, not a built-in module reference. */
++	spin_lock_irqsave(&nss_igs_module_lock, flags);
++	if (nss_igs_module) {
++		acquired = try_module_get(nss_igs_module);
++	}
++	spin_unlock_irqrestore(&nss_igs_module_lock, flags);
++	return acquired;
+ }
+ EXPORT_SYMBOL(nss_igs_module_get);
+ 
+@@ -199,7 +212,16 @@
+  */
+ void nss_igs_module_put(void)
+ {
+-	nss_assert(nss_igs_module);
++	unsigned long flags;
++
++	/* A caller must pair this with a successful get before owner removal. */
++	spin_lock_irqsave(&nss_igs_module_lock, flags);
++	if (!nss_igs_module) {
++		spin_unlock_irqrestore(&nss_igs_module_lock, flags);
++		pr_warn_once("IGS module owner unavailable for put\n");
++		return;
++	}
+ 	module_put(nss_igs_module);
++	spin_unlock_irqrestore(&nss_igs_module_lock, flags);
+ }
+ EXPORT_SYMBOL(nss_igs_module_put);
