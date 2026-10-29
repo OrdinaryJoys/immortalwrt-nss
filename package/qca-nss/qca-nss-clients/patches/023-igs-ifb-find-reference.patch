@@ -1,0 +1,151 @@
+nss-clients: return referenced IFB bindings from find paths
+
+nss_ifb_find_dev/map_dev() returned a raw list pointer. The list owns one
+reference and async CLEAR owns another; callers that use the binding after
+unlock depended on RTNL serialization for lifetime.
+
+Take a binding reference under the list lock and make every find caller
+release it. This covers action release, init validation/error paths,
+unregister, down and up. It makes the find/use lifetime explicit while
+keeping the existing mapping selection and publication order.
+
+This does not add S05 idempotency, firmware replace, or request identity.
+
+--- a/nss_qdisc/igs/nss_ifb.h
++++ b/nss_qdisc/igs/nss_ifb.h
+@@ -55,6 +55,7 @@
+  *	API to delete member in ifb list.
+  */
+ extern void nss_ifb_list_del(struct nss_ifb_info *ifb_info);
++extern void nss_ifb_info_put(struct nss_ifb_info *ifb_info);
+ 
+ /*
+  * nss_ifb_is_mapped()
+@@ -108,13 +109,13 @@
+ 
+ /*
+  * nss_ifb_find_map_dev()
+- *	Find and return the IFB mapped netdev in the ifb list.
++ *	Find the IFB mapped netdev and return a referenced binding.
+  */
+ extern struct nss_ifb_info *nss_ifb_find_map_dev(struct net_device *dev);
+ 
+ /*
+  * nss_ifb_find_dev()
+- *	Find and return the IFB netdev in the ifb list.
++ *	Find the IFB netdev and return a referenced binding.
+  */
+ extern struct nss_ifb_info *nss_ifb_find_dev(struct net_device *dev);
+ 
+--- a/nss_qdisc/igs/nss_ifb.c
++++ b/nss_qdisc/igs/nss_ifb.c
+@@ -495,6 +495,7 @@
+ 	spin_lock_bh(&nss_ifb_list_lock);
+ 	list_for_each_entry(ifb_info, &nss_ifb_list, map_list) {
+ 		if (ifb_info->map_dev == dev) {
++			nss_ifb_info_get(ifb_info);
+ 			spin_unlock_bh(&nss_ifb_list_lock);
+ 			return ifb_info;
+ 		}
+@@ -514,6 +515,7 @@
+ 	spin_lock_bh(&nss_ifb_list_lock);
+ 	list_for_each_entry(ifb_info, &nss_ifb_list, map_list) {
+ 		if (ifb_info->ifb_dev == dev) {
++			nss_ifb_info_get(ifb_info);
+ 			spin_unlock_bh(&nss_ifb_list_lock);
+ 			return ifb_info;
+ 		}
+--- a/nss_qdisc/igs/nss_mirred.c
++++ b/nss_qdisc/igs/nss_mirred.c
+@@ -79,6 +79,9 @@
+ 		nss_igs_error("Error in sending IFB CLEAR configure message\n");
+ 	}
+ 
++	/* The find reference ends here; CLEAR owns its own reference. */
++	nss_ifb_info_put(ifb_info);
++
+ put_dev:
+ 	if (dev) {
+ 		dev_put(dev);
+@@ -205,9 +208,11 @@
+ 		if (nss_ifb_is_mapped(ifb_info)) {
+ 			nss_igs_error("%s device is already mapped to the other IFB device\n",
+ 					from_dev->name);
++			nss_ifb_info_put(ifb_info);
+ 			ret = -EEXIST;
+ 			goto init_failed;
+ 		}
++		nss_ifb_info_put(ifb_info);
+ 	}
+ 
+ 	ifb_info = nss_ifb_find_dev(to_dev);
+@@ -215,6 +220,7 @@
+ 		if (nss_ifb_is_mapped(ifb_info)) {
+ 			nss_igs_error("%s IFB device is already mapped to the other device\n",
+ 					to_dev->name);
++			nss_ifb_info_put(ifb_info);
+ 			ret = -EEXIST;
+ 			goto init_failed;
+ 		}
+@@ -223,6 +229,9 @@
+ 	/* Reserve all fallible local binding storage before any NSS side effect. */
+ 	prepared_binding = nss_ifb_prepare_bind(ifb_info, &new_binding);
+ 	if (!prepared_binding) {
++		if (ifb_info) {
++			nss_ifb_info_put(ifb_info);
++		}
+ 		ret = -ENOMEM;
+ 		goto init_failed;
+ 	}
+@@ -262,6 +271,9 @@
+ 	 * Bind an IFB device with its requested mapped interface.
+ 	 */
+ 	nss_ifb_bind(prepared_binding, from_dev, to_dev, new_binding);
++	if (!new_binding) {
++		nss_ifb_info_put(prepared_binding);
++	}
+ 
+ 	/*
+ 	 * Return error if nss mirred action index is present in the hash.
+@@ -308,6 +320,9 @@
+ init_failed:
+ 	/* This only cancels private host storage; unknown FW state is not freed. */
+ 	nss_ifb_abort_bind(prepared_binding, new_binding);
++	if (!new_binding && prepared_binding) {
++		nss_ifb_info_put(prepared_binding);
++	}
+ #if (LINUX_VERSION_CODE >= KERNEL_VERSION(5, 4, 0))
+ 	/* Release only the action reference acquired above, not unknown FW state. */
+ 	tcf_idr_release(*tc_act, bind);
+@@ -484,11 +499,15 @@
+ 
+ 		if (ifb_num < 0) {
+ 			nss_igs_error("Invalid %s IFB device\n", dev->name);
++			nss_ifb_info_put(ifb_info);
+ 			return;
+ 		}
+ 		nss_ifb_delete_if(ifb_num);
+ 		nss_ifb_list_del(ifb_info);
+ 	}
++
++	/* The find reference ends here; CLEAR owns its own reference. */
++	nss_ifb_info_put(ifb_info);
+ }
+ 
+ /*
+@@ -515,6 +534,7 @@
+ 	if (!nss_ifb_down(ifb_info)) {
+ 		nss_igs_error("Error in sending IFB DOWN configure message\n");
+ 	}
++	nss_ifb_info_put(ifb_info);
+ }
+ 
+ /*
+@@ -541,6 +561,7 @@
+ 	if (!nss_ifb_up(ifb_info)) {
+ 		nss_igs_error("Error in sending IFB UP configure message\n");
+ 	}
++	nss_ifb_info_put(ifb_info);
+ }
+ 
+ /*
