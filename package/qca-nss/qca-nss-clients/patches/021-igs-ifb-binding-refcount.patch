@@ -1,0 +1,144 @@
+nss-clients: keep IFB binding and module alive until CLEAR callback
+
+nss_ifb_list_del() only removed the list node. The asynchronous CLEAR keeps
+app_data pointing at the same nss_ifb_info, so freeing it on removal would
+be a use-after-free; not freeing it leaked every binding.
+
+Give each binding a refcount. The list owns the initial reference, and a
+CLEAR transaction owns an additional binding and module reference until its
+callback retires them. If CLEAR never completes, retain the references:
+a bounded leak is safer than use-after-unload.
+
+The find paths remain under RTNL serialization in this bounded fix; this
+does not add a general lock-free lookup contract or request correlation.
+
+--- a/nss_qdisc/igs/nss_ifb.h
++++ b/nss_qdisc/igs/nss_ifb.h
+@@ -14,6 +14,8 @@
+  **************************************************************************
+  */
+ 
++#include <linux/refcount.h>
++
+ #define NSS_IFB_MSG_TIMEOUT (600*HZ)	/* 10 minute timeout */
+ 
+ /*
+@@ -38,6 +40,7 @@
+ 	struct net_device *map_dev;	/* Device mapped to an IFB device */
+ 	struct list_head map_list;	/* Internal list */
+ 	bool is_mapped;			/* Flag to indicate whether mapping is valid or not */
++	refcount_t refs;			/* Owners: list, async CLEAR callbacks */
+ };
+ 
+ /*
+--- a/nss_qdisc/igs/nss_ifb.c
++++ b/nss_qdisc/igs/nss_ifb.c
+@@ -15,6 +15,7 @@
+  */
+ 
+ #include <linux/completion.h>
++#include <linux/module.h>
+ #include <nss_api_if.h>
+ #include <nss_cmn.h>
+ #include <net/netfilter/nf_conntrack_dscpremark_ext.h>
+@@ -31,6 +32,23 @@
+ static DEFINE_SPINLOCK(nss_ifb_list_lock);	/* Lock for the ifb list */
+ 
+ /*
++ * nss_ifb_info_get/put()
++ *	The list owns one reference. An asynchronous CLEAR owns another
++ *	until its callback retires it. The last reference frees the object.
++ */
++static void nss_ifb_info_get(struct nss_ifb_info *ifb_info)
++{
++	refcount_inc(&ifb_info->refs);
++}
++
++static void nss_ifb_info_put(struct nss_ifb_info *ifb_info)
++{
++	if (refcount_dec_and_test(&ifb_info->refs)) {
++		kfree(ifb_info);
++	}
++}
++
++/*
+  * nss_ifb_msg_response
+  *	NSS firmware message response structure.
+  */
+@@ -105,6 +123,9 @@
+ 	spin_lock_bh(&nss_ifb_list_lock);
+ 	list_del(&ifb_info->map_list);
+ 	spin_unlock_bh(&nss_ifb_list_lock);
++
++	/* The list's reference retires here. A pending CLEAR keeps it alive. */
++	nss_ifb_info_put(ifb_info);
+ }
+ 
+ /*
+@@ -153,7 +174,7 @@
+ 
+ 	if (nim->cm.response != NSS_CMN_RESPONSE_ACK) {
+ 		nss_igs_error("Response error: %d\n", nim->cm.response);
+-		return;
++		goto out;
+ 	}
+ 
+ 	do {
+@@ -161,6 +182,11 @@
+ 	} while (!ret);
+ 	ifb_info->is_mapped = false;
+ 	spin_unlock_bh(&nss_ifb_list_lock);
++
++out:
++	/* The callback owns one clear reference and one module reference. */
++	module_put(THIS_MODULE);
++	nss_ifb_info_put(ifb_info);
+ }
+ 
+ /*
+@@ -453,7 +479,19 @@
+ 		nss_igs_info("%s IFB device mapped flag is not set\n", ifb_info->ifb_dev->name);
+ 		spin_unlock_bh(&nss_ifb_list_lock);
+ 		return true;
++	}
++
++	/*
++	 * The asynchronous CLEAR needs the binding and this module alive until
++	 * its callback retires. A timeout intentionally retains both references:
++	 * a bounded leak is safer than reuse after unload.
++	 */
++	if (!try_module_get(THIS_MODULE)) {
++		nss_igs_error("%s: cannot hold IGS module for CLEAR\n", ifb_info->ifb_dev->name);
++		spin_unlock_bh(&nss_ifb_list_lock);
++		return false;
+ 	}
++	nss_ifb_info_get(ifb_info);
+ 
+ 	/*
+ 	 * Send CLEAR config message to the mapped interface.
+@@ -465,6 +503,8 @@
+ 
+ 	if (nss_ifb_config_msg_tx(ifb_info->map_dev, if_num, NSS_IFB_CLEAR_IGS_NODE, ifb_info) < 0) {
+ 		nss_igs_error("Sending unassign to %s dev failed\n", ifb_info->map_dev->name);
++		nss_ifb_info_put(ifb_info);
++		module_put(THIS_MODULE);
+ 		spin_unlock_bh(&nss_ifb_list_lock);
+ 		return false;
+ 	}
+@@ -542,6 +582,7 @@
+ 	ifb_info->ifb_dev = NULL;
+ 	ifb_info->map_dev = NULL;
+ 	ifb_info->is_mapped = false;
++	refcount_set(&ifb_info->refs, 1);
+ 	INIT_LIST_HEAD(&ifb_info->map_list);
+ 	*new_entry = true;
+ 	return ifb_info;
+@@ -554,7 +595,7 @@
+ void nss_ifb_abort_bind(struct nss_ifb_info *ifb_info, bool new_entry)
+ {
+ 	if (new_entry) {
+-		kfree(ifb_info);
++		nss_ifb_info_put(ifb_info);
+ 	}
+ }
+ 
