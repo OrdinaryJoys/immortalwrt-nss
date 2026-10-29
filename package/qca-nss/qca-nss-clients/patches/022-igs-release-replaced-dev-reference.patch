@@ -1,0 +1,32 @@
+nss-clients: release replaced mirred device reference
+
+A non-bind action replace at an explicit index installs the new device with
+dev_hold(), but the old act->tcfm_dev reference was overwritten without a
+matching dev_put(). Hold the new device, publish it under RTNL, then drop
+the old reference.
+
+This closes only the device-reference leak in the replace path. Firmware
+mapping replacement, idempotency and the full S05/S06 transaction remain
+separate contracts.
+
+--- a/nss_qdisc/igs/nss_mirred.c
++++ b/nss_qdisc/igs/nss_mirred.c
+@@ -287,9 +287,16 @@
+ 	act->tcf_action = parm->action;
+ 	act->tcfm_from_ifindex = parm->from_ifindex;
+ 	act->tcfm_to_ifindex = parm->to_ifindex;
+-	dev_hold(to_dev);
+-	rcu_assign_pointer(act->tcfm_dev, to_dev);
++	{
++		struct net_device *old_dev = rcu_dereference_protected(act->tcfm_dev, 1);
+ 
++		dev_hold(to_dev);
++		rcu_assign_pointer(act->tcfm_dev, to_dev);
++		if (old_dev) {
++			dev_put(old_dev);
++		}
++	}
++
+ 	/*
+ 	 * Add the new action instance to the nss mirred action list.
+ 	 * An existing action (tc replace path) is already linked.
