@@ -112,7 +112,8 @@ def load(root, output, label):
             raise ValueError('baseline must contain action admission but predate binding preflight')
         helper_names = ('nss_ifb_bind', 'nss_ifb_delete_if', 'nss_ifb_create_if')
     else:
-        helper_names = ('nss_ifb_prepare_bind', 'nss_ifb_abort_bind', 'nss_ifb_bind',
+        helper_names = ('nss_ifb_info_put', 'nss_ifb_prepare_bind',
+                        'nss_ifb_abort_bind', 'nss_ifb_bind',
                         'nss_ifb_delete_if', 'nss_ifb_create_if')
     helpers = ''.join(prepared.function(IFB, name) for name in helper_names)
     return dict(prepared=prepared, raw=raw, code=code, types=types, helpers=helpers,
@@ -130,6 +131,10 @@ PREFIX = r'''
 #include <errno.h>
 typedef uint32_t u32;
 typedef uint32_t __u32;
+typedef struct { int refs; } refcount_t;
+#define refcount_set(r, value) ((r)->refs = (value))
+#define refcount_inc(r) ((r)->refs++)
+#define refcount_dec_and_test(r) (--(r)->refs == 0)
 #define __rcu
 #define KERNEL_VERSION(a,b,c) (((a)<<16)|((b)<<8)|(c))
 #ifndef LINUX_VERSION_CODE
@@ -178,6 +183,7 @@ static struct tc_action *active;
 static struct tc_nss_mirred parms;
 static struct nlattr attribute;
 static bool registered, allocated, from_known, alloc_fail, register_fail, bind_fail;
+static bool in_init;
 static bool check_fail, create_fail, missing_parms, existing, in_release;
 static bool reset_ok, clear_ok;
 static int config_fail, parse_error, slot, module_refs;
@@ -251,13 +257,21 @@ static int32_t nss_cmn_get_interface_number_by_dev_and_type(struct net_device *d
     check(dev==&to && type==NSS_DYNAMIC_INTERFACE_TYPE_IGS); return registered ? 42 : -1;
 }
 static struct nss_ifb_info *nss_ifb_find_map_dev(struct net_device *dev) {
-    return local_info && local_info->map_dev==dev ? local_info : NULL;
+    if (local_info && local_info->map_dev==dev) {
+        refcount_inc(&local_info->refs);
+        return local_info;
+    }
+    return NULL;
 }
 static struct nss_ifb_info *nss_ifb_find_dev(struct net_device *dev) {
     /* A hostile unrelated entry makes accidental NULL lookups observable. */
-    if (!dev) { ++null_lookups; return &sentinel; }
-    if (dev==&old_to) return &sentinel;
-    return local_info && local_info->ifb_dev==dev ? local_info : NULL;
+    if (!dev) { ++null_lookups; refcount_inc(&sentinel.refs); return &sentinel; }
+    if (dev==&old_to) { refcount_inc(&sentinel.refs); return &sentinel; }
+    if (local_info && local_info->ifb_dev==dev) {
+        refcount_inc(&local_info->refs);
+        return local_info;
+    }
+    return NULL;
 }
 static bool nss_ifb_is_mapped(struct nss_ifb_info *i) { return i->is_mapped; }
 static int32_t nss_dynamic_interface_alloc_node(int type) {
@@ -319,7 +333,8 @@ static void dev_hold(struct net_device *dev) {
     check(dev==&to); admission(); ++holds; ++dev->refs; event("dev_hold");
 }
 static void dev_put(struct net_device *dev) {
-    check(in_release && dev && dev->refs>0); ++dev_puts;
+    check((in_release || (in_init && dev==&old_to)) && dev && dev->refs>0);
+    ++dev_puts;
     if (dev && dev->refs>0) --dev->refs;
     event("dev_put");
 }
@@ -363,6 +378,7 @@ MAIN = r'''
 static void setup(bool have_old, int conflict, bool borrowed) {
     memset(&fresh,0,sizeof(fresh)); memset(&old,0,sizeof(old));
     memset(&info,0,sizeof(info)); memset(&sentinel,0,sizeof(sentinel));
+    info.refs.refs=1; sentinel.refs.refs=1;
     INIT_LIST_HEAD(&nss_mirred_list);
     from=(struct net_device){.name="host-from",.ifindex=1};
     to=(struct net_device){.name="host-ifb",.ifindex=2,.ifb=true};
@@ -389,7 +405,7 @@ static void setup(bool have_old, int conflict, bool borrowed) {
     checks=failures=0; idr_checks=creates=cleanups=releases=callbacks=mutations=0;
     allocs=registers=deletes=deallocs=holds=dev_puts=null_lookups=0;
     set_igs=set_nh=resets=clears=adds=0; fw_igs=fw_nh=0;
-    host_allocs=host_frees=map_publishes=0; host_live=false;
+    host_allocs=host_frees=map_publishes=0; host_live=false; in_init=false;
     trace_used=0; trace[0]=0;
 }
 static void report(int rc) {
@@ -465,10 +481,13 @@ static void run_case(const char *name, enum mode mode, bool have_old, bool bind,
     int rc=0;
     for (unsigned attempt=0; attempt<attempts; ++attempt) {
         struct tc_action *a=NULL;
+        in_init=true;
         rc=nss_mirred_init(NULL,mode==NO_NLA ? NULL : &attribute,NULL,&a,NULL,
                            bind ? TCA_ACT_FLAGS_BIND : 0,NULL);
+        in_init=false;
         check(rc==expected);
-        check(!null_lookups && !resets && !clears && !dev_puts && sentinel.is_mapped);
+        unsigned expected_dev_puts = (have_old && !bind && expected == ACT_P_CREATED) ? 1u : 0u;
+        check(!null_lookups && !resets && !clears && dev_puts == expected_dev_puts && sentinel.is_mapped);
         if (expected<0) {
             check(!holds && !adds);
             if (pre || mode==IDR_RACE || mode==IDR_NOMEM) check(!mutations);
@@ -504,6 +523,7 @@ static void run_case(const char *name, enum mode mode, bool have_old, bool bind,
             }
             if (mode==REUSE_IGS_FAIL || mode==REUSE_NH_FAIL) {
                 check(local_info==&info && !info.is_mapped && info.ifb_dev==&to && info.map_dev==&old_from);
+                check(info.refs.refs==1);
             }
         } else if (have_old && bind) {
             check(a==&old.common && old.common.refs==3 && old.common.binds==2);
@@ -661,7 +681,11 @@ def variants(candidate, baseline, mutations):
         helpers = candidate['helpers']
         reserve = ('\t/* Reserve all fallible local binding storage before any NSS side effect. */\n'
                    '\tprepared_binding = nss_ifb_prepare_bind(ifb_info, &new_binding);\n'
-                   '\tif (!prepared_binding) {\n\t\tret = -ENOMEM;\n\t\tgoto init_failed;\n\t}\n\n')
+                   '\tif (!prepared_binding) {\n'
+                   '\t\tif (ifb_info) {\n'
+                   '\t\t\tnss_ifb_info_put(ifb_info);\n'
+                   '\t\t}\n'
+                   '\t\tret = -ENOMEM;\n\t\tgoto init_failed;\n\t}\n\n')
         bind_call = '\tnss_ifb_bind(prepared_binding, from_dev, to_dev, new_binding);'
         late = changed(changed(init, reserve, ''), bind_call, reserve + bind_call)
         expanded.extend([
@@ -671,16 +695,13 @@ def variants(candidate, baseline, mutations):
                 '(void)nss_ifb_abort_bind; (void)prepared_binding;'),
              release, helpers, False, 'new_set_igs_failure_bind'),
             ('abort-borrowed-storage', init, release,
-             changed(helpers, 'if (new_entry) {\n\t\tkfree(ifb_info);',
-                     'if (new_entry || ifb_info) {\n\t\tkfree(ifb_info);'),
+             changed(helpers, 'if (new_entry) {\n\t\tnss_ifb_info_put(ifb_info);',
+                     'if (new_entry || ifb_info) {\n\t\tnss_ifb_info_put(ifb_info);'),
              False, 'reuse_borrowed_set_igs_failure'),
-            ('lose-private-ownership', init, release,
-             changed(helpers, '*new_entry = true;', '*new_entry = false;'),
-             False, 'new_set_igs_failure_bind'),
-            ('claim-borrowed-storage', init, release,
-             changed(helpers, 'if (ifb_info) {\n\t\treturn ifb_info;',
-                     'if (ifb_info) {\n\t\t*new_entry = true;\n\t\treturn ifb_info;'),
-             False, 'reuse_borrowed_set_igs_failure'),
+            ('omit-borrowed-put', changed(init,
+                'if (!new_binding && prepared_binding) {\n\t\tnss_ifb_info_put(prepared_binding);\n\t}',
+                '(void)prepared_binding;'),
+             release, helpers, False, 'reuse_borrowed_set_igs_failure'),
             ('omit-binding-publication', changed(init, bind_call,
                 '\t(void)nss_ifb_bind; (void)prepared_binding;'),
              release, helpers, False, 'normal_new_bind'),

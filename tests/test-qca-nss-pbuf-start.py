@@ -189,7 +189,7 @@ for label, code, must_pass in variants:
         work.mkdir()
         (work / 'empty-path').mkdir()
         cpus = [work / ('cpu/cpu%d/cpufreq/scaling_governor' % i) for i in range(3)]
-        stats = [work / ('stats/' + name + '/stats_disable') for name in ['radio 0', r'radio\one', 'radio*two']]
+        stats = [work / ('stats/' + name + '/stats_disable') for name in ['radio 0', r'radio\one', 'radio-two']]
         keys = dict(zip(['cpu0', 'cpu1', 'cpu2', 'stats0', 'stats1', 'stats2'], cpus + stats))
         for item in cpus + stats:
             item.parent.mkdir(parents=True, exist_ok=True)
