@@ -9,6 +9,10 @@ release it. This covers action release, init validation/error paths,
 unregister, down and up. It makes the find/use lifetime explicit while
 keeping the existing mapping selection and publication order.
 
+The put helper has external linkage within act_nssmirred: both nss_ifb.o
+and nss_mirred.o use the header declaration. Do not leave its definition
+static or add an unrelated inter-module export.
+
 This does not add S05 idempotency, firmware replace, or request identity.
 
 --- a/nss_qdisc/igs/nss_ifb.h
@@ -39,6 +43,15 @@ This does not add S05 idempotency, firmware replace, or request identity.
  
 --- a/nss_qdisc/igs/nss_ifb.c
 +++ b/nss_qdisc/igs/nss_ifb.c
+@@ -41,7 +41,7 @@
+ 	refcount_inc(&ifb_info->refs);
+ }
+ 
+-static void nss_ifb_info_put(struct nss_ifb_info *ifb_info)
++void nss_ifb_info_put(struct nss_ifb_info *ifb_info)
+ {
+ 	if (refcount_dec_and_test(&ifb_info->refs)) {
+ 		kfree(ifb_info);
 @@ -495,6 +495,7 @@
  	spin_lock_bh(&nss_ifb_list_lock);
  	list_for_each_entry(ifb_info, &nss_ifb_list, map_list) {
