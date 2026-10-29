@@ -22,6 +22,15 @@ Subject: ath11k: 999-939-ath11k-qmi-init-exit-ownership.patch
  			kfree(event);
  			return;
  		}
+@@ -3339,7 +3339,7 @@
+ 	int ret;
+ 
+ 	memset(&ab->qmi.target, 0, sizeof(struct target_info));
+-	memset(&ab->qmi.target_mem, 0, sizeof(struct target_mem_chunk));
++	memset(&ab->qmi.target_mem, 0, sizeof(ab->qmi.target_mem));
+ 	ab->qmi.ab = ab;
+ 
+ 	ab->qmi.target_mem_mode = ab->hw_params.fw_mem_mode;
 @@ -3398,31 +3400,34 @@
  	atomic_set(&ab->qmi.cb_active, 0);
  	ab->qmi.cb_closing = false;
