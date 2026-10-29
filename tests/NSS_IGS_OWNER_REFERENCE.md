@@ -115,8 +115,9 @@ only owner-gcc-final / owner-clang-final and owner-default-final qualify the
 final runner. Earlier v1/v2/v3/default-cc files remain historical evidence,
 not final acceptance. Initial CI fixture ambiguity is also retained separately.
 
-Final GCC16 and Clang ASan/UBSan passed 32 executables each, default cc with
-ASan/UBSan passed 28 without baseline. Evidence root:
+Final GCC16 without sanitizers passed 32 executables. Clang with ASan/UBSan
+passed 32 executables; default cc with ASan/UBSan passed 28 without baseline.
+These are separate host qualifications, not GCC sanitizer coverage. Evidence root:
 /Volumes/FX-MD87/Review-AX6/audits/20261027/igs-owner-admission.
 
 Still OPEN: whole qdisc reference pairing, early put versus async callbacks,
