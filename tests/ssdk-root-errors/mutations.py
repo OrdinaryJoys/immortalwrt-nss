@@ -1,0 +1,72 @@
+"""Single faults in complete extracted source bodies; all must run, not just compile."""
+
+
+def once(text, old, new):
+    if text.count(old) != 1:
+        raise RuntimeError('mutation-anchor:' + old)
+    return text.replace(old, new, 1)
+
+
+def variants():
+    # name, complete function, edit, witness, exact native diagnostic
+    return [
+        ('fal-overwritten-by-phy', 'ssdk_cleanup',
+         '\t\tif (rv == SW_OK)\n\t\t\trv = phy_rv;', '\t\trv = phy_rv;',
+         'fal-only', 'cleanup-first-error'),
+        ('phy-error-hidden', 'ssdk_cleanup', '\t\t\trv = phy_rv;', '\t\t\trv = SW_OK;',
+         'phy-only', 'cleanup-first-error'),
+        ('missing-fal-log', 'ssdk_cleanup',
+         '\tif (rv != SW_OK)\n\t\tSSDK_ERROR("ssdk FAL cleanup failed for device %u: %d\\n", dev_id, rv);', '',
+         'fal-only', 'fal-error-log'),
+        ('missing-phy-log', 'ssdk_cleanup',
+         '\t\tif (phy_rv != SW_OK)\n\t\t\tSSDK_ERROR("ssdk PHY cleanup failed for device %u: %d\\n", dev_id, phy_rv);', '',
+         'phy-only', 'phy-error-log'),
+        ('wrong-fal-log-code', 'ssdk_cleanup',
+         'dev_id, rv);', 'dev_id, SW_OK);', 'fal-only', 'fal-error-log'),
+        ('wrong-phy-log-code', 'ssdk_cleanup',
+         'dev_id, phy_rv);', 'dev_id, rv);', 'phy-only', 'phy-error-log'),
+        ('log-success-as-error', 'ssdk_cleanup', 'if (rv != SW_OK)', 'if (rv == SW_OK)',
+         'clean', 'unexpected-log'),
+        ('skip-fal-action', 'ssdk_cleanup', 'rv = fal_cleanup(dev_id);', 'rv = SW_OK;',
+         'clean', 'action-order-or-gate'),
+        ('skip-phy-action', 'ssdk_cleanup', 'phy_rv = ssdk_phy_driver_cleanup(dev_id);', 'phy_rv = SW_OK;',
+         'clean', 'missing-action-or-log'),
+        ('invert-emulation', 'ssdk_cleanup', 'if(!ssdk_is_emulation(dev_id))', 'if(ssdk_is_emulation(dev_id))',
+         'emulation-clean', 'extra-action-or-log'),
+        ('stop-after-fal-error', 'ssdk_cleanup',
+         '\tif(!ssdk_is_emulation(dev_id))', '\tif (rv != SW_OK) return rv;\n\tif(!ssdk_is_emulation(dev_id))',
+         'fal-only', 'missing-action-or-log'),
+        ('wrong-cleanup-device', 'ssdk_cleanup', 'rv = fal_cleanup(dev_id);', 'rv = fal_cleanup(0);',
+         'three-clean', 'action-order-or-gate'),
+        ('module-latest-error', 'regi_exit',
+         '\t\t\tif (rv == SW_OK)\n\t\t\t\trv = cleanup_rv;', '\t\t\trv = cleanup_rv;',
+         'three-distinct-errors', 'module-first-error-log'),
+        ('module-clear-earlier-error', 'regi_exit',
+         '\t\tcleanup_rv = ssdk_cleanup(dev_id);', '\t\tcleanup_rv = ssdk_cleanup(dev_id);\n\t\trv = SW_OK;',
+         'three-first-error', 'module-first-error-log'),
+        ('missing-device-log', 'regi_exit',
+         '\t\t\tSSDK_ERROR("qca-%s device %u cleanup failed! (code: %d)\\n",\n\t\t\t\tSSDK_STR, dev_id, cleanup_rv);', '',
+         'three-first-error', 'device-error-log'),
+        ('wrong-device-log-code', 'regi_exit',
+         'SSDK_STR, dev_id, cleanup_rv);', 'SSDK_STR, dev_id, SW_OK);',
+         'three-first-error', 'device-error-log'),
+        ('wrong-device-log-id', 'regi_exit',
+         'SSDK_STR, dev_id, cleanup_rv);', 'SSDK_STR, 0u, cleanup_rv);',
+         'three-middle-error', 'device-error-log'),
+        ('module-success-log-on-error', 'regi_exit',
+         '\tif (rv == SW_OK)\n\t\tSSDK_INFO(', '\tif (rv != SW_OK)\n\t\tSSDK_INFO(',
+         'three-first-error', 'module-first-error-log'),
+        ('ignore-switch-registration-gate', 'regi_exit',
+         'if (qca_phy_priv_global[dev_id]->qca_ssdk_sw_dev_registered == A_TRUE)', 'if (1)',
+         'three-clean', 'action-order-or-gate'),
+        ('missing-sfp-exit', 'regi_exit', '\t\tsfp_phy_exit(dev_id);', '',
+         'three-clean', 'action-order-or-gate'),
+        ('missing-platform-exit', 'regi_exit', '\t\tssdk_plat_exit(dev_id);', '',
+         'three-clean', 'action-order-or-gate'),
+        ('missing-free-priv', 'regi_exit', '\tssdk_free_priv();', '',
+         'three-clean', 'missing-action-or-log'),
+        ('controls-before-notifier', 'regi_exit',
+         '\tssdk_netdev_notifier_unregister();\n\tssdk_fdb_retire_controls();',
+         '\tssdk_fdb_retire_controls();\n\tssdk_netdev_notifier_unregister();',
+         'three-clean', 'action-order-or-gate'),
+    ]

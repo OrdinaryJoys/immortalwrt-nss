@@ -1,0 +1,50 @@
+--- a/src/init/ssdk_init.c
++++ b/src/init/ssdk_init.c
+@@ -1639,16 +1639,22 @@
+ sw_error_t
+ ssdk_cleanup(a_uint32_t dev_id)
+ {
+-	sw_error_t rv;
++	sw_error_t rv, phy_rv;
+ 
+ 	ssdk_netdev_cache_stop();
+ 	ssdk_fdb_retire_controls();
+ 	rv = fal_cleanup(dev_id);
++	if (rv != SW_OK)
++		SSDK_ERROR("ssdk FAL cleanup failed for device %u: %d\n", dev_id, rv);
+ /*qca808x_end*/
+ 	if(!ssdk_is_emulation(dev_id))
+ /*qca808x_start*/
+ 	{
+-		rv = ssdk_phy_driver_cleanup(dev_id);
++		phy_rv = ssdk_phy_driver_cleanup(dev_id);
++		if (phy_rv != SW_OK)
++			SSDK_ERROR("ssdk PHY cleanup failed for device %u: %d\n", dev_id, phy_rv);
++		if (rv == SW_OK)
++			rv = phy_rv;
+ 	}
+ 
+ 	return rv;
+@@ -2255,6 +2261,7 @@
+ {
+ 	a_uint32_t dev_id, dev_num = 1;
+ 	sw_error_t rv = SW_OK;
++	sw_error_t cleanup_rv;
+ /*qca808x_end*/
+ 	ssdk_netdev_notifier_unregister();
+ 	ssdk_fdb_retire_controls();
+@@ -2269,7 +2276,13 @@
+ #ifdef IN_SFP_PHY
+ 		sfp_phy_exit(dev_id);
+ #endif
+-		rv = ssdk_cleanup(dev_id);
++		cleanup_rv = ssdk_cleanup(dev_id);
++		if (cleanup_rv != SW_OK) {
++			SSDK_ERROR("qca-%s device %u cleanup failed! (code: %d)\n",
++				SSDK_STR, dev_id, cleanup_rv);
++			if (rv == SW_OK)
++				rv = cleanup_rv;
++		}
+ 	}
+ 
+ 	if (rv == SW_OK)

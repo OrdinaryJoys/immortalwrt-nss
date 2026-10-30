@@ -1,0 +1,93 @@
+--- a/src/init/ssdk_dts.c
++++ b/src/init/ssdk_dts.c
+@@ -1609,35 +1609,45 @@
+ int ssdk_switch_device_num_init(void)
+ {
+ 	struct device_node *switch_instance = NULL;
+-	a_uint32_t len = 0;
+-	const __be32 *num_devices;
++	ssdk_dt_cfg **nodes;
+ 	a_uint32_t dev_num = 1, dev_id = 0;
++	int ret = 0;
++
++	if (ssdk_dt_global.ssdk_dt_switch_nodes || ssdk_dt_global.num_devices)
++		return -EBUSY;
+ 
+ 	switch_instance = of_find_node_by_name(NULL, "ess-instance");
+ 	if (switch_instance) {
+-		num_devices = of_get_property(switch_instance, "num_devices", &len);
+-		if (num_devices)
+-			dev_num = be32_to_cpup(num_devices);
++		if (of_find_property(switch_instance, "num_devices", NULL))
++			ret = of_property_read_u32(switch_instance, "num_devices", &dev_num);
++		of_node_put(switch_instance);
++		if (ret)
++			return ret;
+ 	}
+ 
+-	ssdk_dt_global.ssdk_dt_switch_nodes = kzalloc(dev_num * sizeof(ssdk_dt_cfg *), GFP_KERNEL);
+-	if (ssdk_dt_global.ssdk_dt_switch_nodes == NULL) {
++	nodes = kcalloc(dev_num, sizeof(*nodes), GFP_KERNEL);
++	if (!nodes)
+ 		return -ENOMEM;
+-	}
+ 
+ 	for (dev_id = 0; dev_id < dev_num; dev_id++) {
+-		ssdk_dt_global.ssdk_dt_switch_nodes[dev_id] = kzalloc(sizeof(ssdk_dt_cfg),
+-								GFP_KERNEL);
+-		if (ssdk_dt_global.ssdk_dt_switch_nodes[dev_id] == NULL) {
+-			return -ENOMEM;
+-		}
+-		ssdk_dt_global.ssdk_dt_switch_nodes[dev_id]->switch_reg_access_mode = HSL_REG_MDIO;
+-		ssdk_dt_global.ssdk_dt_switch_nodes[dev_id]->psgmii_reg_access_mode = HSL_REG_MDIO;
++		nodes[dev_id] = kzalloc(sizeof(*nodes[dev_id]), GFP_KERNEL);
++		if (!nodes[dev_id])
++			goto free_nodes;
++		nodes[dev_id]->switch_reg_access_mode = HSL_REG_MDIO;
++		nodes[dev_id]->psgmii_reg_access_mode = HSL_REG_MDIO;
+ 	}
+ 
++	/* No root consumer may observe a partially allocated topology. */
++	ssdk_dt_global.ssdk_dt_switch_nodes = nodes;
+ 	ssdk_dt_global.num_devices = dev_num;
+ 
+ 	return 0;
++
++free_nodes:
++	while (dev_id)
++		kfree(nodes[--dev_id]);
++	kfree(nodes);
++	return -ENOMEM;
+ }
+ 
+ void ssdk_switch_device_num_exit(void)
+--- a/src/init/ssdk_init.c
++++ b/src/init/ssdk_init.c
+@@ -2007,7 +2007,7 @@
+ 	ssdk_netdev_cache_stop();
+ 	ssdk_fdb_retire_controls();
+ 	if(!qca_phy_priv_global) {
+-		return;
++		goto free_topology;
+ 	}
+ /*qca808x_end*/
+ 	dev_num = ssdk_switch_device_num_get();
+@@ -2022,6 +2022,7 @@
+ 
+ 	kfree(qca_phy_priv_global);
+ 
++free_topology:
+ 	qca_phy_priv_global = NULL;
+ /*qca808x_end*/
+ 	ssdk_switch_device_num_exit();
+@@ -2112,7 +2113,9 @@
+ 	int rv = 0;
+ /*qca808x_end*/
+ 	/*init switch device num firstly*/
+-	ssdk_switch_device_num_init();
++	rv = ssdk_switch_device_num_init();
++	if (rv)
++		return rv;
+ 
+ 	dev_num = ssdk_switch_device_num_get();
+ /*qca808x_start*/

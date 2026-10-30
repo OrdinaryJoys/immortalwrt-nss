@@ -1,0 +1,71 @@
+"""Single-fault edits to extracted complete definitions, not replacement algorithms."""
+
+
+def replace_once(text, before, after):
+    if text.count(before) != 1:
+        raise RuntimeError('mutation-anchor:' + before)
+    return text.replace(before, after, 1)
+
+
+def variants():
+    # name, function, old, new, witness case, exact runtime diagnostic
+    return [
+        ('no-pointer-reentry', 'ssdk_switch_device_num_init',
+         'ssdk_dt_global.ssdk_dt_switch_nodes || ssdk_dt_global.num_devices',
+         'ssdk_dt_global.num_devices', 'foreign-pointer', 'reentry-side-effect'),
+        ('no-count-reentry', 'ssdk_switch_device_num_init',
+         'ssdk_dt_global.ssdk_dt_switch_nodes || ssdk_dt_global.num_devices',
+         'ssdk_dt_global.ssdk_dt_switch_nodes', 'foreign-count', 'reentry-side-effect'),
+        ('corrupt-foreign-child', 'ssdk_switch_device_num_init',
+         '\t\treturn -EBUSY;',
+         '\t\t{ ssdk_dt_global.ssdk_dt_switch_nodes[0]->switch_reg_access_mode = HSL_REG_MDIO; return -EBUSY; }',
+         'foreign-both', 'foreign-owner-preserved'),
+        ('corrupt-foreign-slot', 'ssdk_switch_device_num_init',
+         '\t\treturn -EBUSY;',
+         '\t\t{ ssdk_dt_global.ssdk_dt_switch_nodes[0] = NULL; return -EBUSY; }',
+         'foreign-both', 'foreign-owner-preserved'),
+        ('missing-of-put', 'ssdk_switch_device_num_init',
+         '\t\tof_node_put(switch_instance);', '', 'present-zero', 'of-put-before-allocation'),
+        ('ignore-typed-error', 'ssdk_switch_device_num_init',
+         '\t\tif (ret)\n\t\t\treturn ret;', '\t\tif (ret) ret = 0;',
+         'short-one', 'return-value'),
+        ('missing-typed-read', 'ssdk_switch_device_num_init',
+         'ret = of_property_read_u32(switch_instance, "num_devices", &dev_num);',
+         'ret = 0;', 'valid-three', 'topology-values'),
+        ('wrong-default', 'ssdk_switch_device_num_init',
+         'dev_num = 1, dev_id = 0', 'dev_num = 2, dev_id = 0',
+         'no-node', 'topology-values'),
+        ('normalize-zero', 'ssdk_switch_device_num_init',
+         '\tnodes = kcalloc(dev_num, sizeof(*nodes), GFP_KERNEL);',
+         '\tif (!dev_num) dev_num = 1;\n\tnodes = kcalloc(dev_num, sizeof(*nodes), GFP_KERNEL);',
+         'present-zero', 'topology-values'),
+        ('early-pointer-publish', 'ssdk_switch_device_num_init',
+         '\tfor (dev_id = 0; dev_id < dev_num; dev_id++) {',
+         '\tssdk_dt_global.ssdk_dt_switch_nodes = nodes;\n\tfor (dev_id = 0; dev_id < dev_num; dev_id++) {',
+         'valid-three', 'publication-before-complete'),
+        ('early-count-publish', 'ssdk_switch_device_num_init',
+         '\tfor (dev_id = 0; dev_id < dev_num; dev_id++) {',
+         '\tssdk_dt_global.num_devices = dev_num;\n\tfor (dev_id = 0; dev_id < dev_num; dev_id++) {',
+         'valid-three', 'publication-before-complete'),
+        ('leak-prior-children', 'ssdk_switch_device_num_init',
+         '\twhile (dev_id)\n\t\tkfree(nodes[--dev_id]);', '',
+         'fail-child-three', 'allocation-leak'),
+        ('leak-local-array', 'ssdk_switch_device_num_init',
+         '\tkfree(nodes);', '', 'fail-child-one', 'allocation-leak'),
+        ('ignore-root-preparation-error', 'regi_init',
+         '\tif (rv)\n\t\treturn rv;', '',
+         'root-fail-array', 'early-root-private'),
+        ('cleanup-foreign-preparation', 'regi_init',
+         '\tif (rv)\n\t\treturn rv;',
+         '\tif (rv) { ssdk_free_priv(); return rv; }',
+         'root-foreign', 'early-root-controls'),
+        ('null-private-early-return', 'ssdk_free_priv',
+         '\t\tgoto free_topology;',
+         '\t\tif (!qca_phy_priv_global) return;\n\t\tgoto free_topology;',
+         'null-private-three', 'null-private-topology'),
+        ('exit-stale-count', 'ssdk_switch_device_num_exit',
+         '\tssdk_dt_global.num_devices = 0;', '', 'valid-three', 'exit-state'),
+        ('exit-stale-pointer', 'ssdk_switch_device_num_exit',
+         '\tssdk_dt_global.ssdk_dt_switch_nodes = NULL;', '',
+         'valid-three', 'exit-state'),
+    ]
