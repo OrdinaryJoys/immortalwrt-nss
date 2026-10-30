@@ -287,6 +287,62 @@ Any proposed per-iface/per-BSS counter rule is only an offline oracle, not
 authorization to deploy a new policy. BE/MLO, wire assignment, FW enablement,
 on-air beacons and performance remain blocked or unverified.
 
+### Frozen 001-016 TX composition follow-up
+
+The integration wrapper now defaults to the separately qualified 001-015
+subset and requires an additional explicit frozen-016 hash to select 001-016.
+Missing, malformed or mismatched hashes stop before preparation/compiler
+execution. This is an input-selection gate, not authorization or a target
+build. Both selected chains freshly replay the complete package at declared
+old/new coordinates and compare all output bytes. The 014 nine-function TX
+contract, complete edma_cfg.c and existing map/publish/retire traces must stay
+identical to before15; global OF init/final functions are not executed here.
+
+Parent through16-r1 and default15-r3 each pass both native compilers with
+74 cases/185559 checks, 519 paired maps/unmaps and 16 exact semantic mutants.
+Four CLI rejection controls are separate from driver cases. A subsequent
+README-only correction names the separate reference repair OF016, not 015;
+the old run identities are preserved. Parent through16-r2-doc rebinds that
+exact corrected README and passes both compilers with the same results.
+Independent review accepts the test wrapper only, without blockers; it does
+not execute tests again or provide a new independent signature on the earlier
+production patches. This is not full EDMA lifetime/performance acceptance.
+
+### MU-EDCA offline-only acceptance boundaries
+
+The new fixture separates original dispatch/reply/queue behavior, an explicit
+true-received-extent validator, a test-only canonical-iface consumer and an
+off-wire composition adapter. It allocates no command/attribute ID and never
+turns a genuine standard event into a MU protocol. Exact libnl-tiny40493a65,
+hostapd b004de0b and backports6.18.26 inputs are bound; selected38 plus seven
+support files are freshly reconstructed, with 27 recorded selected-file
+offsets, not full303 zero-offset or whole-daemon qualification.
+
+Parent review rejected earlier prototypes despite their bounded PASS:
+WIPHY0 is valid, unlike IFINDEX0; canonical bss0 must actually be observed
+exactly once, and every observed route/AP owner must belong to the validated
+radio before any update. The final prototype fixes these test-only errors.
+Stable caller-owned topology is still required; null guards do not drain
+concurrent teardown. The per-BSS counter rule remains an offline oracle,
+not a production policy approval.
+
+Author final-r11 and parent-r1 each pass GCC ordinary and Clang ASan/UBSan:
+AX-on4209 cases/34911 checks, AX-off route projection87/650, and26 exact runtime
+mutants per compiler. LSan is unsupported here and disabled. The actual
+AX-off member-guard syntax probe still fails on existing unguarded HE member
+accesses: this is a bounded compatibility BLOCKER, not a passing component
+build or semantic-negative success. Full AP/supplicant processing is not
+executed. True received-extent production adapter, wire negotiation/allocation,
+paired emitter/receiver, BE/MLO, beacon construction/OTA and performance remain
+OPEN or BLOCKED. Independent review accepts only the frozen offline scope,
+without new mustfix; it did not rerun compilers or approve production MU.
+Its P2 records that postrun hashing checks a fixed initial input list only:
+new directory entries, saved patches and prepared/evidence trees are not
+covered by a final inventory/tree revalidation. Frozen files and recorded
+inputs/results were independently checked; there is no atomic snapshot,
+concurrent-workspace or anti-tamper guarantee. Stronger gates are a separate
+tests-only follow-up, not a silent upgrade of this acceptance.
+
 ## Item 1: MATCH bounded command repair
 
 Local patch 024 repairs the set/reset handlers together. The exact upstream
