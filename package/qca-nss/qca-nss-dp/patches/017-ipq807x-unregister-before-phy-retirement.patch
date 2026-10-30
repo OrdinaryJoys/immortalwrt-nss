@@ -1,0 +1,31 @@
+--- a/nss_dp_main.c
++++ b/nss_dp_main.c
+@@ -1445,6 +1445,12 @@
+ 		nss_dp_plane_quarantine(dp_priv);
+ 		nss_dp_clear_host_ctx(dp_priv);
+ 		rtnl_unlock();
++
++		/* Keep the PHY and HAL alive through netdevice notifiers.
++		 * Quarantine already blocks and drains plane callbacks.
++		 * PHY disconnect still performs its own conditional stop.
++		 */
++		unregister_netdev(dp_priv->netdev);
+ #else
+ 		dp_ops = dp_priv->data_plane_ops;
+ #endif
+@@ -1467,6 +1473,7 @@
+ 
+ 		nss_dp_hal_deinit_soc_priv_flags(dp_priv);
+ 
++#ifndef NSS_DP_IPQ807X
+ 		/*
+ 		 * Execution of unregister_netdev may access statistics of the
+ 		 * netdevice, which leads to the netdev op accessing netdev
+@@ -1474,6 +1481,7 @@
+ 		 * before performing hal_ops exit().
+ 		 */
+ 		unregister_netdev(dp_priv->netdev);
++#endif
+ 		hal_ops->exit(dp_priv->gmac_hal_ctx);
+ 		dp_priv->gmac_hal_ctx = NULL;
+ 		free_netdev(dp_priv->netdev);
