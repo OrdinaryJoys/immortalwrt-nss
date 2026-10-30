@@ -1,5 +1,10 @@
 # Core-risk repair and validation plan
 
+Phase 2 starts at local source 0b9e425f92402b2252d5f22e4554793b3d5edda9
+on codex/ax6-mcs-edma-muedca-20261030. The original baseline below is history.
+The build checkout/lock remains deliberately frozen at 2bcafb4. Phase-2 source
+and native-host qualification must not be attributed to the old build lock.
+
 Baseline: source cfde3310d6fe3b007775a91c81e35309a29886a2,
 build 2bcafb435bb316da0f74da1f6ec0817020201ed1. No target/firmware
 build, make, push, main merge, Release, device access or performance setting
@@ -66,6 +71,51 @@ The initial audit's complete records and unread coverage remain at
 `/Volumes/FX-MD87/Review-AX6/audits/20261030/component-deep-audit`.
 That sealed directory is data only; never execute its generated programs.
 New evidence belongs to `core-risk-repairs`, not a rewrite of old PASS/failure.
+
+Phase-2 evidence instead belongs to the new, separate `core-risk-phase2`
+directory. No sealed program is executed, even by copying it elsewhere.
+
+## Phase 2 item 1: MCS protocol and direct source consumers
+
+Patch 021 / qca-mcs release 4 is bound to exact da120b15 plus the nine prior
+patches. The public wire header is unchanged. It validates complete actual
+messages before shared-state effects, preserves fixed SET buf_len=0 with
+sufficient actual data, flags=0, low command numbers, extra actual SET bytes
+and bounded outer-count clamps. Responses use an independent linear skb and
+trusted sender portid; GET/event output is initialized. Every management
+command, including GET, now explicitly requires initial-user-namespace admin.
+
+Independent review rejected r3 despite its passing covered host tests: event
+portid zero could self-deliver to the kernel capability/file path, and ECM
+passed a raw source address to a packet-header helper. The final candidate
+rejects zero before capability, configuration and event emission, retaining
+the -1 disable sentinel and nonzero high-bit proxy destinations. A private
+address helper separates ECM from the unchanged public packet-header helper.
+Byte comparisons avoid typed unaligned loads from packed source arrays; ECM
+uses the entire source union and checks its zero destination capacity.
+
+Other bounded fixes include matched-slot MLD ACL replacement, overlapping
+compaction with memmove, four-byte IPv4 mask output, combined-family ACL
+required sizing, internal MDB/ECM source limits, interval multiplication/range
+and MLD-off DEL_MDB/family guards. These are not MCS attach/timer teardown or
+recipient lifetime repairs. No sleeping lock or performance setting is added.
+
+Final candidate-r6/r8 GCC and Clang ASan/UBSan each passed four positive
+profiles (597/2060, 601/2070, 627/2161 and 631/2171 cases/checks, zero failures).
+GCC records 45 semantic runs, Clang 44; one Clang unaligned-load sanitizer
+control and the old MLD-off compile failure are separately classified. Actual
+ECM functions and exact Linux IP header structures now join the extracted
+control functions. Host transport, lists, credentials, RCU, timers, callbacks
+and struct-group expansion are explicit substitutes. The smaller jiffy limit
+is a numerical LP64 model, not 32-bit target qualification. r4/r5/r6 harness
+and compile failures remain saved rather than relabeled as passing.
+
+The bounded independent r8 test/source review found the two P1 issues closed
+for this scope, not kernel runtime. Four test-quality follow-ups remain:
+second packed-entry lookup, other GET capacity paths, failure-case targeting
+and stricter general negative diagnostics. They must be separately completed
+and reviewed, not silently claimed by r8. Unknown userspace query/event
+callers, recipient reuse, full lifecycle, target and runtime remain open.
 
 ## Item 1: MATCH bounded command repair
 

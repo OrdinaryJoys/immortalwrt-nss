@@ -1,0 +1,592 @@
+Subject: [PATCH] mcs: bound control messages, own replies and validate source lists
+
+--- a/mc_netlink.c
++++ b/mc_netlink.c
+@@ -19,6 +19,9 @@
+ #include <net/net_namespace.h>
+ #include <net/sock.h>
+ #include <linux/etherdevice.h>
++#include <linux/jiffies.h>
++#include <linux/overflow.h>
++#include <net/netlink.h>
+ 
+ #include "mc_osdep.h"
+ #include "mc_api.h"
+@@ -27,6 +30,153 @@
+ 
+ static struct sock *mc_nl_sk = NULL;
+ static __be32 event_pid = MC_INVALID_PID;
++
++static bool mc_control_protocol_valid(u32 protocol)
++{
++	if (protocol == htons(ETH_P_IP))
++		return true;
++#ifdef MC_SUPPORT_MLD
++	if (protocol == htons(ETH_P_IPV6))
++		return true;
++#endif
++	return false;
++}
++
++static bool mc_control_group_valid(const void *data)
++{
++	struct __mc_group group;
++
++	memcpy(&group, data, sizeof(group));
++	return mc_control_protocol_valid(group.pro);
++}
++
++static bool mc_control_interval_valid(u32 seconds)
++{
++	unsigned long ticks;
++
++	return !check_mul_overflow((unsigned long)seconds, (unsigned long)HZ, &ticks) &&
++		ticks <= MAX_JIFFY_OFFSET;
++}
++
++/* Validate every consumed field before any command can change shared state. */
++static bool mc_control_payload_valid(u32 type, const struct __mcctl_msg_header *hdr,
++				     const void *data, size_t available)
++{
++	size_t required = 0, unit = 0, i, j;
++
++	if (hdr->buf_len > available)
++		return false;
++	if (type != MC_MSG_SET_EVENT_PID &&
++	    (!hdr->if_name[0] || !memchr(hdr->if_name, '\0', IFNAMSIZ)))
++		return false;
++
++	switch (type) {
++	case MC_MSG_SET_ENABLE:
++	case MC_MSG_SET_DEBUG:
++	case MC_MSG_SET_POLICY:
++	case MC_MSG_SET_MEMBERSHIP_INTERVAL:
++	case MC_MSG_SET_CONVERT_ALL:
++	case MC_MSG_SET_M2I3_FILTER:
++	case MC_MSG_SET_TBIT:
++	case MC_MSG_SET_LOCAL_QUERY_INTERVAL:
++	case MC_MSG_SET_ROUTER:
++		required = sizeof(struct __mc_param_value);
++		break;
++	case MC_MSG_SET_RETAG:
++		required = sizeof(struct __mc_param_retag);
++		break;
++	case MC_MSG_SET_ROUTER_PORT:
++		required = sizeof(struct __mc_param_router_port);
++		break;
++	case MC_MSG_SET_ADD_ACL_RULE:
++		required = sizeof(struct __mc_param_acl_rule);
++		break;
++	case MC_MSG_SET_FLUSH_ACL_RULE:
++		required = sizeof(u32);
++		break;
++	case MC_MSG_SET_TIMEOUT:
++		required = sizeof(struct __mc_param_timeout);
++		break;
++	case MC_MSG_SET_EVENT_PID:
++		required = sizeof(struct __event_info);
++		break;
++	case MC_MSG_DEL_MDB:
++		required = sizeof(struct __mc_mdb_entry);
++		break;
++	case MC_MSG_SET_PSW_ENCAP:
++		unit = sizeof(struct __mc_encaptbl_entry);
++		break;
++	case MC_MSG_SET_PSW_FLOOD:
++		unit = sizeof(struct __mc_floodtbl_entry);
++		break;
++	case MC_MSG_SET_NOTIFY:
++		unit = sizeof(struct __mc_group);
++		break;
++	case MC_MSG_GET_ACL:
++	case MC_MSG_GET_MDB:
++	case MC_MSG_GET_ROUTER_PORT:
++		break;
++	default:
++		return false;
++	}
++
++	/* Legacy fixed SET callers may leave buf_len zero; actual bytes still count. */
++	if (available < required || (required && hdr->buf_len && hdr->buf_len < required) ||
++	    (unit && hdr->buf_len % unit))
++		return false;
++
++	switch (type) {
++	case MC_MSG_SET_EVENT_PID:
++		return ((const struct __event_info *)data)->event_pid != 0;
++	case MC_MSG_SET_POLICY:
++		return ((const struct __mc_param_value *)data)->val <= MC_POLICY_FLOOD;
++	case MC_MSG_SET_MEMBERSHIP_INTERVAL:
++	case MC_MSG_SET_LOCAL_QUERY_INTERVAL:
++		return mc_control_interval_valid(((const struct __mc_param_value *)data)->val);
++	case MC_MSG_SET_ROUTER_PORT:
++		return ((const struct __mc_param_router_port *)data)->type < MC_RTPORT_MAX;
++	case MC_MSG_SET_TIMEOUT:
++		return ((const struct __mc_param_timeout *)data)->from <=
++			MC_TIMEOUT_FROM_GROUP_MEMBERSHIP_INTERVAL;
++	case MC_MSG_SET_ADD_ACL_RULE:
++		if (((const struct __mc_param_acl_rule *)data)->pattern.rule >= MC_ACL_RULE_MAX)
++			return false;
++		fallthrough;
++	case MC_MSG_SET_FLUSH_ACL_RULE:
++		if (((const struct __mc_param_acl_rule *)data)->pattern_type == MC_ACL_PATTERN_IGMP)
++			return true;
++#ifdef MC_SUPPORT_MLD
++		return ((const struct __mc_param_acl_rule *)data)->pattern_type == MC_ACL_PATTERN_MLD;
++#else
++		return false;
++#endif
++	case MC_MSG_DEL_MDB:
++		return mc_control_group_valid(data);
++	case MC_MSG_SET_PSW_ENCAP:
++		for (i = 0; i < hdr->buf_len / unit; i++) {
++			const struct __mc_encaptbl_entry *entry =
++				(const void *)((const u8 *)data + i * unit);
++
++			if (!mc_control_group_valid(entry))
++				return false;
++			/* Keep the existing bounded outer-count clamp. */
++			for (j = 0; j < min_t(u32, entry->dev_cnt, MC_ENCAP_DEV_MAX); j++) {
++				if (entry->dev[j].in_nsrcs > MC_DEF_SRCS_MAX ||
++				    (entry->dev[j].ex_nsrcs != MC_DEF_EX_SRCS_INVAL &&
++				     entry->dev[j].ex_nsrcs > MC_DEF_SRCS_MAX))
++					return false;
++			}
++		}
++		break;
++	case MC_MSG_SET_PSW_FLOOD:
++	case MC_MSG_SET_NOTIFY:
++		for (i = 0; i < hdr->buf_len / unit; i++)
++			if (!mc_control_group_valid((const u8 *)data + i * unit))
++				return false;
++		break;
++	}
++	return true;
++}
+ /*
+  * mc_acltbl_update
+  *	update the acl rules table
+@@ -64,7 +214,7 @@
+ 		if (ar->pattern.rule == MC_ACL_RULE_DISABLE) {
+ 			if (i != mc->igmp_acl.pattern_count) {
+ 				if (i < mc->igmp_acl.pattern_count - 1)
+-					memcpy(&mc->igmp_acl.patterns[i], &mc->igmp_acl.patterns[i+1],
++					memmove(&mc->igmp_acl.patterns[i], &mc->igmp_acl.patterns[i+1],
+ 						(sizeof pattern) * (mc->igmp_acl.pattern_count - 1 - i));
+ 				mc->igmp_acl.pattern_count--;
+ 			}
+@@ -124,14 +274,14 @@
+ 		if (ar->pattern.rule == MC_ACL_RULE_DISABLE) {
+ 			if (i != mc->mld_acl.pattern_count) {
+ 				if (i < mc->mld_acl.pattern_count - 1)
+-					memcpy(&mc->mld_acl.patterns[i], &mc->mld_acl.patterns[i+1],
++					memmove(&mc->mld_acl.patterns[i], &mc->mld_acl.patterns[i+1],
+ 						(sizeof pattern) * (mc->mld_acl.pattern_count - 1 - i));
+ 				mc->mld_acl.pattern_count--;
+ 			}
+ 			MC_PRINT(KERN_INFO "%s: Del MLD acl rule, count=%d\n", __func__, mc->mld_acl.pattern_count);
+ 		} else {
+ 			if (i != mc->mld_acl.pattern_count) {
+-				memcpy(&mc->mld_acl.patterns[mc->mld_acl.pattern_count], &pattern, sizeof pattern);
++				memcpy(&mc->mld_acl.patterns[i], &pattern, sizeof pattern);
+ 				MC_PRINT(KERN_INFO "%s: Update acl rule\n", __func__);
+ 				goto out;
+ 			}
+@@ -196,14 +346,11 @@
+ 		memcpy(entry->pattern.mac, p[i].mac, ETH_ALEN);
+ 		memcpy(entry->pattern.mac_mask, p[i].mac_mask, ETH_ALEN);
+ 		memcpy(entry->pattern.ip, &p[i].ip.ip4, sizeof(__be32));
+-		memcpy(entry->pattern.ip_mask, &p[i].ip_mask.ip4_mask, sizeof(entry->pattern.ip_mask));
++		memcpy(entry->pattern.ip_mask, &p[i].ip_mask.ip4_mask, sizeof(__be32));
+ 
+ 		entry++;
+ 		num++;
+ 	}
+-	if (ret < 0)
+-		goto out;
+-
+ #ifdef MC_SUPPORT_MLD
+ 	p = &mc->mld_acl.patterns[0];
+ 	for (i = 0; i < mc->mld_acl.pattern_count; i++) {
+@@ -224,7 +371,6 @@
+ 		num++;
+ 	}
+ #endif
+-out:
+ 	if (bytes_written)
+ 		*bytes_written = num * sizeof(*entry);
+ 
+@@ -341,6 +487,11 @@
+ 						ret = -EAGAIN;
+ 						continue;
+ 					}
++					if (fg->a.nsrcs < 0 || fg->a.nsrcs > MC_DEF_SRCS_MAX ||
++					    !mc_control_protocol_valid(mdb->group.pro)) {
++						ret = -EINVAL;
++						goto out;
++					}
+ 
+ 					if (mdb->group.pro == htons(ETH_P_IP)) {
+ 						entry->nsrcs = fg->a.nsrcs;
+@@ -370,6 +521,7 @@
+ 		}
+ 	}
+ 
++out:
+ 	if (bytes_written)
+ 		*bytes_written = num * sizeof(*entry);
+ 
+@@ -395,15 +547,16 @@
+ 	__u8 *entry = param;
+ 
+ 	for (i = 0; i < entry_cnt; i++, entry += entry_size) {
+-		struct __mc_group *entry_group = (struct __mc_group *)entry;
++		struct __mc_group entry_group;
+ 
++		memcpy(&entry_group, entry, sizeof(entry_group));
+ 		memset(&group, 0, sizeof group);
+-		group.pro = entry_group->pro;
++		group.pro = entry_group.pro;
+ 		if (group.pro == htons(ETH_P_IP))
+-			group.u.ip4 = entry_group->u.ip4;
++			group.u.ip4 = entry_group.u.ip4;
+ #ifdef MC_SUPPORT_MLD
+ 		else
+-			memcpy(group.u.ip6.s6_addr, entry_group->u.ip6, sizeof(struct in6_addr));
++			memcpy(group.u.ip6.s6_addr, entry_group.u.ip6, sizeof(struct in6_addr));
+ #endif
+ 
+ 		if (!memcmp(&group, &mdb->group, sizeof(struct mc_ip)))
+@@ -554,25 +707,45 @@
+ 	struct sk_buff *skb;
+ 	struct nlmsghdr *nlh = NULL;
+ 	void *msgdata = NULL;
+-	u32 pid, seq, msgtype;
++	u32 pid, msgtype;
++	size_t available, padding;
+ 	struct __mcctl_msg_header *msghdr;
+ 	struct mc_struct *mc = NULL;
+ 
+-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(3, 10, 0))
+-	if ((skb = skb_clone(__skb, GFP_ATOMIC)) == NULL)
+-#else
+-	if ((skb = skb_get(__skb)) == NULL)
+-#endif
++	if (!NETLINK_CB(__skb).portid ||
++	    !netlink_capable(__skb, CAP_NET_ADMIN) || __skb->len < NLMSG_HDRLEN)
+ 		return;
++	/* Own a linear response: skb_clone would modify the request's shared data. */
++	skb = skb_copy(__skb, GFP_ATOMIC);
++	if (!skb)
++		return;
+ 
+ 	/* process netlink message pointed by skb->data */
+ 	nlh = nlmsg_hdr(skb);
+-	pid = nlh->nlmsg_pid;
+-	seq = nlh->nlmsg_seq;
++	if (!nlmsg_ok(nlh, skb->len) || nlmsg_len(nlh) < MC_MSG_HDRLEN)
++		goto malformed;
++	padding = (NLMSG_ALIGNTO - (nlh->nlmsg_len & (NLMSG_ALIGNTO - 1))) &
++		(NLMSG_ALIGNTO - 1);
++	if (skb->len - nlh->nlmsg_len > padding)
++		goto malformed;
++	skb_trim(skb, nlh->nlmsg_len);
++	pid = NETLINK_CB(__skb).portid;
++	nlh->nlmsg_pid = 0;
+ 	msghdr = NLMSG_DATA(nlh);
+ 	msghdr->status = MC_STATUS_SUCCESS;
++	msghdr->tbl_offsite = 0;
++	msghdr->bytes_written = 0;
++	msghdr->bytes_needed = 0;
+ 	msgdata = MC_MSG_DATA(nlh);
+ 	msgtype = nlh->nlmsg_type;
++	available = nlmsg_len(nlh) - MC_MSG_HDRLEN;
++	if (!mc_control_payload_valid(msgtype, msghdr, msgdata, available)) {
++		msghdr->status = MC_STATUS_INVALID_PARAMETER;
++		goto reply;
++	}
++	if (msgtype == MC_MSG_GET_ACL || msgtype == MC_MSG_GET_MDB ||
++	    msgtype == MC_MSG_GET_ROUTER_PORT)
++		memset(msgdata, 0, available);
+ 
+ 	do {
+ 		/*
+@@ -581,7 +754,7 @@
+ 		if (msgtype == MC_MSG_SET_EVENT_PID) {
+ 			struct __event_info *p = msgdata;
+ 
+-			event_pid = p->event_pid;
++			WRITE_ONCE(event_pid, p->event_pid);
+ 			break;
+ 		}
+ 
+@@ -599,7 +772,8 @@
+ 			struct __mc_param_value *e = (struct __mc_param_value *)msgdata;
+ 
+ 			if (e->val) {
+-				mc_attach(brdev);
++				if (mc_attach(brdev))
++					msghdr->status = MC_STATUS_FAILURE;
+ 			} else {
+ 				mc_detach(brdev);
+ 			}
+@@ -637,7 +811,7 @@
+ 		case MC_MSG_SET_MEMBERSHIP_INTERVAL:
+ 			{
+ 				struct __mc_param_value *mi = (struct __mc_param_value *)msgdata;
+-				mc->membership_interval = mi->val * HZ;
++				mc->membership_interval = (unsigned long)mi->val * HZ;
+ 				MC_PRINT(KERN_INFO "%s: Set membership interval to %ds\n", __func__, mi->val);
+ 			}
+ 			break;
+@@ -725,7 +899,7 @@
+ 				struct __mc_param_value *i = (struct __mc_param_value *)msgdata;
+ 				if (i->val) {
+ 					spin_lock_bh(&mc->lock);
+-					mc->local_query_interval = i->val * HZ;
++					mc->local_query_interval = (unsigned long)i->val * HZ;
+ 					if (timer_pending(&mc->qtimer) ?
+ 						time_after(mc->qtimer.expires, jiffies + mc->local_query_interval) :
+ 							timer_delete_sync_try(&mc->qtimer) >= 0) {
+@@ -758,10 +932,14 @@
+ 			break;
+ 		case MC_MSG_GET_MDB:
+ 			{
++				int ret;
++
+ 				spin_lock_bh(&mc->lock);
+-				if (mc_mdbtbl_fillbuf(mc, msgdata, msghdr->buf_len,
+-							&msghdr->bytes_written, &msghdr->bytes_needed))
+-					msghdr->status = MC_STATUS_BUFFER_OVERFLOW;
++				ret = mc_mdbtbl_fillbuf(mc, msgdata, msghdr->buf_len,
++							&msghdr->bytes_written, &msghdr->bytes_needed);
++				if (ret)
++					msghdr->status = ret == -EAGAIN ?
++						MC_STATUS_BUFFER_OVERFLOW : MC_STATUS_FAILURE;
+ 				spin_unlock_bh(&mc->lock);
+ 			}
+ 			break;
+@@ -776,12 +954,14 @@
+ 					MC_PRINT("%s:del group=%pI4, ifindex=%d, mac=%pM\n",
+ 						 __func__, &e->group.u.ip4,e->ifindex, e->mac);
+ 				}
++#ifdef MC_SUPPORT_MLD
+ 				else {
+ 					mc_group.pro = e->group.pro;
+ 					memcpy(&mc_group.u.ip6, &e->group.u.ip6, sizeof(struct in6_addr));
+ 					MC_PRINT("%s:del group=%pI6, ifindex=%d, mac=%pM\n",
+ 						 __func__, &e->group.u.ip6,e->ifindex, e->mac);
+ 				}
++#endif
+ 
+ 				spin_lock_bh(&mc->lock);
+ 				if(mc_mdb_destroy_by_port(mc, &mc_group, (__u8 *)e->mac, e->ifindex)>0)
+@@ -826,6 +1006,7 @@
+ 
+ 	} while (0);
+ 
++reply:
+ #if (LINUX_VERSION_CODE >= KERNEL_VERSION(3, 7, 0))
+ 	NETLINK_CB(skb).portid = 0; /* from kernel */
+ #else
+@@ -833,6 +1014,9 @@
+ #endif
+ 	NETLINK_CB(skb).dst_group = 0; /* unicast */
+ 	netlink_unicast(mc_nl_sk, skb, pid, MSG_DONTWAIT);
++	return;
++malformed:
++	kfree_skb(skb);
+ }
+ 
+ /*
+@@ -855,47 +1039,37 @@
+ 	struct sk_buff *skb;
+ 	struct nlmsghdr *nlh;
+ 	struct __mcctl_msg_header *data;
+-	int send_msg = 1;
++	u32 destination = READ_ONCE(event_pid);
+ 
+-	if (!mc || event_pid == MC_INVALID_PID ||
+-			event_type >= MC_EVENT_MAX)
++	/* MDB_UPDATED has no payload; no other outbound event ABI is implemented. */
++	if (!mc || !mc->dev || !destination || destination == MC_INVALID_PID ||
++	    event_type != MC_EVENT_MDB_UPDATED || event_len)
+ 		return;
+ 
+-	skb = nlmsg_new(event_len + MC_MSG_HDRLEN, gfp_any());
++	skb = nlmsg_new(MC_MSG_HDRLEN, gfp_any());
+ 	if (!skb) {
+ 		MC_PRINT("nlmsg_new failed, event_type=%d\n", event_type);
+ 		return;
+ 	}
+ 
+-	nlh = nlmsg_put(skb, event_pid, 0, event_type, event_len + MC_MSG_HDRLEN, 0);
++	nlh = nlmsg_put(skb, 0, 0, event_type, MC_MSG_HDRLEN, 0);
+ 	if (!nlh) {
+ 		MC_PRINT("nlmsg_put failed, event_type=%d\n", event_type);
+ 		kfree_skb(skb);
+ 		return;
+ 	}
+ 
+-	switch (event_type) {
+-	case MC_EVENT_MDB_UPDATED:
+-		data = NLMSG_DATA(nlh);
+-		memcpy(data->if_name, mc->dev->name, IFNAMSIZ);
+-		break;
++	data = NLMSG_DATA(nlh);
++	memset(data, 0, MC_MSG_HDRLEN);
++	strscpy(data->if_name, mc->dev->name, sizeof(data->if_name));
+ 
+-	default:
+-		MC_PRINT("event type %d is not supported\n", event_type);
+-		send_msg = 0;
+-		kfree_skb(skb);
+-		break;
+-	}
+-
+-	if (send_msg) {
+ #if (LINUX_VERSION_CODE >= KERNEL_VERSION(3, 7, 0))
+-		NETLINK_CB(skb).portid = 0; /* from kernel */
++	NETLINK_CB(skb).portid = 0; /* from kernel */
+ #else
+-		NETLINK_CB(skb).pid = 0; /* from kernel */
++	NETLINK_CB(skb).pid = 0; /* from kernel */
+ #endif
+-		NETLINK_CB(skb).dst_group = 0; /* unicast */
+-		netlink_unicast(mc_nl_sk, skb, event_pid, MSG_DONTWAIT);
+-	}
++	NETLINK_CB(skb).dst_group = 0; /* unicast */
++	netlink_unicast(mc_nl_sk, skb, destination, MSG_DONTWAIT);
+ }
+ 
+ /*
+--- a/mc_forward.c
++++ b/mc_forward.c
+@@ -50,16 +50,18 @@
+  * mc_stranslate_check_source
+  *	check source for givens sources.
+  */
+-static int mc_stranslate_check_source(int pro, void *srcs, int offset, void *iph)
++static int mc_stranslate_check_source(int pro, const void *srcs, int offset,
++				    const void *source)
+ {
+-	if (offset > MC_DEF_IP6_SIZE)
+-		return -1;
++	if (offset < 0 || offset >= MC_DEF_SRCS_MAX)
++		return 0;
+ 
+ 	if (pro == htons(ETH_P_IP))
+-		return (*((__be32 *)srcs + offset) == ((struct iphdr *)iph)->saddr);
++		return !memcmp((const u8 *)srcs + offset * sizeof(__be32), source, sizeof(__be32));
+ #ifdef MC_SUPPORT_MLD
+-	else
+-		return (!ipv6_addr_cmp((struct in6_addr *)srcs + offset, &((struct ipv6hdr *)iph)->saddr));
++	else if (pro == htons(ETH_P_IPV6))
++		return !memcmp((const u8 *)srcs + offset * sizeof(struct in6_addr), source,
++			       sizeof(struct in6_addr));
+ #endif
+ 	return 0;
+ }
+@@ -68,16 +70,21 @@
+  * mc_translate_filter_source
+  *	translation filtered by the source
+  */
+-int mc_translate_filter_source(struct __mc_encaptbl_dev *dev, void *ip, __be16 pro)
++int mc_translate_filter_address(struct __mc_encaptbl_dev *dev,
++				const void *source, __be16 pro)
+ {
+ 	int n = 0;
+ 
++	if (dev->in_nsrcs > MC_DEF_SRCS_MAX ||
++	    (dev->ex_nsrcs != MC_DEF_EX_SRCS_INVAL && dev->ex_nsrcs > MC_DEF_SRCS_MAX))
++		return 1;
++
+ 	if (!dev->in_nsrcs && !dev->ex_nsrcs)
+ 		return 0;
+ 
+ 	/* Check INCLUDE list first */
+ 	for (n = 0; n < dev->in_nsrcs; n++) {
+-		if (mc_stranslate_check_source(pro, dev->in_srcs, n, ip))
++		if (mc_stranslate_check_source(pro, dev->in_srcs, n, source))
+ 			break;
+ 	}
+ 	if (n != dev->in_nsrcs)
+@@ -87,12 +94,24 @@
+ 	if (dev->ex_nsrcs == MC_DEF_EX_SRCS_INVAL)
+ 		return 1;
+ 	for (n = 0; n < dev->ex_nsrcs; n++) {
+-		if (mc_stranslate_check_source(pro, dev->ex_srcs, n, ip))
++		if (mc_stranslate_check_source(pro, dev->ex_srcs, n, source))
+ 			break;
+ 	}
+ 	if (n == dev->ex_nsrcs)
+ 		return 0;
++
++	return 1;
++}
+ 
++/* Keep the public packet-header contract distinct from ECM's raw address. */
++int mc_translate_filter_source(struct __mc_encaptbl_dev *dev, void *ip, __be16 pro)
++{
++	if (pro == htons(ETH_P_IP))
++		return mc_translate_filter_address(dev, &((struct iphdr *)ip)->saddr, pro);
++#ifdef MC_SUPPORT_MLD
++	if (pro == htons(ETH_P_IPV6))
++		return mc_translate_filter_address(dev, &((struct ipv6hdr *)ip)->saddr, pro);
++#endif
+ 	return 1;
+ }
+ 
+--- a/mc_ecm.c
++++ b/mc_ecm.c
+@@ -52,6 +52,8 @@
+ 
+ 		/*anyone who would like to receive stream from the source*/
+ 		os_hlist_for_each_entry_rcu(fg, fgh, &pg->fslist, fslist) {
++			if (fg->a.nsrcs < 0 || fg->a.nsrcs > MC_DEF_SRCS_MAX)
++				continue;
+ 			if (!fg->filter_mode || (fg->filter_mode == MC_DEF_FILTER_EXCLUDE && !fg->a.nsrcs))
+ 				return 0;
+ 
+@@ -68,7 +70,7 @@
+ 				}
+ 			}
+ #ifdef MC_SUPPORT_MLD
+-			else {
++			else if (mdb->group.pro == htons(ETH_P_IPV6)) {
+ 				struct in6_addr *ip6 = &mc_source->u.ip6;
+ 				struct in6_addr *srcs = (struct in6_addr *)fg->a.srcs;
+ 
+@@ -78,6 +80,9 @@
+ 				}
+ 			}
+ #endif
++			else {
++				continue;
++			}
+ 
+ 			if ((fg->filter_mode == MC_DEF_FILTER_INCLUDE && i != fg->a.nsrcs) ||
+ 				(fg->filter_mode == MC_DEF_FILTER_EXCLUDE && i == fg->a.nsrcs))
+@@ -122,7 +127,11 @@
+ 	 * If MCUC on, it means at most one host joined the group
+ 	 */
+ 	if (mdb->encap_dev_cnt) {
+-		if (!mc_translate_filter_source(mdb->encap_dev,  &mc_source->u.ip4, mdb->group.pro)) {
++		if (!mc_translate_filter_address(mdb->encap_dev, &mc_source->u, mdb->group.pro)) {
++			if (!max_dst) {
++				read_unlock(&mdb->rwlock);
++				return -1;
++			}
+ 			dst_dev[0] = mdb->encap_dev[0].ifindex;
+ 			ether_addr_copy(mac, mdb->encap_dev[0].mac);
+ 			read_unlock(&mdb->rwlock);
+--- a/mc_private.h
++++ b/mc_private.h
+@@ -327,4 +327,7 @@
+ {
+ 	return mc->multicast_router > 0 ? 1 : 0;
+ }
++
++int mc_translate_filter_address(struct __mc_encaptbl_dev *dev,
++				const void *source, __be16 pro);
+ #endif
