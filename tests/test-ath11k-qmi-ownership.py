@@ -19,6 +19,7 @@ parser.add_argument('--baseline',type=Path)
 parser.add_argument('--output',type=Path,required=True)
 parser.add_argument('--cc',default='cc',help='host compiler command, for GCC/Clang qualification')
 parser.add_argument('--sanitize',action='store_true')
+parser.add_argument('--mutations',action='store_true',help='reject single-chunk target-memory clear regression')
 args=parser.parse_args();args.output.mkdir(parents=True,exist_ok=False)
 
 def definition(text,name):
@@ -140,7 +141,16 @@ int main(void) {
         int ret=ath11k_qmi_init_service(&ab);
         check(ret<0);check(!handles&&!queues&&!event_allocs);
     }
-    failure=0;memset(&ab,0,sizeof(ab));check(!ath11k_qmi_init_service(&ab));
+    failure=0;memset(&ab,0,sizeof(ab));
+    memset(ab.qmi.target_mem,0xa5,sizeof(ab.qmi.target_mem));
+    check(!ath11k_qmi_init_service(&ab));
+    for(size_t i=0;i<sizeof(ab.qmi.target_mem);i++) {
+        if(((unsigned char *)ab.qmi.target_mem)[i]) {
+            fprintf(stderr,"target-memory-array-not-fully-cleared at %zu\n",i);
+            return 1;
+        }
+        check(true);
+    }
     check(!ath11k_qmi_driver_event_post(&ab.qmi,TEST_EVENT,NULL));
     ath11k_qmi_deinit_service(&ab);
     check(release_post_result==-ESHUTDOWN);check(!handles&&!queues&&!event_allocs);
@@ -169,9 +179,15 @@ int main(void) {
 }
 '''
 records=[]
-for label,tree,must_pass in [('candidate',args.prepared,True)]+([('baseline',args.baseline,False)] if args.baseline else []):
+variants=[('candidate',args.prepared,True)]+([('baseline',args.baseline,False)] if args.baseline else [])
+if args.mutations:variants.append(('single-chunk-clear',args.prepared,False))
+for label,tree,must_pass in variants:
     wifi=tree/'drivers/net/wireless/ath/ath11k'
     qmi=(wifi/'qmi.c').read_text();ahb=(wifi/'ahb.c').read_text()
+    if label=='single-chunk-clear':
+        old='memset(&ab->qmi.target_mem, 0, sizeof(ab->qmi.target_mem));'
+        if qmi.count(old)!=1:raise ValueError('missing or ambiguous full-array clear')
+        qmi=qmi.replace(old,'memset(&ab->qmi.target_mem, 0, sizeof(struct target_mem_chunk));',1)
     header=(wifi/'qmi.h').read_text()
     limit=re.search(r'^#define ATH11K_QMI_WLANFW_MAX_NUM_MEM_SEG_V01\s+\d+\s*$',header,re.M)
     if limit is None:raise ValueError('missing target memory array limit')
@@ -200,12 +216,15 @@ for label,tree,must_pass in [('candidate',args.prepared,True)]+([('baseline',arg
     if args.sanitize:command+=['-fsanitize=address,undefined','-fno-sanitize-recover=all','-fno-omit-frame-pointer']
     result=subprocess.run(command,capture_output=True,timeout=60)
     (args.output/(label+'-compile.stderr')).write_bytes(result.stderr)
-    if result.returncode:raise SystemExit(result.stderr.decode())
+    if result.returncode or result.stderr:raise SystemExit('compilation failed or emitted diagnostics: '+result.stderr.decode())
     result=subprocess.run([str(c.with_suffix(''))],capture_output=True,timeout=30)
     (args.output/(label+'.stdout')).write_bytes(result.stdout);(args.output/(label+'.stderr')).write_bytes(result.stderr)
     if (result.returncode==0)!=must_pass:raise SystemExit('unexpected '+label+' result: '+result.stderr.decode())
     if re.search(rb'AddressSanitizer|UndefinedBehaviorSanitizer|runtime error:',result.stderr):
         raise SystemExit('sanitizer failure is not a valid assertion negative control: '+label)
+    if must_pass and result.stderr:raise SystemExit('positive stderr is not empty: '+label)
+    if label=='single-chunk-clear' and b'target-memory-array-not-fully-cleared' not in result.stderr:
+        raise SystemExit('array-clear control missed its target')
     records.append(dict(label=label,returncode=result.returncode,expected_pass=must_pass,command=command,
         qmi_sha256=hashlib.sha256(qmi.encode()).hexdigest(),ahb_sha256=hashlib.sha256(ahb.encode()).hexdigest(),
         qmi_header_sha256=hashlib.sha256(header.encode()).hexdigest(),layout_sha256=hashlib.sha256(layout.encode()).hexdigest()))

@@ -189,6 +189,11 @@ was intentional and remains identical. Only that hunk's position/context was
 refreshed; all ordered added/removed code lines remain unchanged. No QMI
 lifecycle logic or timing was changed to make patch application pass.
 
+The QMI fixture now poisons the actual target-memory array before successful
+init and checks every byte. GCC ordinary and Clang ASan/UBSan each passed
+1692 checks; a single-chunk-clear mutation compiles but fails the named array
+assertion. This is not proof of full recovery or concurrent callback draining.
+
 The corrected full replay applies 16 SSDK, 18 ECM and 303 mac80211 patches.
 Saved logs contain no fuzz/offset/failure marker. This is textual integration
 only. It does not validate full kernel compilation, QMI_FAIL cleanup, firmware
