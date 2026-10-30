@@ -1,0 +1,484 @@
+{
+  "families": [
+    {
+      "file": "nss_nlpppoe.c",
+      "table": "nss_nlpppoe_ops",
+      "netnsok": true,
+      "ops": [
+        {
+          "cmd": "NSS_STATS_EVENT_NOTIFY",
+          "handler": "nss_nlpppoe_ops_get_stats",
+          "policy": "stats"
+        }
+      ]
+    },
+    {
+      "file": "nss_nlqrfs.c",
+      "table": "nss_nlqrfs_ops",
+      "netnsok": true,
+      "ops": [
+        {
+          "cmd": "NSS_QRFS_MSG_FLOW_ADD",
+          "handler": "nss_nlqrfs_ops_add_rule",
+          "policy": "new_admin"
+        },
+        {
+          "cmd": "NSS_QRFS_MSG_FLOW_DELETE",
+          "handler": "nss_nlqrfs_ops_del_rule",
+          "policy": "new_admin"
+        }
+      ]
+    },
+    {
+      "file": "nss_nludp_st.c",
+      "table": "nss_nludp_st_ops",
+      "netnsok": true,
+      "ops": [
+        {
+          "cmd": "NSS_UDP_ST_CFG_RULE_MSG",
+          "handler": "nss_nludp_st_ops_cfg_rule",
+          "policy": "new_admin"
+        },
+        {
+          "cmd": "NSS_UDP_ST_UNCFG_RULE_MSG",
+          "handler": "nss_nludp_st_ops_uncfg_rule",
+          "policy": "new_admin"
+        },
+        {
+          "cmd": "NSS_UDP_ST_START_MSG",
+          "handler": "nss_nludp_st_ops_start",
+          "policy": "new_admin"
+        },
+        {
+          "cmd": "NSS_UDP_ST_STOP_MSG",
+          "handler": "nss_nludp_st_ops_stop",
+          "policy": "new_admin"
+        },
+        {
+          "cmd": "NSS_UDP_ST_TX_CREATE_MSG",
+          "handler": "nss_nludp_st_ops_tx_create",
+          "policy": "new_admin"
+        },
+        {
+          "cmd": "NSS_UDP_ST_TX_DESTROY_MSG",
+          "handler": "nss_nludp_st_ops_tx_destroy",
+          "policy": "new_admin"
+        },
+        {
+          "cmd": "NSS_UDP_ST_TX_UPDATE_RATE_MSG",
+          "handler": "nss_nludp_st_ops_tx_update_rate",
+          "policy": "new_admin"
+        },
+        {
+          "cmd": "NSS_UDP_ST_RX_MODE_SET_MSG",
+          "handler": "nss_nludp_st_ops_rx_mode_set",
+          "policy": "new_admin"
+        },
+        {
+          "cmd": "NSS_UDP_ST_RESET_STATS_MSG",
+          "handler": "nss_nludp_st_ops_reset_stats",
+          "policy": "new_admin"
+        }
+      ]
+    },
+    {
+      "file": "nss_nldynamic_interface.c",
+      "table": "nss_nldynamic_interface_ops",
+      "netnsok": true,
+      "ops": [
+        {
+          "cmd": "NSS_STATS_EVENT_NOTIFY",
+          "handler": "nss_nldynamic_interface_ops_get_stats",
+          "policy": "stats"
+        }
+      ]
+    },
+    {
+      "file": "nss_nll2tpv2.c",
+      "table": "nss_nll2tpv2_ops",
+      "netnsok": true,
+      "ops": [
+        {
+          "cmd": "NSS_STATS_EVENT_NOTIFY",
+          "handler": "nss_nll2tpv2_ops_get_stats",
+          "policy": "stats"
+        }
+      ]
+    },
+    {
+      "file": "nss_nlpptp.c",
+      "table": "nss_nlpptp_ops",
+      "netnsok": true,
+      "ops": [
+        {
+          "cmd": "NSS_STATS_EVENT_NOTIFY",
+          "handler": "nss_nlpptp_ops_get_stats",
+          "policy": "stats"
+        }
+      ]
+    },
+    {
+      "file": "nss_nlwifili.c",
+      "table": "nss_nlwifili_ops",
+      "netnsok": true,
+      "ops": [
+        {
+          "cmd": "NSS_STATS_EVENT_NOTIFY",
+          "handler": "nss_nlwifili_ops_get_stats",
+          "policy": "stats"
+        }
+      ]
+    },
+    {
+      "file": "nss_nlipv6_reasm.c",
+      "table": "nss_nlipv6_reasm_ops",
+      "netnsok": true,
+      "ops": [
+        {
+          "cmd": "NSS_STATS_EVENT_NOTIFY",
+          "handler": "nss_nlipv6_reasm_ops_get_stats",
+          "policy": "stats"
+        }
+      ]
+    },
+    {
+      "file": "nss_nlc2c_rx.c",
+      "table": "nss_nlc2c_rx_ops",
+      "netnsok": true,
+      "ops": [
+        {
+          "cmd": "NSS_STATS_EVENT_NOTIFY",
+          "handler": "nss_nlc2c_rx_ops_get_stats",
+          "policy": "stats"
+        }
+      ]
+    },
+    {
+      "file": "nss_nlethrx.c",
+      "table": "nss_nlethrx_ops",
+      "netnsok": true,
+      "ops": [
+        {
+          "cmd": "NSS_STATS_EVENT_NOTIFY",
+          "handler": "nss_nlethrx_ops_get_stats",
+          "policy": "stats"
+        }
+      ]
+    },
+    {
+      "file": "nss_nlipv4_reasm.c",
+      "table": "nss_nlipv4_reasm_ops",
+      "netnsok": true,
+      "ops": [
+        {
+          "cmd": "NSS_STATS_EVENT_NOTIFY",
+          "handler": "nss_nlipv4_reasm_ops_get_stats",
+          "policy": "stats"
+        }
+      ]
+    },
+    {
+      "file": "nss_nloam.c",
+      "table": "nss_nloam_ops",
+      "netnsok": false,
+      "ops": [
+        {
+          "cmd": "NSS_NLOAM_CMD_NONE",
+          "handler": "nss_nloam_op_none",
+          "policy": "unchanged_dormant"
+        },
+        {
+          "cmd": "NSS_NLOAM_CMD_GET_REQ",
+          "handler": "nss_nloam_op_get_req",
+          "policy": "unchanged_dormant"
+        }
+      ]
+    },
+    {
+      "file": "nss_nledma.c",
+      "table": "nss_nledma_ops",
+      "netnsok": true,
+      "ops": [
+        {
+          "cmd": "NSS_STATS_EVENT_NOTIFY",
+          "handler": "nss_nledma_ops_get_stats",
+          "policy": "stats"
+        }
+      ]
+    },
+    {
+      "file": "nss_nlipv4.c",
+      "table": "nss_nlipv4_ops",
+      "netnsok": true,
+      "ops": [
+        {
+          "cmd": "NSS_IPV4_TX_CREATE_RULE_MSG",
+          "handler": "nss_nlipv4_ops_create_rule",
+          "policy": "existing_admin"
+        },
+        {
+          "cmd": "NSS_IPV4_TX_DESTROY_RULE_MSG",
+          "handler": "nss_nlipv4_ops_destroy_rule",
+          "policy": "existing_admin"
+        }
+      ]
+    },
+    {
+      "file": "nss_nldtls.c",
+      "table": "nss_nldtls_ops",
+      "netnsok": true,
+      "ops": [
+        {
+          "cmd": "NSS_NLDTLS_CMD_TYPE_CREATE_TUN",
+          "handler": "nss_nldtls_ops_create_tun",
+          "policy": "unchanged_dormant"
+        },
+        {
+          "cmd": "NSS_NLDTLS_CMD_TYPE_DESTROY_TUN",
+          "handler": "nss_nldtls_ops_destroy_tun",
+          "policy": "unchanged_dormant"
+        },
+        {
+          "cmd": "NSS_NLDTLS_CMD_TYPE_UPDATE_CONFIG",
+          "handler": "nss_nldtls_ops_update_config",
+          "policy": "unchanged_dormant"
+        },
+        {
+          "cmd": "NSS_NLDTLS_CMD_TYPE_TX_PKTS",
+          "handler": "nss_nldtls_ops_tx_pkts",
+          "policy": "unchanged_dormant"
+        }
+      ]
+    },
+    {
+      "file": "nss_nlmap_t.c",
+      "table": "nss_nlmap_t_ops",
+      "netnsok": true,
+      "ops": [
+        {
+          "cmd": "NSS_STATS_EVENT_NOTIFY",
+          "handler": "nss_nlmap_t_ops_get_stats",
+          "policy": "stats"
+        }
+      ]
+    },
+    {
+      "file": "nss_nlc2c_tx.c",
+      "table": "nss_nlc2c_tx_ops",
+      "netnsok": true,
+      "ops": [
+        {
+          "cmd": "NSS_STATS_EVENT_NOTIFY",
+          "handler": "nss_nlc2c_tx_ops_get_stats",
+          "policy": "stats"
+        }
+      ]
+    },
+    {
+      "file": "nss_nlcapwap.c",
+      "table": "nss_nlcapwap_cmd_ops",
+      "netnsok": true,
+      "ops": [
+        {
+          "cmd": "NSS_NLCAPWAP_CMD_TYPE_CREATE_TUN",
+          "handler": "nss_nlcapwap_ops_create_tun",
+          "policy": "unchanged_dormant"
+        },
+        {
+          "cmd": "NSS_NLCAPWAP_CMD_TYPE_DESTROY_TUN",
+          "handler": "nss_nlcapwap_ops_destroy_tun",
+          "policy": "unchanged_dormant"
+        },
+        {
+          "cmd": "NSS_NLCAPWAP_CMD_TYPE_UPDATE_MTU",
+          "handler": "nss_nlcapwap_ops_update_mtu",
+          "policy": "unchanged_dormant"
+        },
+        {
+          "cmd": "NSS_NLCAPWAP_CMD_TYPE_DTLS",
+          "handler": "nss_nlcapwap_ops_dtls",
+          "policy": "unchanged_dormant"
+        },
+        {
+          "cmd": "NSS_NLCAPWAP_CMD_TYPE_PERF",
+          "handler": "nss_nlcapwap_ops_perf",
+          "policy": "unchanged_dormant"
+        },
+        {
+          "cmd": "NSS_NLCAPWAP_CMD_TYPE_TX_PACKETS",
+          "handler": "nss_nlcapwap_ops_tx_packets",
+          "policy": "unchanged_dormant"
+        },
+        {
+          "cmd": "NSS_NLCAPWAP_CMD_TYPE_META_HEADER",
+          "handler": "nss_nlcapwap_ops_meta_header",
+          "policy": "unchanged_dormant"
+        },
+        {
+          "cmd": "NSS_NLCAPWAP_CMD_TYPE_IP_FLOW",
+          "handler": "nss_nlcapwap_ops_ip_flow",
+          "policy": "unchanged_dormant"
+        },
+        {
+          "cmd": "NSS_NLCAPWAP_CMD_TYPE_KEEPALIVE",
+          "handler": "nss_nlcapwap_ops_keepalive",
+          "policy": "unchanged_dormant"
+        },
+        {
+          "cmd": "NSS_STATS_EVENT_NOTIFY",
+          "handler": "nss_nlcapwap_ops_get_stats",
+          "policy": "stats"
+        }
+      ]
+    },
+    {
+      "file": "nss_nln2h.c",
+      "table": "nss_nln2h_ops",
+      "netnsok": true,
+      "ops": [
+        {
+          "cmd": "NSS_STATS_EVENT_NOTIFY",
+          "handler": "nss_nln2h_ops_get_stats",
+          "policy": "stats"
+        }
+      ]
+    },
+    {
+      "file": "nss_nllso_rx.c",
+      "table": "nss_nllso_rx_ops",
+      "netnsok": true,
+      "ops": [
+        {
+          "cmd": "NSS_STATS_EVENT_NOTIFY",
+          "handler": "nss_nllso_rx_ops_get_stats",
+          "policy": "stats"
+        }
+      ]
+    },
+    {
+      "file": "nss_nlgre_redir_cmd.c",
+      "table": "nss_nlgre_redir_ops",
+      "netnsok": true,
+      "ops": [
+        {
+          "cmd": "NSS_NLGRE_REDIR_CMD_TYPE_CREATE_TUN",
+          "handler": "nss_nlgre_redir_cmd_ops_tun_create",
+          "policy": "new_admin"
+        },
+        {
+          "cmd": "NSS_NLGRE_REDIR_CMD_TYPE_DESTROY_TUN",
+          "handler": "nss_nlgre_redir_cmd_ops_tun_destroy",
+          "policy": "new_admin"
+        },
+        {
+          "cmd": "NSS_NLGRE_REDIR_CMD_TYPE_MAP",
+          "handler": "nss_nlgre_redir_cmd_ops_map",
+          "policy": "new_admin"
+        },
+        {
+          "cmd": "NSS_NLGRE_REDIR_CMD_TYPE_UNMAP",
+          "handler": "nss_nlgre_redir_cmd_ops_unmap",
+          "policy": "new_admin"
+        },
+        {
+          "cmd": "NSS_NLGRE_REDIR_CMD_TYPE_SET_NEXT_HOP",
+          "handler": "nss_nlgre_redir_cmd_ops_set_next",
+          "policy": "new_admin"
+        },
+        {
+          "cmd": "NSS_NLGRE_REDIR_CMD_TYPE_ADD_HASH",
+          "handler": "nss_nlgre_redir_cmd_ops_add_hash",
+          "policy": "new_admin"
+        },
+        {
+          "cmd": "NSS_NLGRE_REDIR_CMD_TYPE_DEL_HASH",
+          "handler": "nss_nlgre_redir_cmd_ops_del_hash",
+          "policy": "new_admin"
+        }
+      ]
+    },
+    {
+      "file": "nss_nlipsec.c",
+      "table": "nss_nlipsec_ops",
+      "netnsok": true,
+      "ops": [
+        {
+          "cmd": "NSS_NLIPSEC_CMD_ADD_TUNNEL",
+          "handler": "nss_nlipsec_op_create_tunnel",
+          "policy": "unchanged_dormant"
+        },
+        {
+          "cmd": "NSS_NLIPSEC_CMD_DEL_TUNNEL",
+          "handler": "nss_nlipsec_op_destroy_tunnel",
+          "policy": "unchanged_dormant"
+        },
+        {
+          "cmd": "NSS_NLIPSEC_CMD_ADD_SA",
+          "handler": "nss_nlipsec_op_add_sa",
+          "policy": "unchanged_dormant"
+        },
+        {
+          "cmd": "NSS_NLIPSEC_CMD_DEL_SA",
+          "handler": "nss_nlipsec_op_delete_sa",
+          "policy": "unchanged_dormant"
+        },
+        {
+          "cmd": "NSS_NLIPSEC_CMD_ADD_FLOW",
+          "handler": "nss_nlipsec_op_add_flow",
+          "policy": "unchanged_dormant"
+        },
+        {
+          "cmd": "NSS_NLIPSEC_CMD_DEL_FLOW",
+          "handler": "nss_nlipsec_op_delete_flow",
+          "policy": "unchanged_dormant"
+        }
+      ]
+    },
+    {
+      "file": "nss_nlipv6.c",
+      "table": "nss_nlipv6_ops",
+      "netnsok": true,
+      "ops": [
+        {
+          "cmd": "NSS_IPV6_TX_CREATE_RULE_MSG",
+          "handler": "nss_nlipv6_ops_create_rule",
+          "policy": "existing_admin"
+        },
+        {
+          "cmd": "NSS_IPV6_TX_DESTROY_RULE_MSG",
+          "handler": "nss_nlipv6_ops_destroy_rule",
+          "policy": "existing_admin"
+        }
+      ]
+    }
+  ],
+  "target_ids": {
+    "NSS_QRFS_MSG_FLOW_ADD": 0,
+    "NSS_QRFS_MSG_FLOW_DELETE": 1,
+    "NSS_UDP_ST_CFG_RULE_MSG": 2,
+    "NSS_UDP_ST_UNCFG_RULE_MSG": 3,
+    "NSS_UDP_ST_START_MSG": 0,
+    "NSS_UDP_ST_STOP_MSG": 1,
+    "NSS_UDP_ST_TX_CREATE_MSG": 5,
+    "NSS_UDP_ST_TX_DESTROY_MSG": 6,
+    "NSS_UDP_ST_TX_UPDATE_RATE_MSG": 8,
+    "NSS_UDP_ST_RX_MODE_SET_MSG": 9,
+    "NSS_UDP_ST_RESET_STATS_MSG": 7,
+    "NSS_NLGRE_REDIR_CMD_TYPE_CREATE_TUN": 1,
+    "NSS_NLGRE_REDIR_CMD_TYPE_DESTROY_TUN": 2,
+    "NSS_NLGRE_REDIR_CMD_TYPE_MAP": 3,
+    "NSS_NLGRE_REDIR_CMD_TYPE_UNMAP": 4,
+    "NSS_NLGRE_REDIR_CMD_TYPE_SET_NEXT_HOP": 5,
+    "NSS_NLGRE_REDIR_CMD_TYPE_ADD_HASH": 6,
+    "NSS_NLGRE_REDIR_CMD_TYPE_DEL_HASH": 7
+  },
+  "linux_sha256": {
+    "net/netlink/genetlink.c": "48ade0f1fda069e30ba13b6c7adda43de82d9202e6b3ef06c6d8d8f356dab7c0",
+    "include/net/genetlink.h": "8d0e268cf11a8cbfff6ee166e47dc7b2c36fc29b55f329666b63914d2207db2d",
+    "include/uapi/linux/genetlink.h": "1f2469ec331c8975e3c9643be7e23f085e1b95bef12b1b5df413d46ade3fc778",
+    "net/netlink/af_netlink.c": "d8bc016a73d8c63662bfe5c4de2081ee7a63a3a47a09bba3f6a16ec8c922e830",
+    "include/net/netlink.h": "c43108f86579b9d0ff285626667437e7d3108df8e118284f65e0c59712e3afb6",
+    "include/linux/netlink.h": "a3306386f5a5a9af16b12a1701dc362d3d3ac6e239b31b1df506ac6448bc88d6",
+    "include/uapi/linux/capability.h": "ca365c79695eda6afe5fccdc37c7ce3f4b3bf6a95420b7a8801dd71f2d494311"
+  }
+}

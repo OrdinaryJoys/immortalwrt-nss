@@ -152,3 +152,116 @@ are extracted, but allocation/MMIO/reset/RX fill are host substitutes.
 Success disposal is fixture-only, not live-teardown validation. Ring geometry,
 IRQ/NAPI policy, firmware ownership, B-DP-002/003 and hardware DMA quiescence
 remain unchanged and unqualified. Earlier fixture failures remain evidence.
+
+## Item 4: NSS mutating netlink operation permission gate
+
+Patch 025 adds GENL_ADMIN_PERM to exactly 18 existing QRFS, GRE-redirect and
+UDP-ST operations, retaining command numbers, handlers and namespace settings.
+The four existing IPv4/IPv6 admin gates and 15 actual stats no-op handlers are
+unchanged. Linux 6.18.38 actual full-to-split flag propagation and dispatch
+checks were inspected and extracted: ADMIN requires initial-user-namespace
+CAP_NET_ADMIN, not merely the child's own namespace capability. NETLINK_SKB_DST
+can bypass the socket-file check, never the current sender capability check.
+
+All 23 actual op tables (58 entries), exact headers/enums and seven selected
+Linux functions feed the host regression. Clang ordinary, Clang ASan/UBSan and
+GCC ordinary each passed 1856 positive cases and 4234 checks. The actual
+baseline and 40 targeted runtime variants are rejected per compiler; most
+flag variants use runtime table mutation, not separate source recompilation.
+The independent scoped review found no blocker in the exact 18 additions.
+
+This is not an all-family payload or permission hardening claim. The remaining
+21 unchanged dormant/query entries include 19 mutation-capable CAPWAP, DTLS
+and IPsec entries plus two OAM entries. Current package selections gate their
+registration; alternate enablement requires another permission/payload audit.
+Credential masks, reduced family/header parsing and non-stats handlers are
+host substitutes. Real sockets, LSM, registration, final configuration, NSS
+payload/lifetime and MCS remain unverified. Do not enable dormant families on
+the strength of this 18-operation repair.
+
+## Full-stack integration finding: QMI 939 stale context
+
+A fresh complete mac80211 patch replay, rather than the earlier selected-file
+fixtures, rejected the target_mem memset hunk in 939. Patch 938 had already
+inserted callback-lock initialization after qmi.ab; 939 still required the old
+blank line and target_mem_mode context there. The array-clear change itself
+was intentional and remains identical. Only that hunk's position/context was
+refreshed; all ordered added/removed code lines remain unchanged. No QMI
+lifecycle logic or timing was changed to make patch application pass.
+
+The corrected full replay applies 16 SSDK, 18 ECM and 303 mac80211 patches.
+Saved logs contain no fuzz/offset/failure marker. This is textual integration
+only. It does not validate full kernel compilation, QMI_FAIL cleanup, firmware
+handle lifetime or the already-open callback/event-drain contracts.
+
+The existing NSS init ownership fixture must track the new opaque registration
+API and actual registry structure. Its provider-loss hook observes publication,
+not an assumption that every registration acquires the legacy global lock.
+Legacy netdevice and opaque registrations are both counted; the pre-existing
+foreign-interface, failure, retry and DMA-zero assertions are retained.
+
+## Next repair batches and stop conditions
+
+### MCS A03: input, output and nested consumers as one protocol
+
+The command ledger covers all 22 inbound commands and outbound event 100.
+Before implementation, confirm native 36-byte private-header ABI and real
+userspace callers, especially fixed SET requests with buf_len=0. Validate the
+actual nlmsg length before any private-field access, every fixed/array payload,
+nested source counts and output item capacity before side effects. Do not
+add sleeping allocations under the current receive-side RCU critical section.
+Use trusted sender capability/portid, not a supplied nlmsg_pid, and initialize
+all response/event bytes. Preserve event/group command semantics and native
+control-field endianness rather than inventing a new protocol.
+
+Include adjacent actual defects: full MLD ACL update must select the matched
+index, deletion uses overlapping ranges, IPv6 source translation confuses byte
+size with source count, and GET item serialization has its own source bound.
+Length-only or capability-only changes cannot close this group. Required
+fixtures cover each command with short/exact/oversized input, nested counts,
+full-table update, overlap deletion, allocation/ref/RCU ownership and poisoned
+output. Real transport/framework behavior remains a later target gate.
+
+### EDMA B-DP-002/003: shared lifetime and slot ownership
+
+Probe abort can retain a failed netdevice in the registry and leave shared
+NAPI attached to its first provisional owner. Inventory every registry reader,
+NAPI/IRQ owner and SSDK notifier before defining a stable shared owner and
+reader drain. A NULL write is not a drain, and a netdev reference alone is not
+NAPI lifetime. Failure paths must not reuse NSS takeover/final module teardown.
+
+For TX, both producers and both completion/cleanup routes must use one skb/DMA
+slot protocol. Capture/retire the pair before advertising a slot reusable, and
+specify lock/order and streaming-DMA ownership for wrap and teardown. A producer
+lock that completion never takes or a single read reorder is insufficient.
+Use extracted functions and forced interleavings before changing packet-path
+code. Performance cost of a proposed common lock must later be measured; no
+ring/IRQ/budget tuning is authorized here.
+
+### Wi-Fi ABI, dispatch and firmware lifetime
+
+Treat MU-EDCA command/attribute mismatch and global event dispatch together.
+Current kernel 160/346 collides with standard hostapd allocations; its local
+extension is 161/351. A same-image paired allocation is a candidate, not an
+upstream reservation. Check both actual headers/policies and the global MLME
+socket dispatch, strict payload size and one update per radio/interface across
+multiple BSSes. Do not merely add the case to every BSS or change one enum.
+
+Opaque host context repair does not supply firmware reply identity or drain.
+STOP/PDEV_DEINIT/RESET timeout, late replies, descriptor release and QMI_FAIL
+resource cleanup require separate request/session and DMA-quiescence contracts.
+Keep UNKNOWN when firmware status is unknown; no stack callback data, forced
+timeout free or assumed cancellation is an acceptable shortcut.
+
+### Uncovered and later validation
+
+A06/A07 management parsers and A08 firmware-version search need complete
+input/read/offset/error contracts, not mechanical copy_from_user replacement.
+DP bridge/VLAN/VSI, topology helpers, stats epoch, SSDK bounds, IGS/CLEAR/N2H,
+SQM, rpcd/LuCI, DNS/TUN/backup and other records in the original coverage ledger
+remain open. Inventory/parser coverage is not line-by-line semantic review.
+
+After reviewed source commits, separately update the build input lock, patch
+manifest and future CI test wiring. The frozen old build repository must not
+be used as if it already contains this batch. No cloud dispatch, target build,
+artifact/runtime qualification or performance claim is obtained in this round.

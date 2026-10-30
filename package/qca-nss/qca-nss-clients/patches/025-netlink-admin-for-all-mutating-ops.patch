@@ -1,0 +1,76 @@
+From: AX6 local review
+Subject: [PATCH] netlink: require global admin for all mutating controls
+
+QRFS, GRE redirect and UDP speed-test control shared NSS resources.
+Require the same initial-user-namespace CAP_NET_ADMIN permission as
+IPv4/IPv6 rule injection. Leave stats and notification operations alone.
+
+--- a/netlink/nss_nlqrfs.c
++++ b/netlink/nss_nlqrfs.c
+@@ -56,10 +56,10 @@
+ /*
+  * operation table called by the generic netlink layer based on the command
+  */
+ static struct genl_ops nss_nlqrfs_ops[] = {
+-	{.cmd = NSS_QRFS_MSG_FLOW_ADD, .doit = nss_nlqrfs_ops_add_rule,},
++	{.cmd = NSS_QRFS_MSG_FLOW_ADD, .doit = nss_nlqrfs_ops_add_rule, .flags = GENL_ADMIN_PERM,},
+-	{.cmd = NSS_QRFS_MSG_FLOW_DELETE, .doit = nss_nlqrfs_ops_del_rule,},
++	{.cmd = NSS_QRFS_MSG_FLOW_DELETE, .doit = nss_nlqrfs_ops_del_rule, .flags = GENL_ADMIN_PERM,},
+ };
+ 
+ /*
+  * qrfs family definition
+--- a/netlink/nss_nlgre_redir_cmd.c
++++ b/netlink/nss_nlgre_redir_cmd.c
+@@ -65,15 +65,15 @@
+  * nss_nlgre_redir_ops
+  * 	Operation table called by the generic netlink layer based on the command
+  */
+ static struct genl_ops nss_nlgre_redir_ops[] = {
+-	{.cmd = NSS_NLGRE_REDIR_CMD_TYPE_CREATE_TUN, .doit = nss_nlgre_redir_cmd_ops_tun_create,},
++	{.cmd = NSS_NLGRE_REDIR_CMD_TYPE_CREATE_TUN, .doit = nss_nlgre_redir_cmd_ops_tun_create, .flags = GENL_ADMIN_PERM,},
+-	{.cmd = NSS_NLGRE_REDIR_CMD_TYPE_DESTROY_TUN, .doit = nss_nlgre_redir_cmd_ops_tun_destroy,},
++	{.cmd = NSS_NLGRE_REDIR_CMD_TYPE_DESTROY_TUN, .doit = nss_nlgre_redir_cmd_ops_tun_destroy, .flags = GENL_ADMIN_PERM,},
+-	{.cmd = NSS_NLGRE_REDIR_CMD_TYPE_MAP, .doit = nss_nlgre_redir_cmd_ops_map,},
++	{.cmd = NSS_NLGRE_REDIR_CMD_TYPE_MAP, .doit = nss_nlgre_redir_cmd_ops_map, .flags = GENL_ADMIN_PERM,},
+-	{.cmd = NSS_NLGRE_REDIR_CMD_TYPE_UNMAP, .doit = nss_nlgre_redir_cmd_ops_unmap,},
++	{.cmd = NSS_NLGRE_REDIR_CMD_TYPE_UNMAP, .doit = nss_nlgre_redir_cmd_ops_unmap, .flags = GENL_ADMIN_PERM,},
+-	{.cmd = NSS_NLGRE_REDIR_CMD_TYPE_SET_NEXT_HOP, .doit = nss_nlgre_redir_cmd_ops_set_next,},
++	{.cmd = NSS_NLGRE_REDIR_CMD_TYPE_SET_NEXT_HOP, .doit = nss_nlgre_redir_cmd_ops_set_next, .flags = GENL_ADMIN_PERM,},
+-	{.cmd = NSS_NLGRE_REDIR_CMD_TYPE_ADD_HASH, .doit = nss_nlgre_redir_cmd_ops_add_hash,},
++	{.cmd = NSS_NLGRE_REDIR_CMD_TYPE_ADD_HASH, .doit = nss_nlgre_redir_cmd_ops_add_hash, .flags = GENL_ADMIN_PERM,},
+-	{.cmd = NSS_NLGRE_REDIR_CMD_TYPE_DEL_HASH, .doit = nss_nlgre_redir_cmd_ops_del_hash,},
++	{.cmd = NSS_NLGRE_REDIR_CMD_TYPE_DEL_HASH, .doit = nss_nlgre_redir_cmd_ops_del_hash, .flags = GENL_ADMIN_PERM,},
+ };
+ 
+ /*
+  * nss_nlgre_redir_cmd_family
+--- a/netlink/nss_nludp_st.c
++++ b/netlink/nss_nludp_st.c
+@@ -72,17 +72,17 @@
+ /*
+  * operation table called by the generic netlink layer based on the command
+  */
+ static struct genl_ops nss_nludp_st_ops[] = {
+-	{.cmd = NSS_UDP_ST_CFG_RULE_MSG, .doit = nss_nludp_st_ops_cfg_rule,},
++	{.cmd = NSS_UDP_ST_CFG_RULE_MSG, .doit = nss_nludp_st_ops_cfg_rule, .flags = GENL_ADMIN_PERM,},
+-	{.cmd = NSS_UDP_ST_UNCFG_RULE_MSG, .doit = nss_nludp_st_ops_uncfg_rule,},
++	{.cmd = NSS_UDP_ST_UNCFG_RULE_MSG, .doit = nss_nludp_st_ops_uncfg_rule, .flags = GENL_ADMIN_PERM,},
+-	{.cmd = NSS_UDP_ST_START_MSG, .doit = nss_nludp_st_ops_start,},
++	{.cmd = NSS_UDP_ST_START_MSG, .doit = nss_nludp_st_ops_start, .flags = GENL_ADMIN_PERM,},
+-	{.cmd = NSS_UDP_ST_STOP_MSG, .doit = nss_nludp_st_ops_stop,},
++	{.cmd = NSS_UDP_ST_STOP_MSG, .doit = nss_nludp_st_ops_stop, .flags = GENL_ADMIN_PERM,},
+-	{.cmd = NSS_UDP_ST_TX_CREATE_MSG, .doit = nss_nludp_st_ops_tx_create,},
++	{.cmd = NSS_UDP_ST_TX_CREATE_MSG, .doit = nss_nludp_st_ops_tx_create, .flags = GENL_ADMIN_PERM,},
+-	{.cmd = NSS_UDP_ST_TX_DESTROY_MSG, .doit = nss_nludp_st_ops_tx_destroy,},
++	{.cmd = NSS_UDP_ST_TX_DESTROY_MSG, .doit = nss_nludp_st_ops_tx_destroy, .flags = GENL_ADMIN_PERM,},
+-	{.cmd = NSS_UDP_ST_TX_UPDATE_RATE_MSG, .doit = nss_nludp_st_ops_tx_update_rate,},
++	{.cmd = NSS_UDP_ST_TX_UPDATE_RATE_MSG, .doit = nss_nludp_st_ops_tx_update_rate, .flags = GENL_ADMIN_PERM,},
+-	{.cmd = NSS_UDP_ST_RX_MODE_SET_MSG, .doit = nss_nludp_st_ops_rx_mode_set,},
++	{.cmd = NSS_UDP_ST_RX_MODE_SET_MSG, .doit = nss_nludp_st_ops_rx_mode_set, .flags = GENL_ADMIN_PERM,},
+-	{.cmd = NSS_UDP_ST_RESET_STATS_MSG, .doit = nss_nludp_st_ops_reset_stats,},
++	{.cmd = NSS_UDP_ST_RESET_STATS_MSG, .doit = nss_nludp_st_ops_reset_stats, .flags = GENL_ADMIN_PERM,},
+ };
+ 
+ /*
+  * udp_st family definition
