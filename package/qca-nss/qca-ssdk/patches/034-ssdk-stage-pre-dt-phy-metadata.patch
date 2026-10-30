@@ -1,0 +1,234 @@
+--- a/include/hsl/phy/hsl_phy.h
++++ b/include/hsl/phy/hsl_phy.h
+@@ -652,6 +652,9 @@
+ 
+ int ssdk_phy_driver_init(a_uint32_t dev_id);
+ 
++int qca_ssdk_phy_info_prepare(phy_info_t **prepared, a_uint32_t *bitmap);
++int qca_ssdk_phy_info_publish(phy_info_t **prepared,
++		const a_uint32_t *bitmaps, a_uint32_t dev_num);
+ int qca_ssdk_phy_info_init(a_uint32_t dev_id);
+ 
+ void qca_ssdk_port_bmp_init(a_uint32_t dev_id);
+--- a/src/hsl/phy/hsl_phy.c
++++ b/src/hsl/phy/hsl_phy.c
+@@ -286,7 +286,8 @@
+ static qca808x_phy_info_t qca808x_phy_info[] = {
+ 	{5,0x7c,PHY_I2C_ACCESS}
+ };
+-static int qca_ssdk_qca808x_phy_info_init(a_uint32_t dev_id)
++static void qca_ssdk_qca808x_phy_info_prepare(phy_info_t *information,
++		a_uint32_t *bitmap)
+ {
+ 	a_uint32_t port_bmp = 0, port_id = 0, port_index = 0, port_index_max = 0;
+ 
+@@ -295,51 +296,106 @@
+ 		port_id = qca808x_phy_info[port_index].port_id;
+ 		port_bmp |= (1 << port_id);
+ 		/*qca808x phy address*/
+-		phy_info[dev_id]->phy_address[port_id] =
++		information->phy_address[port_id] =
+ 			qca808x_phy_info[port_index].phy_address;
+ 		/*qca808x access mode, 1:i2c, 0:mdio*/
+ 		if(qca808x_phy_info[port_index].phy_access_type == PHY_I2C_ACCESS)
+-			hsl_port_feature_set(dev_id, port_id, PHY_F_I2C);
++			information->phy_features[port_id] |= PHY_F_I2C;
+ 		else
+-			hsl_port_feature_clear(dev_id, port_id, PHY_F_I2C);
++			information->phy_features[port_id] &= ~PHY_F_I2C;
+ 	}
+-	qca_ssdk_port_bmp_set(dev_id, port_bmp);
+-
+-	return 0;
++	*bitmap = port_bmp;
+ }
+ #endif
+ 
+-int qca_ssdk_phy_info_init(a_uint32_t dev_id)
++int qca_ssdk_phy_info_prepare(phy_info_t **prepared, a_uint32_t *bitmap)
+ {
+ 	a_uint32_t j = 0;
++	a_uint32_t prepared_bitmap;
+ 	phy_info_t *phy_information;
+ 
++	if (!prepared || !bitmap)
++		return -EINVAL;
++	if (*prepared)
++		return -EBUSY;
++	prepared_bitmap = *bitmap;
++
+ 	phy_information = kzalloc(sizeof(phy_info_t), GFP_KERNEL);
+ 	if (phy_information == NULL) {
+ 		SSDK_ERROR("phy_information kzalloc failed!\n");
+ 		return -ENOMEM;
+ 	}
+ 	memset(phy_information, 0, sizeof(*phy_information));
+-	phy_info[dev_id] = phy_information;
+ 
+ 	for (j = SSDK_PHYSICAL_PORT0; j < SW_MAX_NR_PORT; j ++)
+ 	{
+-		phy_info[dev_id]->phy_type[j] = MAX_PHY_CHIP;
+-		phy_info[dev_id]->port_link_status[j] = PORT_LINK_DOWN;
+-		phy_info[dev_id]->port_mode[j] = PORT_INTERFACE_MODE_MAX;
++		phy_information->phy_type[j] = MAX_PHY_CHIP;
++		phy_information->port_link_status[j] = PORT_LINK_DOWN;
++		phy_information->port_mode[j] = PORT_INTERFACE_MODE_MAX;
+ 		if(j == SSDK_PHYSICAL_PORT0)
+ 		{
+-			phy_info[dev_id]->phy_address[j] = INVALID_PHY_ADDR;
++			phy_information->phy_address[j] = INVALID_PHY_ADDR;
+ 		}
+ 		else
+ 		{
+-			phy_info[dev_id]->phy_address[j] = j - 1;
++			phy_information->phy_address[j] = j - 1;
+ 		}
+ 	}
+ #ifdef QCA808X_PORTS_INFO
+-	qca_ssdk_qca808x_phy_info_init(dev_id);
++	qca_ssdk_qca808x_phy_info_prepare(phy_information, &prepared_bitmap);
+ #endif
++
++	*prepared = phy_information;
++	*bitmap = prepared_bitmap;
++	return 0;
++}
++
++/* Fresh pre-DT root only: consumers must not yet be admitted. */
++int qca_ssdk_phy_info_publish(phy_info_t **prepared,
++		const a_uint32_t *bitmaps, a_uint32_t dev_num)
++{
++	a_uint32_t i, j;
++
++	if (!prepared || !bitmaps || dev_num > SW_MAX_NR_DEV)
++		return -EINVAL;
++	for (i = 0; i < SW_MAX_NR_DEV; i++)
++		if (phy_info[i])
++			return -EBUSY;
++	for (i = 0; i < dev_num; i++) {
++		if (!prepared[i])
++			return -EINVAL;
++		for (j = 0; j < i; j++)
++			if (prepared[i] == prepared[j])
++				return -EINVAL;
++	}
++
++	/* No fallible operation follows the first ownership transfer. */
++	for (i = 0; i < dev_num; i++) {
++		port_bmp[i] = bitmaps[i];
++		phy_info[i] = prepared[i];
++		prepared[i] = NULL;
++	}
++	return 0;
++}
++
++int qca_ssdk_phy_info_init(a_uint32_t dev_id)
++{
++	phy_info_t *prepared = NULL;
++	a_uint32_t bitmap;
++	int rv;
++
++	if (dev_id >= SW_MAX_NR_DEV)
++		return -EINVAL;
++	if (phy_info[dev_id])
++		return -EBUSY;
++	bitmap = port_bmp[dev_id];
++	rv = qca_ssdk_phy_info_prepare(&prepared, &bitmap);
++	if (rv)
++		return rv;
+ 
++	/* Compatibility entry for serialized initialization of an empty slot. */
++	port_bmp[dev_id] = bitmap;
++	phy_info[dev_id] = prepared;
+ 	return 0;
+ }
+ void qca_ssdk_port_bmp_init(a_uint32_t dev_id)
+--- a/src/init/ssdk_init.c
++++ b/src/init/ssdk_init.c
+@@ -2037,29 +2037,55 @@
+ 
+ static int ssdk_alloc_priv(a_uint32_t dev_num)
+ {
+-	int rev = SW_OK;
+-	a_uint32_t dev_id = 0;
++	struct qca_phy_priv **prepared;
++	phy_info_t *metadata[SW_MAX_NR_DEV] = { NULL };
++	a_uint32_t bitmaps[SW_MAX_NR_DEV] = { 0 };
++	a_uint32_t dev_id;
++	int rv;
+ 
+-	qca_phy_priv_global = kzalloc(dev_num * sizeof(struct qca_phy_priv *), GFP_KERNEL);
+-	if (qca_phy_priv_global == NULL) {
++	if (dev_num > SW_MAX_NR_DEV)
++		return -EINVAL;
++	if (qca_phy_priv_global)
++		return -EBUSY;
++	prepared = kcalloc(dev_num, sizeof(*prepared), GFP_KERNEL);
++	if (!prepared)
+ 		return -ENOMEM;
+-	}
+ 
+ 	for (dev_id = 0; dev_id < dev_num; dev_id++) {
+-		qca_phy_priv_global[dev_id] = kzalloc(sizeof(struct qca_phy_priv), GFP_KERNEL);
+-		if (qca_phy_priv_global[dev_id] == NULL) {
+-			return -ENOMEM;
++		prepared[dev_id] = kzalloc(sizeof(*prepared[dev_id]), GFP_KERNEL);
++		if (!prepared[dev_id]) {
++			rv = -ENOMEM;
++			goto abort;
+ 		}
++		bitmaps[dev_id] = 0x3e;
++		rv = qca_ssdk_phy_info_prepare(&metadata[dev_id], &bitmaps[dev_id]);
++		if (rv)
++			goto abort;
+ /*qca808x_end*/
+-		qca_phy_priv_global[dev_id]->qca_ssdk_sw_dev_registered = A_FALSE;
+-		qca_fdb_sw_sync_work_setup(qca_phy_priv_global[dev_id]);
+-		qca_intr_work_init(qca_phy_priv_global[dev_id]);
+-/*qca808x_start*/
+-		qca_ssdk_port_bmp_init(dev_id);
+-		qca_ssdk_phy_info_init(dev_id);
++		prepared[dev_id]->qca_ssdk_sw_dev_registered = A_FALSE;
++		qca_fdb_sw_sync_work_setup(prepared[dev_id]);
++		qca_intr_work_init(prepared[dev_id]);
++/*qca808x_start*/
+ 	}
+ 
+-	return rev;
++	if (qca_phy_priv_global) {
++		rv = -EBUSY;
++		goto abort;
++	}
++	rv = qca_ssdk_phy_info_publish(metadata, bitmaps, dev_num);
++	if (rv)
++		goto abort;
++	qca_phy_priv_global = prepared;
++	return 0;
++
++abort:
++	for (dev_id = dev_num; dev_id; ) {
++		dev_id--;
++		kfree(metadata[dev_id]);
++		kfree(prepared[dev_id]);
++	}
++	kfree(prepared);
++	return rv;
+ }
+ 
+ #ifndef SSDK_STR
+@@ -2126,8 +2152,13 @@
+ 	dev_num = ssdk_switch_device_num_get();
+ /*qca808x_start*/
+ 	rv = ssdk_alloc_priv(dev_num);
+-	if (rv)
+-		goto out;
++	if (rv) {
++/*qca808x_end*/
++		/* Only this invocation's topology was acquired before allocation. */
++		ssdk_switch_device_num_exit();
++/*qca808x_start*/
++		return rv;
++	}
+ 
+ 	for (num = 0; num < dev_num; num++) {
+ 		ssdk_cfg_default_init(&cfg);
