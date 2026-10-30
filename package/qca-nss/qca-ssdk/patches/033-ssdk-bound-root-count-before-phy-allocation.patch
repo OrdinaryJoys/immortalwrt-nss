@@ -1,0 +1,12 @@
+--- a/src/init/ssdk_dts.c
++++ b/src/init/ssdk_dts.c
+@@ -1625,6 +1625,9 @@
+ 			return ret;
+ 	}
+ 
++	if (dev_num > SW_MAX_NR_DEV)
++		return -EINVAL;
++
+ 	nodes = kcalloc(dev_num, sizeof(*nodes), GFP_KERNEL);
+ 	if (!nodes)
+ 		return -ENOMEM;
