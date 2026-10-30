@@ -1,0 +1,226 @@
+From: OpenWrt Build System <openwrt@localhost>
+Subject: [PATCH] edma-v1: transfer TX mapping ownership as one locked tuple
+
+Use a shared producer/slot lock across the global opaque index namespace.
+Take skb, DMA handle, exact map length and host ring owner together before
+reusing a slot; unmap and free only the detached local tuple. Keep the
+existing TXDESC/TXCMPL reclamation ranges and hardware publication ABI.
+This does not establish DMA idle or completion generation semantics.
+
+diff --git a/hal/dp_ops/edma_dp/edma_v1/edma_data_plane.h b/hal/dp_ops/edma_dp/edma_v1/edma_data_plane.h
+--- a/hal/dp_ops/edma_dp/edma_v1/edma_data_plane.h
++++ b/hal/dp_ops/edma_dp/edma_v1/edma_data_plane.h
+@@ -167,6 +167,13 @@
+ 	EDMA_TX_FAIL = 2,	/* Tx failure */
+ };
+ 
++struct edma_tx_slot {
++	struct sk_buff *skb;
++	dma_addr_t dma;
++	size_t len;
++	uint32_t txdesc_id;
++};
++
+ /*
+  * EDMA private data structure
+  */
+@@ -204,8 +211,8 @@
+ 	 * Store for tx and rx skbs
+ 	 */
+ 	struct sk_buff *rx_skb_store[EDMA_RING_SIZE];
+-	struct sk_buff *tx_skb_store[EDMA_RING_SIZE];
+-	dma_addr_t tx_dma_store[EDMA_RING_SIZE];
++	struct edma_tx_slot tx_slots[EDMA_RING_SIZE];
++	spinlock_t tx_slot_lock;
+ 
+ 	struct edma_rxfill_ring *rxfill_ring;
+ 			/* Rx Fill Ring, SW is producer */
+@@ -280,6 +287,8 @@
+ 			    struct edma_txdesc_ring *txdesc_ring);
+ uint32_t edma_clean_tx(struct edma_hw *ehw,
+ 			struct edma_txcmpl_ring *txcmpl_ring);
++bool edma_tx_slot_take(struct edma_hw *ehw, int index,
++		const struct edma_txdesc_ring *owner, struct edma_tx_slot *slot);
+ irqreturn_t edma_handle_irq(int irq, void *ctx);
+ irqreturn_t edma_handle_misc_irq(int irq, void *ctx);
+ int edma_napi(struct napi_struct *napi, int budget);
+diff --git a/hal/dp_ops/edma_dp/edma_v1/edma_tx_rx.c b/hal/dp_ops/edma_dp/edma_v1/edma_tx_rx.c
+--- a/hal/dp_ops/edma_dp/edma_v1/edma_tx_rx.c
++++ b/hal/dp_ops/edma_dp/edma_v1/edma_tx_rx.c
+@@ -131,6 +131,26 @@
+ 	return num_alloc;
+ }
+ 
++/* Take the whole mapping before exposing an empty slot to any producer. */
++bool edma_tx_slot_take(struct edma_hw *ehw, int index,
++		const struct edma_txdesc_ring *owner, struct edma_tx_slot *slot)
++{
++	bool taken = false;
++
++	if (unlikely(index < 0 || index >= EDMA_RING_SIZE))
++		return false;
++
++	spin_lock_bh(&ehw->tx_slot_lock);
++	if (ehw->tx_slots[index].skb &&
++			(!owner || ehw->tx_slots[index].txdesc_id == owner->id)) {
++		*slot = ehw->tx_slots[index];
++		memset(&ehw->tx_slots[index], 0, sizeof(ehw->tx_slots[index]));
++		taken = true;
++	}
++	spin_unlock_bh(&ehw->tx_slot_lock);
++	return taken;
++}
++
+ /*
+  * edma_clean_tx()
+  *	Reap Tx descriptors
+@@ -144,10 +164,8 @@
+ 	uint16_t cons_idx = 0;
+ 	uint32_t data = 0;
+ 	uint32_t txcmpl_consumed = 0;
+-	struct sk_buff *skb;
+-	uint32_t len;
++	struct edma_tx_slot slot;
+ 	int store_index;
+-	dma_addr_t daddr;
+ 
+ 	/*
+ 	 * Get TXCMPL ring producer index
+@@ -176,24 +194,18 @@
+ 					store_index, cons_idx, prod_idx);
+ 			goto next_txcmpl_desc;
+ 		}
+-		skb = ehw->tx_skb_store[store_index];
+-		ehw->tx_skb_store[store_index] = NULL;
+-		daddr = ehw->tx_dma_store[store_index];
+-		ehw->tx_dma_store[store_index] = 0;
+-
+-		if (unlikely(!skb)) {
++		if (unlikely(!edma_tx_slot_take(ehw, store_index, NULL, &slot))) {
+ 			pr_warn_ratelimited("Invalid skb: cons_idx:%u prod_idx:%u status %x\n",
+ 				  cons_idx, prod_idx, txcmpl->status);
+ 			goto next_txcmpl_desc;
+ 		}
+ 
+-		len = skb_headlen(skb);
+-		pr_debug("skb:%px cons_idx:%d prod_idx:%d word1:0x%x\n",
+-			   skb, cons_idx, prod_idx, txcmpl->status);
++		pr_debug("skb:%px cons_idx:%d prod_idx:%d word1:0x%x\n",
++			   slot.skb, cons_idx, prod_idx, txcmpl->status);
+ 
+-		dma_unmap_single(&pdev->dev, daddr,
+-				 len, DMA_TO_DEVICE);
+-		dev_kfree_skb_any(skb);
++		dma_unmap_single(&pdev->dev, slot.dma,
++				 slot.len, DMA_TO_DEVICE);
++		dev_kfree_skb_any(slot.skb);
+ 
+ next_txcmpl_desc:
+ 		if (++cons_idx == txcmpl_ring->count)
+@@ -540,7 +552,7 @@
+ 	/*
+ 	 * TODO - revisit locking
+ 	 */
+-	spin_lock_bh(&txdesc_ring->tx_lock);
++	spin_lock_bh(&ehw->tx_slot_lock);
+ 
+ 	/*
+ 	 * Read TXDESC ring producer index
+@@ -563,13 +575,13 @@
+ 	chk_idx = (hw_next_to_use + 1) & (txdesc_ring->count-1);
+ 
+ 	if (chk_idx == hw_next_to_clean) {
+-		spin_unlock_bh(&txdesc_ring->tx_lock);
++		spin_unlock_bh(&ehw->tx_slot_lock);
+ 		return EDMA_TX_DESC;
+ 	}
+ 
+ 	store_index = hw_next_to_use & (txdesc_ring->count - 1);
+-	if (unlikely(ehw->tx_skb_store[store_index] != NULL)) {
+-		spin_unlock_bh(&txdesc_ring->tx_lock);
++	if (unlikely(ehw->tx_slots[store_index].skb != NULL)) {
++		spin_unlock_bh(&ehw->tx_slot_lock);
+ 		return EDMA_TX_DESC;
+ 	}
+ 
+@@ -586,7 +598,7 @@
+ 		if (skb_padto(skb, EDMA_TX_PKT_MIN_SIZE)) {
+ 			netdev_dbg(netdev, "padding couldn't happen, skb is freed.\n");
+ 			netdev->stats.tx_dropped++;
+-			spin_unlock_bh(&txdesc_ring->tx_lock);
++			spin_unlock_bh(&ehw->tx_slot_lock);
+ 			return EDMA_TX_OK;
+ 		}
+ 		skb->len = EDMA_TX_PKT_MIN_SIZE;
+@@ -633,12 +645,14 @@
+ 		 * and make sure does not got to stack again
+ 		 */
+ 		dev_kfree_skb_any(skb);
+-		spin_unlock_bh(&txdesc_ring->tx_lock);
++		spin_unlock_bh(&ehw->tx_slot_lock);
+ 		return EDMA_TX_OK;
+ 	}
+ 	txdesc->buffer_addr = cpu_to_le32(dma_addr);
+-	ehw->tx_skb_store[store_index] = skb;
+-	ehw->tx_dma_store[store_index] = dma_addr;
++	ehw->tx_slots[store_index].skb = skb;
++	ehw->tx_slots[store_index].dma = dma_addr;
++	ehw->tx_slots[store_index].len = buf_len + EDMA_TX_PREHDR_SIZE;
++	ehw->tx_slots[store_index].txdesc_id = txdesc_ring->id;
+ 
+ 	/*
+ 	 * Populate Tx descriptor
+@@ -667,7 +681,7 @@
+ 
+ 	edma_reg_write(EDMA_REG_TXDESC_PROD_IDX(txdesc_ring->id),
+ 		       hw_next_to_use & EDMA_TXDESC_PROD_IDX_MASK);
+-	spin_unlock_bh(&txdesc_ring->tx_lock);
++	spin_unlock_bh(&ehw->tx_slot_lock);
+ 	return EDMA_TX_OK;
+ }
+ 
+diff --git a/hal/dp_ops/edma_dp/edma_v1/edma_cfg.c b/hal/dp_ops/edma_dp/edma_v1/edma_cfg.c
+--- a/hal/dp_ops/edma_dp/edma_v1/edma_cfg.c
++++ b/hal/dp_ops/edma_dp/edma_v1/edma_cfg.c
+@@ -265,7 +265,7 @@
+ 				struct edma_txdesc_ring *txdesc_ring)
+ {
+ 	struct platform_device *pdev = ehw->pdev;
+-	struct sk_buff *skb = NULL;
++	struct edma_tx_slot slot;
+ 	uint16_t prod_idx, cons_idx;
+ 	uint32_t data;
+ 	int store_idx;
+@@ -281,15 +281,10 @@
+ 
+ 	while (cons_idx != prod_idx) {
+ 		store_idx = cons_idx;
+-		skb = ehw->tx_skb_store[store_idx];
+-		ehw->tx_skb_store[store_idx] = NULL;
+-
+-		if (skb) {
+-			dma_unmap_single(&pdev->dev,
+-					ehw->tx_dma_store[store_idx],
+-					skb_headlen(skb), DMA_TO_DEVICE);
+-			ehw->tx_dma_store[store_idx] = 0;
+-			dev_kfree_skb_any(skb);
++		if (edma_tx_slot_take(ehw, store_idx, txdesc_ring, &slot)) {
++			dma_unmap_single(&pdev->dev, slot.dma,
++					slot.len, DMA_TO_DEVICE);
++			dev_kfree_skb_any(slot.skb);
+ 		}
+ 
+ 		cons_idx++;
+@@ -716,10 +711,10 @@
+ 	/*
+ 	 * Initialize the store
+ 	 */
++	spin_lock_init(&ehw->tx_slot_lock);
++	memset(ehw->tx_slots, 0, sizeof(ehw->tx_slots));
+ 	for (i = 0; i < EDMA_RING_SIZE; i++) {
+-		ehw->tx_skb_store[i] = NULL;
+ 		ehw->rx_skb_store[i] = NULL;
+-		ehw->tx_dma_store[i] = 0;
+ 	}
+ 
+ 	/*

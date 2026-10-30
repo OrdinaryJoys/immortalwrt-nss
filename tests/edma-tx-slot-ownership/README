@@ -1,0 +1,81 @@
+EDMA v1 TX tuple ownership host fixture
+=====================================
+
+Only patch 014 and this new test are covered. No make, target/module/firmware
+build, device access or performance measurement is performed. The runner
+uses a supplied local Git cache, exact d8f802f08fd8ff31057ba58edb20bbe448e7b505,
+and freshly replays current patches 001-013 plus 014. Existing audit programs
+are neither imported nor executed. A new EDMA-TX-* output directory is
+required; all failed preparation, compile and run evidence is retained.
+
+Example commands, from the source checkout:
+
+/usr/bin/python3 tests/test-edma-tx-slot-ownership.py --upstream-cache /Volumes/FX-MD87/Review-AX6/upstreams/nss/qca-nss-dp --output /Volumes/FX-MD87/Review-AX6/audits/20261030/core-risk-phase2/EDMA-TX-gcc-final --compiler /opt/homebrew/bin/gcc-16
+/usr/bin/python3 tests/test-edma-tx-slot-ownership.py --upstream-cache /Volumes/FX-MD87/Review-AX6/upstreams/nss/qca-nss-dp --output /Volumes/FX-MD87/Review-AX6/audits/20261030/core-risk-phase2/EDMA-TX-clang-final --compiler /usr/bin/clang --sanitize
+
+Extraction and validation boundary
+----------------------------------
+The complete original edma_ring_xmit, edma_clean_tx, edma_tx_slot_take,
+edma_if_xmit wrapper, TXDESC/TXCMPL setup/cleanup and edma_configure_rings
+bodies are extracted with comment/literal-aware balanced-brace parsing.
+Actual architecture, descriptor/register and dataplane headers are included
+with only their kernel include directives removed. Original fragment and
+prepared-file hashes, exact replay logs and source-site inventory are saved.
+All other C function bodies in touched source files must remain unchanged;
+existing descriptor/preheader/ring declarations and parameter macros are
+also checked. This is not a target compiler or full kernel include proof.
+
+Deterministic condition-variable hooks are inserted immediately after old
+skb-clear / DMA-capture operations and after the new full tuple capture.
+The rest of each extracted function is unchanged. Real pthread mutexes model
+spin_lock_bh mutual exclusion, not kernel preemption, IRQ or RCU semantics.
+Successful baseline/candidate mapping, descriptor publication and retirement
+traces must match. Both old race schedules must fail the precise DMA ledger.
+New schedules also pause old retirement after detach, permit same-index reuse,
+then require each mapping to be unmapped by its own original local tuple.
+
+The ledger checks map device, direction, full dma_addr_t and exact map size;
+free requires the skb's map already retired. Successful DMA address zero is
+tested in normal completion and TXDESC cleanup. A synthetic >32-bit mapping
+tests host metadata preservation only, not EDMA hardware address capability.
+Other cases include wrap, occupied cross-ring indices, invalid/empty opaque,
+all producer returns, padding consumption, mapping error, timestamp position,
+wrapper busy/drop/expand paths, foreign ring cleanup and indirect TXCMPL
+teardown. Named source mutants must compile cleanly and fail their intended
+semantic stderr gate. Positive compile output and candidate stderr must be
+empty. Clang ASan/UBSan canaries must emit the expected positive diagnostics;
+UBSAN_OPTIONS includes halt_on_error=1. Host LSan is disabled; explicit skb,
+streaming-map and coherent-allocation ledgers check fixture resource balance.
+
+Production protocol and limits
+-----------------------------
+One global slot lock replaces the per-ring producer lock at the same producer
+critical-section boundaries. It also protects tuple take in completion and
+TXDESC teardown. After take, unmap/free uses only the local tuple outside the
+lock; no retire code returns to clear shared DMA fields. DMA zero is not an
+empty marker. Ring owner and exact map length are host-only metadata.
+
+The old per-ring tx_lock field and its setup initialization are intentionally
+retained, but are no longer used by the TX producer. Removing them would be
+unrelated layout churn. Stock has one TX ring, so producer-to-producer
+serialization is unchanged in scope. Completion now shares the lock and can
+wait for the existing padding/PTP/map/doorbell producer section. Synthetic
+multi-ring producers serialize globally because the opaque namespace is
+global. No latency, throughput, contention or fairness result is claimed.
+
+edma_configure_rings initializes the lock/empty tuple array only under a
+PRE-LIVE caller assumption. Calling that memset or spin_lock_init with live
+slots/readers is NOT safe reinitialization. The fixture invokes it only
+before publication; it does not certify every real module-init/error/reset
+lifetime. edma_hw_init caller quiescence and all lifecycle repair remain
+separate acceptance boundaries.
+
+Teardown selects only its original TXDESC consumer-to-producer range and
+original TXCMPL completion range. A recorded foreign ring owner is skipped;
+there is no all-slot force sweep. This patch does not establish DMA idle,
+stop/disable acknowledgement, visibility of an in-flight completion, FW
+handoff safety, generation/duplicate-opaque protection, or concurrent
+completion-ring consumer/MMIO/free safety. Tests release modeled hardware
+ownership before teardown; that is an input assumption, not hardware proof.
+Probe/NAPI/active membership, NSS/SSDK and asynchronous PHY ownership remain
+outside this patch. Never use passing host checks as a firmware fault cause.

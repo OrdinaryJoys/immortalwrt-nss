@@ -117,6 +117,33 @@ and stricter general negative diagnostics. They must be separately completed
 and reviewed, not silently claimed by r8. Unknown userspace query/event
 callers, recipient reuse, full lifecycle, target and runtime remain open.
 
+## Phase 2 item 2: EDMA TX tuple retirement
+
+Patch 014 / qca-nss-dp release 6 is bound to exact d8f802f plus 001-013.
+One shared lock replaces the old producer-only exclusion over the global
+opaque-index namespace. A slot holds skb, full DMA handle, exact mapped length
+and host TXDESC owner. Publication and complete detach are atomic under that
+same lock; consumers unmap/free the detached tuple outside the lock. Normal
+completion and both existing teardown routes share this protocol. Existing
+reclamation intervals, descriptor/preheader/opaque layouts, ring and IRQ
+parameters are unchanged. No new all-slot DMA sweeping or reset is added.
+
+Fresh GCC ordinary and Clang ASan/UBSan source-bound fixtures each passed
+74 cases/185559 checks, 519 exact map/unmap pairs and two valid zero handles.
+The two old interleavings and 16 deliberately faulty variants are rejected.
+The normal wire trace is unchanged. Parent independently reran the GCC suite
+in EDMA-TX-parent-gcc-r1; a separate read-only source/oracle review accepts only
+TX_PAIR_MINIMUM, with no new blocking 014 finding.
+
+These are repeated host scheduling/ledger checks, not 185559 independent
+behaviors or actual weak-memory/DMA observations. PHY timestamp, skb expansion,
+MMIO/DMA and lock/BH semantics remain substitutes; coherent fallback disposal
+does not qualify complete teardown. This shared lock adds completion contention
+and has no throughput/latency certification. Late duplicate completions,
+hardware stop/visibility, FW handoff and concurrent descriptor deletion stay
+OPEN. PRE-LIVE initialization is not safe live reset. Lifecycle 015 and its
+combined-header/TX regression require separate acceptance before any build.
+
 ## Item 1: MATCH bounded command repair
 
 Local patch 024 repairs the set/reset handlers together. The exact upstream
