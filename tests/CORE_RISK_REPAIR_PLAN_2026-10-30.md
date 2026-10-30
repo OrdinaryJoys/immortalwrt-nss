@@ -164,6 +164,46 @@ hardware stop/visibility, FW handoff and concurrent descriptor deletion stay
 OPEN. PRE-LIVE initialization is not safe live reset. Lifecycle 015 and its
 combined-header/TX regression require separate acceptance before any build.
 
+## Phase 2 item 3: EDMA CPU port and shared NAPI ownership
+
+Patch 015 / qca-nss-dp release 7 is frozen at SHA256
+62ea007bc30cdd23a9e92be7cb3b798bea2773fccf13cdda90e711bdff48c6fc.
+Probe abort retires only its matching port/static context and never counts as
+NSS takeover. A dummy netdev owns shared NAPI; per-port host-open membership,
+separate added/enabled state and exact acquired IRQ counters govern cleanup.
+Quarantine drains admitted callbacks before RCU port unpublication; full poll
+RCU includes its queue-wake and completion/MMIO tail. Only successful
+napi_complete rearms. Override retains MMIO for the final port disable;
+repeated final cleanup does not use unmapped registers. Host re-registration
+of an overridden ID is rejected without an invented FW return contract.
+
+Fresh 001-015 replay has zero fuzz/offset. GCC ordinary and Clang ASan/UBSan
+r5 each pass 55 cases/11401 checks and 18 designated semantic negatives, with
+78 NAPI adds/dels and 14 enables/disables paired. Parent separately reran GCC.
+Read-only independent frozen-source and saved-oracle review accepts only
+015_CPU_PORT_ADMISSION_RCU_NAPI_IRQ_MMIO_MINIMUM_ONLY, not complete lifecycle.
+The existing contains-marker negative gate does not enforce exact diagnostic
+equality; the independent review observed single intended lines in these r5
+logs. Gate hardening remains a distinct P2 test-quality follow-up.
+
+The independent 014+015 TX integration and parent's new dual-compiler rerun
+also pass each 74 cases/185559 checks, 519 paired mappings and 16 exact-line
+negative controls. Successful before/after traces match; actual TX/config
+bodies and the full config file remain identical under the new real headers.
+Only nine TX functions are dynamically exercised, not every saved body or
+the lifecycle caller. Combination acceptance does not borrow a lifecycle PASS.
+
+OF pdata and hardware init are stubs in the CPU fixture, while actual RX
+cleaner use is static-only. The inherited OF node/device gets without puts
+remain a separate 016 repair: preserve references through all DMA/IRQ/MMIO
+users, release only attempt-owned acquisitions on failure and final exit,
+and never retire shared global ownership on a physical probe abort. External
+SSDK/NSS caches and PHY callbacks, HW idle, FW handoff/epoch, delayed duplicate
+completions, full module-init rollback, target/runtime and performance remain
+OPEN. A newly rechecked outer nss_dp_init registration-error path has no
+complete driver/HAL unwind; it requires its own validated repair, not a claim
+that 015 covers it. The build lock is unchanged and does not contain this batch.
+
 ## Item 1: MATCH bounded command repair
 
 Local patch 024 repairs the set/reset handlers together. The exact upstream

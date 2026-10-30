@@ -1,0 +1,715 @@
+From: OpenWrt Build System <openwrt@localhost>
+Subject: [PATCH] edma-v1: retire port and shared NAPI CPU owners
+
+Separate probe abort from takeover accounting, retire per-port host-open
+membership after callback drain, and use a persistent dummy NAPI owner.
+RCU covers both port readers and the complete poll tail. Track each IRQ
+acquisition and keep MMIO ownership after host override until final exit.
+Only successful NAPI completion rearms interrupts. Overridden IDs cannot
+return to host EDMA without a separate firmware/registry ownership contract.
+No hardware idle, FW epoch or external netdev-cache guarantee is added.
+
+diff --git a/nss_dp_main.c b/nss_dp_main.c
+--- a/nss_dp_main.c
++++ b/nss_dp_main.c
+@@ -1156,6 +1156,35 @@
+ /*
+  * nss_dp_probe()
+  */
++#ifdef NSS_DP_IPQ807X
++static void nss_dp_clear_host_ctx(struct nss_dp_dev *dp)
++{
++	struct nss_dp_data_plane_ctx *host;
++
++	ASSERT_RTNL();
++	if (!dp->macid || dp->macid > NSS_DP_HAL_MAX_PORTS)
++		return;
++	host = &dp_global_data_plane_ctx[nss_dp_get_idx_from_macid(dp->macid)];
++	if (host->dev == dp->netdev)
++		host->dev = NULL;
++}
++
++static void nss_dp_abort_host_probe(struct nss_dp_dev *dp)
++{
++	struct nss_dp_data_plane_ctx *host;
++
++	if (!dp->macid || dp->macid > NSS_DP_HAL_MAX_PORTS)
++		return;
++	rtnl_lock();
++	host = &dp_global_data_plane_ctx[nss_dp_get_idx_from_macid(dp->macid)];
++	if (host->dev == dp->netdev) {
++		edma_retire_port(dp->netdev, dp->macid);
++		nss_dp_clear_host_ctx(dp);
++	}
++	rtnl_unlock();
++}
++#endif
++
+ static int32_t nss_dp_probe(struct platform_device *pdev)
+ {
+ 	struct net_device *netdev;
+@@ -1225,7 +1254,17 @@
+ 	}
+ 
+ 	dp_priv->dpc = &dp_global_data_plane_ctx[nss_dp_get_idx_from_macid(dp_priv->macid)];
++#ifdef NSS_DP_IPQ807X
++	rtnl_lock();
++	if (dp_priv->dpc->dev && dp_priv->dpc->dev != netdev) {
++		rtnl_unlock();
++		goto fail;
++	}
++	dp_priv->dpc->dev = netdev;
++	rtnl_unlock();
++#else
+ 	dp_priv->dpc->dev = netdev;
++#endif
+ 	dp_priv->ctx = &dp_global_ctx;
+ 
+ 	/* TODO:locks init */
+@@ -1248,7 +1287,14 @@
+ 		goto fail;
+ 	}
+ 
+-	if (dp_priv->data_plane_ops->init(dp_priv->dpc)) {
++#ifdef NSS_DP_IPQ807X
++	rtnl_lock();
++	ret = dp_priv->data_plane_ops->init(dp_priv->dpc);
++	rtnl_unlock();
++#else
++	ret = dp_priv->data_plane_ops->init(dp_priv->dpc);
++#endif
++	if (ret) {
+ 		netdev_dbg(netdev, "Data plane init failed\n");
+ 		goto data_plane_init_fail;
+ 	}
+@@ -1347,11 +1393,22 @@
+ 	return 0;
+ 
+ phy_setup_fail:
++#ifdef NSS_DP_IPQ807X
++	nss_dp_abort_host_probe(dp_priv);
++#endif
+ 	nss_dp_phy_disconnect(dp_priv);
++#ifndef NSS_DP_IPQ807X
+ 	dp_priv->data_plane_ops->deinit(dp_priv->dpc);
++#endif
+ data_plane_init_fail:
++#ifdef NSS_DP_IPQ807X
++	nss_dp_abort_host_probe(dp_priv);
++#endif
+ 	dp_priv->gmac_hal_ops->exit(dp_priv->gmac_hal_ctx);
+ fail:
++#ifdef NSS_DP_IPQ807X
++	nss_dp_abort_host_probe(dp_priv);
++#endif
+ 	free_netdev(netdev);
+ 	return -EFAULT;
+ }
+@@ -1368,10 +1425,8 @@
+ 	uint32_t i;
+ 	struct nss_dp_dev *dp_priv;
+ 	struct nss_gmac_hal_ops *hal_ops;
++#ifndef NSS_DP_IPQ807X
+ 	struct nss_dp_data_plane_ops *dp_ops;
+-#ifdef NSS_DP_IPQ807X
+-	struct nss_dp_data_plane_ctx *old_dpc;
+-	bool deinit_host;
+ #endif
+ 
+ 	for (i = 0; i < NSS_DP_HAL_MAX_PORTS; i++) {
+@@ -1387,15 +1442,8 @@
+ 		 * retirement, not the netdev lifetime held by that registry.
+ 		 */
+ 		rtnl_lock();
+-		dp_ops = dp_priv->data_plane_ops;
+-		old_dpc = dp_priv->dpc;
+-		deinit_host = !nss_dp_plane_is_quarantined(dp_priv) &&
+-			!(dp_priv->drv_flags & NSS_DP_PRIV_FLAG(INIT_OVERRIDE)) &&
+-			(dp_priv->drv_flags & NSS_DP_PRIV_FLAG(INIT_DONE));
+-		nss_dp_plane_quarantine(dp_priv);
+-		/* Preserve initial host-resource cleanup, not NSS commands. */
+-		if (deinit_host)
+-			dp_ops->deinit(old_dpc);
++		nss_dp_plane_quarantine(dp_priv);
++		nss_dp_clear_host_ctx(dp_priv);
+ 		rtnl_unlock();
+ #else
+ 		dp_ops = dp_priv->data_plane_ops;
+diff --git a/nss_dp_attach.c b/nss_dp_attach.c
+--- a/nss_dp_attach.c
++++ b/nss_dp_attach.c
+@@ -181,6 +181,8 @@
+ {
+ 	ASSERT_RTNL();
+ 	nss_dp_plane_quiesce(dp);
++	/* Only EDMA membership is retired here; never guess an NSS close. */
++	edma_retire_port(dp->netdev, dp->macid);
+ 	clear_bit(__NSS_DP_UP, &dp->flags);
+ 	dp->link_state = __NSS_DP_LINK_DOWN;
+ 	dp->drv_flags &= ~(NSS_DP_PRIV_FLAG(INIT_DONE) |
+diff --git a/hal/soc_ops/ipq807x/nss_ipq807x.h b/hal/soc_ops/ipq807x/nss_ipq807x.h
+--- a/hal/soc_ops/ipq807x/nss_ipq807x.h
++++ b/hal/soc_ops/ipq807x/nss_ipq807x.h
+@@ -58,6 +58,8 @@
+ 
+ extern int edma_init(void);
+ extern void edma_cleanup(bool is_dp_override);
++struct net_device;
++bool edma_retire_port(struct net_device *netdev, uint32_t macid);
+ extern struct nss_dp_data_plane_ops nss_dp_edma_ops;
+ extern bool nss_dp_hal_nsm_sawf_sc_stats_read(struct nss_dp_hal_nsm_sawf_sc_stats *nsm_stats, uint8_t service_class);
+ 
+diff --git a/hal/dp_ops/edma_dp/edma_v1/edma_data_plane.h b/hal/dp_ops/edma_dp/edma_v1/edma_data_plane.h
+--- a/hal/dp_ops/edma_dp/edma_v1/edma_data_plane.h
++++ b/hal/dp_ops/edma_dp/edma_v1/edma_data_plane.h
+@@ -180,8 +180,16 @@
+ struct edma_hw {
+ 	struct napi_struct napi;
+ 			/* napi structure */
+-	struct net_device *netdev_arr[EDMA_MAX_GMACS];
++	struct net_device __rcu *netdev_arr[EDMA_MAX_GMACS];
+ 			/* netdev for each gmac port */
++	struct net_device *napi_dev;
++	bool napi_enabled;
++	bool host_open[EDMA_MAX_GMACS];
++	bool override_accounted[EDMA_MAX_GMACS];
++	uint32_t tx_irqs_owned;
++	uint32_t rxfill_irqs_owned;
++	uint32_t rxdesc_irqs_owned;
++	bool misc_irq_owned;
+ 	struct device_node *device_node;
+ 			/* Device tree node */
+ 	struct platform_device *pdev;
+diff --git a/hal/dp_ops/edma_dp/edma_v1/edma_data_plane.c b/hal/dp_ops/edma_dp/edma_v1/edma_data_plane.c
+--- a/hal/dp_ops/edma_dp/edma_v1/edma_data_plane.c
++++ b/hal/dp_ops/edma_dp/edma_v1/edma_data_plane.c
+@@ -20,6 +20,8 @@
+ #include <linux/of_platform.h>
+ #include <linux/debugfs.h>
+ #include <linux/netdevice.h>
++#include <linux/rtnetlink.h>
++#include <linux/rcupdate.h>
+ #include <fal/fal_vsi.h>
+ #include "edma_data_plane.h"
+ #include "edma_regs.h"
+@@ -257,6 +259,9 @@
+ 	int ret = 0;
+ 	struct resource res_edma;
+ 
++	if (WARN_ON(edma_hw.reg_base || edma_hw.napi_dev))
++		return -EBUSY;
++
+ 	/*
+ 	 * Get all the DTS data needed
+ 	 */
+@@ -285,10 +290,18 @@
+ 		pr_warn("Unable to remap EDMA register memory.\n");
+ 		ret = -EFAULT;
+ 		goto edma_init_remap_fail;
++	}
++
++	edma_hw.napi_dev = alloc_netdev_dummy(0);
++	if (!edma_hw.napi_dev) {
++		ret = -ENOMEM;
++		goto edma_init_hw_init_fail;
+ 	}
+ 
+ 	if (edma_hw_init(&edma_hw) != 0) {
+ 		ret = -EFAULT;
++		free_netdev(edma_hw.napi_dev);
++		edma_hw.napi_dev = NULL;
+ 		goto edma_init_hw_init_fail;
+ 	}
+ 
+@@ -300,37 +313,89 @@
+ 
+ edma_init_hw_init_fail:
+ 	iounmap(edma_hw.reg_base);
++	edma_hw.reg_base = NULL;
+ 
+ edma_init_remap_fail:
+ 	release_mem_region((edma_hw.reg_resource)->start,
+ 			   resource_size(edma_hw.reg_resource));
++	edma_hw.reg_resource = NULL;
+ 	return ret;
+ }
+ 
++static void edma_free_irqs(void)
++{
++	ASSERT_RTNL();
++	if (edma_hw.misc_irq_owned) {
++		free_irq(edma_hw.misc_intr, edma_hw.pdev);
++		edma_hw.misc_irq_owned = false;
++	}
++	while (edma_hw.rxdesc_irqs_owned) {
++		--edma_hw.rxdesc_irqs_owned;
++		free_irq(edma_hw.rxdesc_intr[edma_hw.rxdesc_irqs_owned], edma_hw.pdev);
++	}
++	while (edma_hw.rxfill_irqs_owned) {
++		--edma_hw.rxfill_irqs_owned;
++		free_irq(edma_hw.rxfill_intr[edma_hw.rxfill_irqs_owned], edma_hw.pdev);
++	}
++	while (edma_hw.tx_irqs_owned) {
++		--edma_hw.tx_irqs_owned;
++		free_irq(edma_hw.txcmpl_intr[edma_hw.tx_irqs_owned], edma_hw.pdev);
++	}
++}
++
++static void edma_stop_napi(void)
++{
++	ASSERT_RTNL();
++	edma_disable_interrupts();
++	if (edma_hw.napi_enabled) {
++		napi_disable(&edma_hw.napi);
++		edma_hw.napi_enabled = false;
++	}
++	/* Ownership can be released before the poll's final MMIO access. */
++	synchronize_net();
++	edma_disable_interrupts();
++}
++
++static void edma_release_mmio(void)
++{
++	ASSERT_RTNL();
++	platform_set_drvdata(edma_hw.pdev, NULL);
++	if (edma_hw.reg_base) {
++		iounmap(edma_hw.reg_base);
++		edma_hw.reg_base = NULL;
++	}
++	if (edma_hw.reg_resource) {
++		release_mem_region(edma_hw.reg_resource->start,
++				resource_size(edma_hw.reg_resource));
++		edma_hw.reg_resource = NULL;
++	}
++}
++
+ /*
+  * edma_cleanup()
+  *	EDMA cleanup
+  */
+-void edma_cleanup(bool is_dp_override)
++static void edma_cleanup_locked(bool is_dp_override)
+ {
+ 	int i;
+ 	struct edma_txcmpl_ring *txcmpl_ring = NULL;
+ 	struct edma_rxdesc_ring *rxdesc_ring = NULL;
+ 
++	ASSERT_RTNL();
++	if (WARN_ON(edma_hw.active))
++		return;
+ 	/*
+ 	 * The cleanup can happen from data plane override
+ 	 * or from module_exit, we want to cleanup only once
+ 	 */
+ 	if (!edma_hw.edma_initialized) {
+-		/*
+-		 * Disable EDMA only at module exit time, since NSS firmware
+-		 * depends on this setting.
+-		 */
+-		if (!is_dp_override) {
++		if (!is_dp_override && edma_hw.reg_base) {
+ 			edma_disable_port();
++			edma_release_mmio();
+ 		}
+ 		return;
+ 	}
++	edma_stop_napi();
+ 
+ 	/*
+ 	 * Disable Rx rings used by this driver
+@@ -372,42 +437,12 @@
+ 	 * Remove interrupt handlers and NAPI
+ 	 */
+ 	if (edma_hw.napi_added) {
+-		/*
+-		 * Free IRQ for TXCMPL rings
+-		 */
+-		for (i = 0; i < edma_hw.txcmpl_rings; i++) {
+-			synchronize_irq(edma_hw.txcmpl_intr[i]);
+-			free_irq(edma_hw.txcmpl_intr[i],
+-					(void *)(edma_hw.pdev));
+-		}
+-
+-		/*
+-		 * Free IRQ for RXFILL rings
+-		 */
+-		for (i = 0; i < edma_hw.rxfill_rings; i++) {
+-			synchronize_irq(edma_hw.rxfill_intr[i]);
+-			free_irq(edma_hw.rxfill_intr[i],
+-					(void *)(edma_hw.pdev));
+-		}
+-
+-		/*
+-		 * Free IRQ for RXDESC rings
+-		 */
+-		for (i = 0; i < edma_hw.rxdesc_rings; i++) {
+-			synchronize_irq(edma_hw.rxdesc_intr[i]);
+-			free_irq(edma_hw.rxdesc_intr[i],
+-					(void *)(edma_hw.pdev));
+-		}
+-
+-		/*
+-		 * Free Misc IRQ
+-		 */
+-		synchronize_irq(edma_hw.misc_intr);
+-		free_irq(edma_hw.misc_intr, (void *)(edma_hw.pdev));
+-
++		edma_free_irqs();
+ 		netif_napi_del(&edma_hw.napi);
+ 		edma_hw.napi_added = 0;
+ 	}
++	free_netdev(edma_hw.napi_dev);
++	edma_hw.napi_dev = NULL;
+ 
+ 	/*
+ 	 * Disable EDMA only at module exit time, since NSS firmware
+@@ -421,15 +456,48 @@
+ 	 * cleanup rings and free
+ 	 */
+ 	edma_cleanup_rings(&edma_hw);
+-	iounmap(edma_hw.reg_base);
+-	release_mem_region((edma_hw.reg_resource)->start,
+-			   resource_size(edma_hw.reg_resource));
++	/* Firmware still depends on the enabled port after host override. */
++	if (!is_dp_override)
++		edma_release_mmio();
+ 
+ 	/*
+ 	 * Mark initialize false, so that we do not
+ 	 * try to cleanup again
+ 	 */
+ 	edma_hw.edma_initialized = false;
++}
++
++void edma_cleanup(bool is_dp_override)
++{
++	rtnl_lock();
++	edma_cleanup_locked(is_dp_override);
++	rtnl_unlock();
++}
++
++static void edma_close_member(uint32_t index)
++{
++	ASSERT_RTNL();
++	if (!edma_hw.host_open[index])
++		return;
++	edma_hw.host_open[index] = false;
++	if (--edma_hw.active == 0)
++		edma_stop_napi();
++}
++
++bool edma_retire_port(struct net_device *netdev, uint32_t macid)
++{
++	uint32_t index;
++
++	ASSERT_RTNL();
++	if (!netdev || macid < EDMA_START_GMACS || macid > EDMA_MAX_GMACS)
++		return false;
++	index = macid - 1;
++	if (rcu_access_pointer(edma_hw.netdev_arr[index]) != netdev)
++		return false;
++	edma_close_member(index);
++	rcu_assign_pointer(edma_hw.netdev_arr[index], NULL);
++	synchronize_net();
++	return true;
+ }
+ 
+ /*
+@@ -440,16 +508,30 @@
+ 			uint32_t tx_desc_ring, uint32_t rx_desc_ring,
+ 			uint32_t mode)
+ {
+-	if (!dpc->dev)
++	struct nss_dp_dev *dp_dev;
++	uint32_t index;
++
++	ASSERT_RTNL();
++	if (!dpc->dev || !edma_hw.edma_initialized || !edma_hw.napi_added)
+ 		return NSS_DP_FAILURE;
++	dp_dev = netdev_priv(dpc->dev);
++	if (dp_dev->macid < EDMA_START_GMACS || dp_dev->macid > EDMA_MAX_GMACS)
++		return NSS_DP_FAILURE;
++	index = dp_dev->macid - 1;
++	if (rcu_access_pointer(edma_hw.netdev_arr[index]) != dpc->dev)
++		return NSS_DP_FAILURE;
++	if (edma_hw.host_open[index])
++		return NSS_DP_SUCCESS;
+ 
+ 	/*
+ 	 * Enable NAPI
+ 	 */
++	edma_hw.host_open[index] = true;
+ 	if (edma_hw.active++ != 0)
+ 		return NSS_DP_SUCCESS;
+ 
+ 	napi_enable(&edma_hw.napi);
++	edma_hw.napi_enabled = true;
+ 
+ 	/*
+ 	 * Enable the interrupt masks.
+@@ -465,18 +547,15 @@
+  */
+ static int edma_if_close(struct nss_dp_data_plane_ctx *dpc)
+ {
+-	if (--edma_hw.active != 0)
+-		return NSS_DP_SUCCESS;
++	struct nss_dp_dev *dp_dev;
+ 
+-	/*
+-	 * Disable the interrupt masks.
+-	 */
+-	edma_disable_interrupts();
+-
+-	/*
+-	 * Disable NAPI
+-	 */
+-	napi_disable(&edma_hw.napi);
++	ASSERT_RTNL();
++	if (!dpc->dev)
++		return NSS_DP_SUCCESS;
++	dp_dev = netdev_priv(dpc->dev);
++	if (dp_dev->macid >= EDMA_START_GMACS && dp_dev->macid <= EDMA_MAX_GMACS &&
++			rcu_access_pointer(edma_hw.netdev_arr[dp_dev->macid - 1]) == dpc->dev)
++		edma_close_member(dp_dev->macid - 1);
+ 	return NSS_DP_SUCCESS;
+ }
+ 
+@@ -634,14 +713,25 @@
+  */
+ static int edma_if_deinit(struct nss_dp_data_plane_ctx *dpc)
+ {
++	struct nss_dp_dev *dp_dev;
++	uint32_t index;
++
++	ASSERT_RTNL();
++	if (!dpc->dev)
++		return NSS_DP_SUCCESS;
++	dp_dev = netdev_priv(dpc->dev);
++	if (!edma_retire_port(dpc->dev, dp_dev->macid))
++		return NSS_DP_SUCCESS;
++	index = dp_dev->macid - 1;
++	if (edma_hw.override_accounted[index])
++		return NSS_DP_SUCCESS;
++	edma_hw.override_accounted[index] = true;
+ 	/*
+ 	 * Free up resources used by EDMA if all the
+ 	 * interfaces have been overridden
+ 	 * */
+-	if (edma_hw.dp_override_cnt == EDMA_MAX_GMACS - 1) {
+-		edma_cleanup(true);
+-	} else {
+-		edma_hw.dp_override_cnt++;
++	if (++edma_hw.dp_override_cnt == EDMA_MAX_GMACS) {
++		edma_cleanup_locked(true);
+ 	}
+ 
+ 	return NSS_DP_SUCCESS;
+@@ -655,8 +745,12 @@
+ {
+ 	int err;
+ 	uint32_t entry_num, i;
+-	uint32_t tx_irqs = 0, rxfill_irqs = 0, rxdesc_irqs = 0;
+ 
++	ASSERT_RTNL();
++	if (WARN_ON(edma_hw.tx_irqs_owned || edma_hw.rxfill_irqs_owned ||
++			edma_hw.rxdesc_irqs_owned || edma_hw.misc_irq_owned))
++		return -EINVAL;
++
+ 	/*
+ 	 * Get TXCMPL rings IRQ numbers
+ 	 */
+@@ -733,9 +827,9 @@
+ 		if (err) {
+ 			pr_debug("TXCMPL ring IRQ:%d request failed\n",
+ 					edma_hw.txcmpl_intr[i]);
+-			goto tx_cmpl_ring_intr_req_fail;
++			goto request_failed;
+ 		}
+-		tx_irqs++;
++		edma_hw.tx_irqs_owned++;
+ 	}
+ 
+ 	/*
+@@ -748,9 +842,9 @@
+ 		if (err) {
+ 			pr_debug("RXFILL ring IRQ:%d request failed\n",
+ 					edma_hw.rxfill_intr[i]);
+-			goto rx_fill_ring_intr_req_fail;
++			goto request_failed;
+ 		}
+-		rxfill_irqs++;
++		edma_hw.rxfill_irqs_owned++;
+ 	}
+ 
+ 	/*
+@@ -763,9 +857,9 @@
+ 		if (err) {
+ 			pr_debug("RXDESC ring IRQ:%d request failed\n",
+ 					edma_hw.rxdesc_intr[i]);
+-			goto rx_desc_ring_intr_req_fail;
++			goto request_failed;
+ 		}
+-		rxdesc_irqs++;
++		edma_hw.rxdesc_irqs_owned++;
+ 	}
+ 
+ 	/*
+@@ -777,48 +871,14 @@
+ 	if (err) {
+ 		pr_debug("MISC IRQ:%d request failed\n",
+ 				edma_hw.misc_intr);
+-		goto misc_intr_req_fail;
++		goto request_failed;
+ 	}
++	edma_hw.misc_irq_owned = true;
+ 
+ 	return 0;
+ 
+-misc_intr_req_fail:
+-
+-	/*
+-	 * Free IRQ for RXDESC rings
+-	 */
+-	while (rxdesc_irqs) {
+-		rxdesc_irqs--;
+-		synchronize_irq(edma_hw.rxdesc_intr[rxdesc_irqs]);
+-		free_irq(edma_hw.rxdesc_intr[rxdesc_irqs],
+-				(void *)edma_hw.pdev);
+-	}
+-
+-rx_desc_ring_intr_req_fail:
+-
+-	/*
+-	 * Free IRQ for RXFILL rings
+-	 */
+-	while (rxfill_irqs) {
+-		rxfill_irqs--;
+-		synchronize_irq(edma_hw.rxfill_intr[rxfill_irqs]);
+-		free_irq(edma_hw.rxfill_intr[rxfill_irqs],
+-				(void *)edma_hw.pdev);
+-	}
+-
+-rx_fill_ring_intr_req_fail:
+-tx_cmpl_ring_intr_req_fail:
+-
+-	/*
+-	 * Free IRQ for TXCMPL rings
+-	 */
+-	while (tx_irqs) {
+-		tx_irqs--;
+-		synchronize_irq(edma_hw.txcmpl_intr[tx_irqs]);
+-		free_irq(edma_hw.txcmpl_intr[tx_irqs],
+-				(void *)edma_hw.pdev);
+-	}
+-
++request_failed:
++	edma_free_irqs();
+ 	return -1;
+ }
+ 
+@@ -828,6 +888,7 @@
+  */
+ static int edma_register_netdevice(struct net_device *netdev, uint32_t macid)
+ {
++	ASSERT_RTNL();
+ 	if (!netdev) {
+ 		pr_info("nss_dp_edma: Invalid netdev pointer %px\n", netdev);
+ 		return -EINVAL;
+@@ -847,24 +908,31 @@
+ 	 * IPQ807x. These begin from '1' and hence we subtract
+ 	 * one when using it as an array index.
+ 	 */
+-	edma_hw.netdev_arr[macid - 1] = netdev;
++	if (!edma_hw.edma_initialized || !edma_hw.napi_dev)
++		return -ENODEV;
++	/* No firmware/registry contract returns an overridden ID to EDMA. */
++	if (edma_hw.override_accounted[macid - 1])
++		return -EBUSY;
++	if (rcu_access_pointer(edma_hw.netdev_arr[macid - 1]))
++		return rcu_access_pointer(edma_hw.netdev_arr[macid - 1]) == netdev ? 0 : -EBUSY;
+ 
+ 	/*
+ 	 * NAPI add
+ 	 */
+ 	if (!edma_hw.napi_added) {
+-		netif_napi_add(netdev, &edma_hw.napi, edma_napi);
++		netif_napi_add(edma_hw.napi_dev, &edma_hw.napi, edma_napi);
++		edma_hw.napi_added = 1;
+ 		/*
+ 		 * Register the interrupt handlers and enable interrupts
+ 		 */
+ 		if (edma_irq_init() < 0) {
+ 			netif_napi_del(&edma_hw.napi);
+-			edma_hw.netdev_arr[macid - 1] = NULL;
++			edma_hw.napi_added = 0;
+ 			return -EINVAL;
+ 		}
+ 
+-		edma_hw.napi_added = 1;
+ 	}
++	rcu_assign_pointer(edma_hw.netdev_arr[macid - 1], netdev);
+ 
+ 	return 0;
+ }
+@@ -879,6 +947,10 @@
+ 	struct nss_dp_dev *dp_dev = (struct nss_dp_dev *)netdev_priv(netdev);
+ 	int ret = 0;
+ 
++	ASSERT_RTNL();
++	if (dp_dev->macid >= EDMA_START_GMACS && dp_dev->macid <= EDMA_MAX_GMACS &&
++			rcu_access_pointer(edma_hw.netdev_arr[dp_dev->macid - 1]) == netdev)
++		return NSS_DP_SUCCESS;
+ 	/*
+ 	 * Register the netdev
+ 	 */
+diff --git a/hal/dp_ops/edma_dp/edma_v1/edma_tx_rx.c b/hal/dp_ops/edma_dp/edma_v1/edma_tx_rx.c
+--- a/hal/dp_ops/edma_dp/edma_v1/edma_tx_rx.c
++++ b/hal/dp_ops/edma_dp/edma_v1/edma_tx_rx.c
+@@ -369,7 +369,7 @@
+ 		 * subtract one since the indices start form '0' and
+ 		 * port numbers start from '1'.
+ 		 */
+-		ndev = ehw->netdev_arr[src_port_num - 1];
++		ndev = rcu_dereference(ehw->netdev_arr[src_port_num - 1]);
+ 		if (unlikely(!ndev)) {
+ 			pr_warn_ratelimited("WARN: netdev Null src_info_type:0x%x. Drop skb:%px\n",
+ 					src_port_num, skb);
+@@ -458,6 +458,7 @@
+ 	int work_done = 0;
+ 	int i;
+ 
++	rcu_read_lock();
+ 	for (i = 0; i < ehw->rxdesc_rings; i++) {
+ 		rxdesc_ring = &ehw->rxdesc_ring[i];
+ 		work_done += edma_clean_rx(ehw, budget, rxdesc_ring);
+@@ -482,7 +483,7 @@
+ 	 * support for multiple queues
+ 	 */
+ 	for (i = 0; i < EDMA_MAX_GMACS; i++) {
+-		ndev = ehw->netdev_arr[i];
++		ndev = rcu_dereference(ehw->netdev_arr[i]);
+ 		if (!ndev)
+ 			continue;
+ 
+@@ -493,12 +494,10 @@
+ 	/*
+ 	 * TODO - rework and fix the budget control
+ 	 */
+-	if (work_done < budget) {
++	if (work_done < budget && napi_complete(napi)) {
+ 		/*
+ 		 * TODO per core NAPI
+ 		 */
+-		napi_complete(napi);
+-
+ 		/*
+ 		 * Set RXDESC ring interrupt mask
+ 		 */
+@@ -528,6 +527,7 @@
+ 						edma_hw.rxfill_intr_mask);
+ 		}
+ 	}
++	rcu_read_unlock();
+ 	return work_done;
+ }
+ 

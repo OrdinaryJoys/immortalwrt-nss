@@ -1,0 +1,75 @@
+EDMA v1 CPU port/NAPI lifetime fixture (patch 015)
+================================================
+
+Run from the source checkout, with a new evidence directory each time:
+
+/usr/bin/python3 tests/test-edma-probe-lifetime.py --upstream-cache /Volumes/FX-MD87/Review-AX6/upstreams/nss/qca-nss-dp --output /Volumes/FX-MD87/Review-AX6/audits/20261030/core-risk-phase2/EDMA-LIFETIME-gcc-final --compiler /opt/homebrew/bin/gcc-16
+/usr/bin/python3 tests/test-edma-probe-lifetime.py --upstream-cache /Volumes/FX-MD87/Review-AX6/upstreams/nss/qca-nss-dp --output /Volumes/FX-MD87/Review-AX6/audits/20261030/core-risk-phase2/EDMA-LIFETIME-clang-final --compiler /usr/bin/clang --sanitize
+
+The runner freshly reads exact Git pin d8f802f08fd8ff31057ba58edb20bbe448e7b505
+and applies 001-015 with zero fuzz/offset. It rejects any 015 changed path
+outside the six authorized source/header files. edma_cfg.c and the actual
+014 take/producer/clean functions must remain unchanged. No archived audit
+program is executed; current, read-only TX test utilities supply shared C
+lexing, command logging and digest helpers. Bytecode writes are disabled.
+No existing TX test, release/lock input, target build, make or device is used.
+
+Complete actual function bodies are extracted for global init/cleanup,
+IRQ request/reverse release, host init/open/close/deinit/port retirement,
+probe/abort/static-context clear, physical remove, callback admission/drain,
+quarantine, late open/early close control, initial takeover and whole NAPI
+poll/IRQ handlers. Complete architecture/register/dataplane headers are used
+with only kernel include directives removed. FRAGMENTS.json binds each
+original body and line to its prepared source; the generated C is retained.
+A single scheduling hook is inserted at the start of the successful NAPI
+completion branch to pause its post-completion tail. Kernel/SDK include/type
+qualification is not claimed from mocked nss_dp_dev/netdev/HAL declarations.
+
+Coverage includes global allocation failures and retry, every physical
+probe failure stage, PHY-handle/fixed-link/MDIO and VSI/register failures,
+every IRQ lookup/request position for stock one-ring and synthetic three-ring
+classes, exact reverse acquisition/dev_id ledger, peer survival, duplicate
+open/close/deinit, both partial-open/early-close quarantine paths, no guessed
+NSS close, static-context pointer equality, all six unique takeover IDs,
+overridden-ID remove/reprobe rejection, override-retained MMIO followed by
+final port disable/unmap and repeat-exit no-MMIO behavior. Counts never make
+failed probe attempts into takeover events. Re-probe after an actual failure
+is distinguished from forbidden NSS-to-host ownership recovery.
+
+Deterministic pthread schedules hold a real admitted plane_get snapshot
+across quarantine, hold a port read across abort while a peer remains active,
+and hold the full poll tail after NAPI ownership has been released. Retirement
+must wait for the corresponding modeled drain; the final interrupt mask must
+win over the old poll tail. napi_complete=false does not rearm; true does.
+Source mutants must compile cleanly and fail their intended semantic stderr
+gate, never merely time out. Positive compile stdout/stderr and candidate
+stderr must be empty. ASan/UBSan canaries require positive diagnostics, with
+halt_on_error=1. LSan is disabled for host capability; explicit ledgers track
+the resource classes modeled by this fixture.
+
+Important exclusions
+--------------------
+The RCU, NAPI, waitqueue, netdev, IRQ, OF pdata and hardware-init callees are
+explicit host models, not running Linux implementations. The actual RX DMA
+cleaner is checked for RCU dereference statically but is not executed here;
+queue-wake and full-poll reader paths are executed. free_irq synchronization
+is an official kernel API contract, not reproduced as physical interrupts.
+Synthetic ring IDs/counts do not qualify additional hardware configurations.
+The inherited uint8_t PHY-id buffer requires -Wno-pointer-sign for its old
+char* call sites; other enabled warnings remain fatal and logs must be empty.
+
+In particular, edma_of_get_pdata and edma_hw_init are stubs in this CPU suite.
+Passing failure/retry cases DO NOT certify OF node/device reference balance,
+real allocation rollback or DMA idle. The known inherited EDMA OF double-get
+without matching puts is an explicit P2 outside frozen 015, not a pass hidden
+by the pdata stub. Common MDIO reference ownership is also outside scope.
+
+No new all-slot DMA sweep, FW reset/idle guess or ring/IRQ/budget tuning is
+introduced. External NSS/SSDK caches and asynchronous PHY-owned references,
+hardware stop/completion visibility and duplicate opaque epochs remain OPEN.
+Normal NSS-to-EDMA runtime restoration is deliberately not supported.
+
+The final 014+015 TX function/header combination is delegated to the parent's
+independent integration runner. This lifetime suite neither runs the original
+014 runner (which stops at patch 014) nor borrows its PASS as combination
+evidence. Its own RESULTS.json explicitly records that separation.
