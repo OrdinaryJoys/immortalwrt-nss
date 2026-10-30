@@ -95,3 +95,31 @@ terminates before all cases, so its later cases are not claimed executed.
 Initial fixture/compiler and mutation-anchor failures remain saved. The
 independent v5 review closed IR01/IR02 within this limited scope, not target,
 concurrency, MATCH-table lifetime or firmware timeout/callback qualification.
+
+## Item 2: ECM denied-port snapshot repair
+
+Patch 029 replaces the private denied-port hlist with bounded immutable TCP
+and UDP bitmaps. The pinned upstream 8c7355b hash conversion and inherited
+local code were inspected together; a hash-index-only patch would leave
+unbounded input/output and concurrent reader reclamation defects unresolved.
+Writers validate the complete command before publishing, serialize updates
+with a management mutex and free retired maps only after synchronize_rcu.
+The packet helper uses one snapshot for both ports, without allocation or a
+sleeping lock. Existing public signatures and default DHCP exclusions remain.
+
+Input is capped at 512 bytes. Nonzero positional writes, embedded NUL and
+invalid full numeric tokens are rejected; zero-length writes are no-ops.
+Text allocation, formatting, copy and free are serialized by the same mutex;
+one internal dump is bounded by 393218 bytes. Generic proc-wrapper buffers
+and allocator overhead are outside that bound. Read output is sorted, and
+separate partial reads may observe different generations. The list excludes
+acceleration; it does not drop packets or immediately revoke existing flows.
+
+The v5 host GCC and Clang ASan/UBSan suites each passed 799 cases and 67172
+checks with zero live bitmap allocations at completion. Five deliberately
+faulty variants were rejected after compilation. Complete actual functions
+are extracted, but bitmap/memory/mutex/RCU/kernel API effects are explicit
+host substitutes. The pthread grace model is not Linux RCU, lockdep, KCSAN,
+full-module, concurrent-unload, target or performance qualification. The
+independent final review accepted only this source/host scope. Earlier oracle
+and negative-control compilation failures remain preserved as failures.
