@@ -123,3 +123,32 @@ host substitutes. The pthread grace model is not Linux RCU, lockdep, KCSAN,
 full-module, concurrent-unload, target or performance qualification. The
 independent final review accepted only this source/host scope. Earlier oracle
 and negative-control compilation failures remain preserved as failures.
+
+## Item 3: EDMA unpublished allocation rollback
+
+Patch 013 repairs allocation failure at the pinned d8f802f EDMA v1 source.
+The inherited post-decrement loops can select a negative array index. Merely
+changing the decrement would still invoke operational cleanup before rings
+have been configured and leave the software arrays owned after a failure.
+The new helper releases only acquired coherent descriptors, using non-NULL
+CPU pointers as ownership even when the valid DMA handle is zero. It neither
+accesses MMIO/packet stores nor invokes streaming unmap or completion cleanup.
+The outer allocation owner releases and clears all four software arrays.
+
+All unrelated function definitions and nonallocation tokens are unchanged.
+Parent review checked edma_hw_init/configure ordering and the outer edma_init
+failure path: allocation failure returns before publication, then the outer
+owner unmaps/releases register resources rather than calling live ring cleanup.
+This helper requires acquired zero-initialized software arrays; it is not a
+generic destructor for absent arrays or live/concurrently owned hardware.
+
+GCC ordinary and Clang ASan/UBSan v4 suites each passed 150 matrix cases and
+70517 checks, including 66 allocation-failure cases, 50 successful retries
+and 46 valid zero-DMA rollback releases. Successful single/multi-ring host
+allocation/MMIO/RX-fill traces match the old source byte for byte. Old source,
+decrement-only repair and six faulty variants are rejected with specific
+diagnostics. All actual allocation/configure functions and ring definitions
+are extracted, but allocation/MMIO/reset/RX fill are host substitutes.
+Success disposal is fixture-only, not live-teardown validation. Ring geometry,
+IRQ/NAPI policy, firmware ownership, B-DP-002/003 and hardware DMA quiescence
+remain unchanged and unqualified. Earlier fixture failures remain evidence.

@@ -1,0 +1,226 @@
+Subject: [PATCH] edma_v1: unwind unpublished ring allocations without live cleanup
+
+Descriptor allocation failure precedes edma_configure_rings(). Free only
+acquired coherent descriptors, never packet stores or hardware ring state.
+Also retire the software ring arrays and clear their ownership pointers on
+all allocation failures. A zero DMA handle is valid when desc is non-NULL.
+
+--- a/hal/dp_ops/edma_dp/edma_v1/edma_cfg.c
++++ b/hal/dp_ops/edma_dp/edma_v1/edma_cfg.c
+@@ -336,6 +336,65 @@
+ }
+ 
+ /*
++ * Free descriptor allocations that have never been published to hardware.
++ * Packet stores, producer/consumer registers and streaming DMA are not owned
++ * by this allocation-only rollback path.
++ */
++static void edma_free_unpublished_ring_resources(struct edma_hw *ehw)
++{
++	struct platform_device *pdev = ehw->pdev;
++	int i;
++
++	for (i = 0; i < ehw->rxdesc_rings; i++) {
++		struct edma_rxdesc_ring *ring = &ehw->rxdesc_ring[i];
++
++		if (!ring->desc)
++			continue;
++
++		dma_free_coherent(&pdev->dev, sizeof(struct edma_rxdesc_desc) *
++				ring->count, ring->desc, ring->dma);
++		ring->desc = NULL;
++		ring->dma = 0;
++	}
++
++	for (i = 0; i < ehw->rxfill_rings; i++) {
++		struct edma_rxfill_ring *ring = &ehw->rxfill_ring[i];
++
++		if (!ring->desc)
++			continue;
++
++		dma_free_coherent(&pdev->dev, sizeof(struct edma_rxfill_desc) *
++				ring->count, ring->desc, ring->dma);
++		ring->desc = NULL;
++		ring->dma = 0;
++	}
++
++	for (i = 0; i < ehw->txcmpl_rings; i++) {
++		struct edma_txcmpl_ring *ring = &ehw->txcmpl_ring[i];
++
++		if (!ring->desc)
++			continue;
++
++		dma_free_coherent(&pdev->dev, sizeof(struct edma_txcmpl_desc) *
++				ring->count, ring->desc, ring->dma);
++		ring->desc = NULL;
++		ring->dma = 0;
++	}
++
++	for (i = 0; i < ehw->txdesc_rings; i++) {
++		struct edma_txdesc_ring *ring = &ehw->txdesc_ring[i];
++
++		if (!ring->desc)
++			continue;
++
++		dma_free_coherent(&pdev->dev, sizeof(struct edma_txdesc_desc) *
++				ring->count, ring->desc, ring->dma);
++		ring->desc = NULL;
++		ring->dma = 0;
++	}
++}
++
++/*
+  * edma_setup_ring_resources()
+  *	Allocate/setup resources for EDMA rings
+  */
+@@ -358,14 +417,8 @@
+ 		txdesc_ring->id = ehw->txdesc_ring_start + i;
+ 
+ 		ret = edma_setup_txdesc_ring_res(ehw, txdesc_ring);
+-		if (ret != 0) {
+-			while (i-- >= 0)
+-				edma_cleanup_txdesc_ring_res(ehw,
+-					&ehw->txdesc_ring[i]);
+-
+-			return -ENOMEM;
+-
+-		}
++		if (ret != 0)
++			goto mem_alloc_fail;
+ 	}
+ 
+ 	/*
+@@ -378,13 +431,8 @@
+ 
+ 		ret = edma_setup_txcmpl_ring_res(ehw, txcmpl_ring);
+ 
+-		if (ret != 0) {
+-			while (i-- >= 0)
+-				edma_cleanup_txcmpl_ring_res(ehw,
+-						&ehw->txcmpl_ring[i]);
+-
+-			goto txcmpl_mem_alloc_fail;
+-		}
++		if (ret != 0)
++			goto mem_alloc_fail;
+ 	}
+ 
+ 	/*
+@@ -396,13 +444,8 @@
+ 		rxfill_ring->id = ehw->rxfill_ring_start + i;
+ 
+ 		ret = edma_setup_rxfill_ring_res(ehw, rxfill_ring);
+-		if (ret != 0) {
+-			while (--i >= 0)
+-				edma_cleanup_rxfill_ring_res(ehw,
+-					&ehw->rxfill_ring[i]);
+-
+-			goto rxfill_mem_alloc_fail;
+-		}
++		if (ret != 0)
++			goto mem_alloc_fail;
+ 	}
+ 
+ 	/*
+@@ -424,29 +467,14 @@
+ 			&ehw->rxfill_ring[index - ehw->rxfill_ring_start];
+ 
+ 		ret = edma_setup_rxdesc_ring_res(ehw, rxdesc_ring);
+-		if (ret != 0) {
+-			while (--i >= 0)
+-				edma_cleanup_rxdesc_ring_res(ehw,
+-						&ehw->rxdesc_ring[i]);
+-
+-			goto rxdesc_mem_alloc_fail;
+-		}
++		if (ret != 0)
++			goto mem_alloc_fail;
+ 	}
+ 
+ 	return 0;
+ 
+-rxdesc_mem_alloc_fail:
+-	for (i = 0; i < ehw->rxfill_rings; i++)
+-		edma_cleanup_rxfill_ring_res(ehw, &ehw->rxfill_ring[i]);
+-
+-rxfill_mem_alloc_fail:
+-	for (i = 0; i < ehw->txcmpl_rings; i++)
+-		edma_cleanup_txcmpl_ring_res(ehw, &ehw->txcmpl_ring[i]);
+-
+-txcmpl_mem_alloc_fail:
+-	for (i = 0; i < ehw->txdesc_rings; i++)
+-		edma_cleanup_txdesc_ring_res(ehw, &ehw->txdesc_ring[i]);
+-
++mem_alloc_fail:
++	edma_free_unpublished_ring_resources(ehw);
+ 	return -ENOMEM;
+ }
+ 
+@@ -457,9 +485,13 @@
+ static void edma_free_rings(struct edma_hw *ehw)
+ {
+ 	kfree(ehw->rxfill_ring);
++	ehw->rxfill_ring = NULL;
+ 	kfree(ehw->rxdesc_ring);
++	ehw->rxdesc_ring = NULL;
+ 	kfree(ehw->txdesc_ring);
++	ehw->txdesc_ring = NULL;
+ 	kfree(ehw->txcmpl_ring);
++	ehw->txcmpl_ring = NULL;
+ }
+ 
+ /*
+@@ -471,22 +503,22 @@
+ 	ehw->rxfill_ring = kzalloc((sizeof(struct edma_rxfill_ring) *
+ 				ehw->rxfill_rings), GFP_KERNEL);
+ 	if (!ehw->rxfill_ring)
+-		return -ENOMEM;
++		goto mem_alloc_fail;
+ 
+ 	ehw->rxdesc_ring = kzalloc((sizeof(struct edma_rxdesc_ring) *
+ 				ehw->rxdesc_rings), GFP_KERNEL);
+ 	if (!ehw->rxdesc_ring)
+-		goto rxdesc_ring_alloc_fail;
++		goto mem_alloc_fail;
+ 
+ 	ehw->txdesc_ring = kzalloc((sizeof(struct edma_txdesc_ring) *
+ 				ehw->txdesc_rings), GFP_KERNEL);
+ 	if (!ehw->txdesc_ring)
+-		goto txdesc_ring_alloc_fail;
++		goto mem_alloc_fail;
+ 
+ 	ehw->txcmpl_ring = kzalloc((sizeof(struct edma_txcmpl_ring) *
+ 				ehw->txcmpl_rings), GFP_KERNEL);
+ 	if (!ehw->txcmpl_ring)
+-		goto txcmpl_ring_alloc_fail;
++		goto mem_alloc_fail;
+ 
+ 	pr_info("Num rings - TxDesc:%u (%u-%u) TxCmpl:%u (%u-%u)\n",
+ 			ehw->txdesc_rings, ehw->txdesc_ring_start,
+@@ -501,12 +533,8 @@
+ 		(ehw->rxfill_ring_start + ehw->rxfill_rings - 1));
+ 
+ 	return 0;
+-txcmpl_ring_alloc_fail:
+-	kfree(ehw->txdesc_ring);
+-txdesc_ring_alloc_fail:
+-	kfree(ehw->rxdesc_ring);
+-rxdesc_ring_alloc_fail:
+-	kfree(ehw->rxfill_ring);
++mem_alloc_fail:
++	edma_free_rings(ehw);
+ 	return -ENOMEM;
+ }
+ 
+@@ -558,8 +586,10 @@
+ 		return ret;
+ 
+ 	ret = edma_setup_ring_resources(ehw);
+-	if (ret)
++	if (ret) {
++		edma_free_rings(ehw);
+ 		return ret;
++	}
+ 
+ 	return 0;
+ }

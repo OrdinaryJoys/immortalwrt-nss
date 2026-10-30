@@ -1,0 +1,61 @@
+# EDMA v1 Unpublished Allocation Unwind
+
+`tests/test-edma-allocation-unwind.py` creates a fresh output directory, reads
+the exact DP pin from a local Git cache, and replays the baseline receipt's
+001-012 patches followed by 013 with zero fuzz/offset. It never executes a
+program from a prepared/archived tree. The supplied baseline C/header/register
+files must match that fresh replay byte for byte.
+
+The runner extracts complete allocation, cleanup and hardware configuration
+functions from the replayed C. Other function definitions must remain byte
+identical; only allocation acquisition/release and unpublished rollback may
+change. Actual ring structs, register constants and SoC macros are retained.
+Linux allocation, MMIO, reset and RX buffer fill are explicit host mocks.
+
+The positive matrix covers every software-array/coherent allocation failure,
+the stock DTS single-ring geometry, synthetic nonzero-start multi-ring geometry,
+same-object failure/retry, repeated failures, every coherent position receiving
+a valid zero DMA handle, and unchanged successful allocation/MMIO/RX-fill traces.
+The fully allocated but unpublished helper is also called twice, with each
+coherent position assigned DMA handle zero in turn. Actual rollback zero-handle
+releases are counted separately from fixture success disposal.
+An ownership ledger rejects unacquired/double/wrong-size/wrong-device frees,
+nonretired descriptor/array pointers, leaked resources, post-failure MMIO,
+streaming unmaps, packet frees and packet-store changes. Success disposal is a
+fixture action, not execution or qualification of production live teardown.
+
+Negative controls include the actual old source, decrement-only repair,
+missing array release, uncleared pointers, skipped zero-DMA ownership,
+unacquired coherent free and accidental live cleanup. Compilation failures are
+fatal, never counted as detected runtime defects. Positive compile/run stderr
+must be empty. Clang mode enables AddressSanitizer and UndefinedBehaviorSanitizer,
+`-fno-sanitize-recover=all`, and `UBSAN_OPTIONS=halt_on_error=1`; separate failing
+canaries require specific sanitizer diagnostics and demonstrate halt behavior.
+ASan's minimum redzone is 128 bytes so a negative ring index cannot accidentally
+land inside a neighboring valid host allocation. The old TXDESC and TXCMPL
+loops must each produce a heap-buffer-overflow diagnostic in sanitized mode.
+Inherited sign comparisons, unused parameters/functions and unsigned-zero
+comparisons are excluded from host warning errors; all other enabled warnings
+remain errors, and successful compilation still requires empty stderr.
+LeakSanitizer is disabled for macOS portability; allocation leaks are checked
+explicitly by the host ledger, not claimed as LeakSanitizer coverage.
+
+Example (run from the source checkout, substitute fresh output paths):
+
+```sh
+python3 tests/test-edma-allocation-unwind.py BASELINE/qca-nss-dp \
+  --receipt BASELINE/receipt.json --upstream-cache LOCAL/qca-nss-dp \
+  --cc /opt/homebrew/opt/gcc/bin/gcc-16 --output AUDIT/edma-gcc-fresh
+python3 tests/test-edma-allocation-unwind.py BASELINE/qca-nss-dp \
+  --receipt BASELINE/receipt.json --upstream-cache LOCAL/qca-nss-dp \
+  --cc /usr/bin/clang --sanitize --output AUDIT/edma-clang-fresh
+```
+
+No make, target/kernel/module/firmware build, device access or network is used.
+These tests do not resolve B-DP-002/003, validate runtime DMA stopping, emulate
+interrupts, prove target ABI/build compatibility, or justify changing ring/IRQ
+parameters. Generated C, binaries, logs, commands and input hashes live only in
+the fresh audit output directory, outside production paths.
+The allocation entry contract is a fresh or fully unwound instance with positive
+valid ring counts, not reinitialization over still-owned live rings. Invalid DTS
+geometry and concurrent allocation/teardown are outside this repair.
