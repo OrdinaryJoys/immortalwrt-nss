@@ -1,0 +1,633 @@
+--- a/src/init/ssdk_plat.c
++++ b/src/init/ssdk_plat.c
+@@ -46,6 +46,7 @@
+ #include <linux/clk.h>
+ #include <linux/delay.h>
+ #include <linux/string.h>
++#include <linux/spinlock.h>
+ #include <linux/bitops.h>
+ #include <linux/mdio-bitbang.h>
+ #include <net/dsa.h>
+@@ -1466,33 +1467,274 @@
+ 	return port_id;
+ }
+ 
+-sw_error_t ssdk_netdev_switch_init(struct net_device *dev)
++/* Every populated cell owns one reference; names never borrow netdev storage. */
++static DEFINE_SPINLOCK(ssdk_netdev_cache_lock);
++static bool ssdk_netdev_cache_accepting;
++static bool ssdk_netdev_cache_live;
++static bool ssdk_netdev_managed[SW_MAX_NR_DEV][SW_MAX_NR_PORT];
++static char ssdk_netdev_names[SW_MAX_NR_DEV][SW_MAX_NR_PORT][IFNAMSIZ];
++static char ssdk_switch_names[SSDK_NETDEV_SWITCH_NUM][IFNAMSIZ];
++
++/* Snapshot only: callers still need their provider/root lifetime contract. */
++bool ssdk_netdev_cache_ready(void)
+ {
+-	ssdk_netdev_switch_t *netdev_switch = NULL;
+-	a_uint32_t port_id, dev_id = 0;
+-	phy_info_t *phyinfo = NULL;
++	bool ready;
+ 
+-	/* netdev info for PPE port */
+-	port_id = ssdk_netdev_to_portid(dev);
+-	if (port_id >= SW_MAX_NR_PORT)
+-		return SW_BAD_VALUE;
++	spin_lock_bh(&ssdk_netdev_cache_lock);
++	ready = ssdk_netdev_cache_live;
++	spin_unlock_bh(&ssdk_netdev_cache_lock);
++	return ready;
++}
++EXPORT_SYMBOL(ssdk_netdev_cache_ready);
+ 
+-	if (A_TRUE != hsl_port_prop_check(dev_id, port_id, HSL_PP_EXCL_CPU))
+-		return SW_BAD_VALUE;
+-	phyinfo = hsl_phy_info_get(dev_id);
+-	SW_RTN_ON_NULL(phyinfo);
+-	phyinfo->netdev[port_id] = dev;
+-
+-	/* netdev switch info for PPE port which connected with switch */
+-	netdev_switch = ssdk_dts_netdev_switch_find(port_id);
+-	if(!netdev_switch)
+-		return SW_NOT_FOUND;
++/* Selected native HPPE/device0 ownership intent, before any PHY attachment. */
++bool ssdk_netdev_cache_mark_native_port(a_uint32_t dev_id, a_uint32_t port_id)
++{
++	bool marked = false;
++#ifdef HPPE
++	hsl_dev_t *pdev;
++#endif
+ 
+-	netdev_switch->dev = dev;
++	if (dev_id != 0 || port_id < SSDK_PHYSICAL_PORT1 ||
++		port_id > SSDK_PHYSICAL_PORT6)
++		return false;
++	spin_lock_bh(&ssdk_netdev_cache_lock);
++#ifdef HPPE
++	if (ssdk_netdev_cache_live &&
++		hsl_get_current_chip_type(dev_id) == CHIP_HPPE &&
++		adpt_ppe_type_get(dev_id) == HPPE_TYPE) {
++		pdev = hsl_dev_ptr_get(dev_id);
++		/* nr_ports witnesses CPU metadata init; it is not a maximum port id. */
++		if (pdev && pdev->nr_ports && pdev->cpu_port_nr < SW_MAX_NR_PORT &&
++			port_id != pdev->cpu_port_nr) {
++			ssdk_netdev_managed[dev_id][port_id] = true;
++			marked = true;
++		}
++	}
++#endif
++	spin_unlock_bh(&ssdk_netdev_cache_lock);
++	return marked;
++}
++EXPORT_SYMBOL(ssdk_netdev_cache_mark_native_port);
+ 
+-	return SW_OK;
++void ssdk_netdev_cache_start(void)
++{
++	spin_lock_bh(&ssdk_netdev_cache_lock);
++	ssdk_netdev_cache_accepting = true;
++	ssdk_netdev_cache_live = false;
++	spin_unlock_bh(&ssdk_netdev_cache_lock);
++}
++
++void ssdk_netdev_cache_commit(void)
++{
++	spin_lock_bh(&ssdk_netdev_cache_lock);
++	if (ssdk_netdev_cache_accepting)
++		ssdk_netdev_cache_live = true;
++	spin_unlock_bh(&ssdk_netdev_cache_lock);
++}
++
++static void ssdk_netdev_cache_remove(struct net_device *dev, bool stop)
++{
++	struct net_device *old[SW_MAX_NR_DEV * SW_MAX_NR_PORT + SSDK_NETDEV_SWITCH_NUM];
++	phy_info_t *phyinfo;
++	ssdk_netdev_switch_t *sw;
++	a_uint32_t d, p, n = 0;
++
++	spin_lock_bh(&ssdk_netdev_cache_lock);
++	if (!ssdk_netdev_cache_accepting) {
++		spin_unlock_bh(&ssdk_netdev_cache_lock);
++		return;
++	}
++	if (stop) {
++		ssdk_netdev_cache_accepting = false;
++		ssdk_netdev_cache_live = false;
++	}
++	for (d = 0; d < SW_MAX_NR_DEV; d++) {
++		phyinfo = hsl_phy_info_get(d);
++		if (!phyinfo)
++			continue;
++		for (p = 0; p < SW_MAX_NR_PORT; p++) {
++			if (phyinfo->netdev[p] && (stop || phyinfo->netdev[p] == dev)) {
++				old[n++] = phyinfo->netdev[p];
++				phyinfo->netdev[p] = NULL;
++				ssdk_netdev_names[d][p][0] = '\0';
++			}
++		}
++	}
++	for (p = 0; p < SSDK_NETDEV_SWITCH_NUM; p++) {
++		sw = ssdk_dts_netdev_switch_get(p);
++		if (sw->dev && (stop || sw->dev == dev)) {
++			old[n++] = sw->dev;
++			sw->dev = NULL;
++			ssdk_switch_names[p][0] = '\0';
++		}
++	}
++	spin_unlock_bh(&ssdk_netdev_cache_lock);
++	while (n)
++		dev_put(old[--n]);
+ }
+ 
++void ssdk_netdev_cache_stop(void)
++{
++	ssdk_netdev_cache_remove(NULL, true);
++}
++
++void ssdk_netdev_cache_unregister(struct net_device *dev)
++{
++	if (dev)
++		ssdk_netdev_cache_remove(dev, false);
++}
++
++void ssdk_netdev_cache_rename(struct net_device *dev)
++{
++	phy_info_t *phyinfo;
++	ssdk_netdev_switch_t *sw;
++	a_uint32_t d, p;
++
++	if (!dev)
++		return;
++	spin_lock_bh(&ssdk_netdev_cache_lock);
++	if (!ssdk_netdev_cache_accepting)
++		goto out;
++	for (d = 0; d < SW_MAX_NR_DEV; d++) {
++		phyinfo = hsl_phy_info_get(d);
++		if (!phyinfo)
++			continue;
++		for (p = 0; p < SW_MAX_NR_PORT; p++)
++			if (phyinfo->netdev[p] == dev)
++				strscpy(ssdk_netdev_names[d][p], dev->name, IFNAMSIZ);
++	}
++	for (p = 0; p < SSDK_NETDEV_SWITCH_NUM; p++) {
++		sw = ssdk_dts_netdev_switch_get(p);
++		if (sw->dev == dev)
++			strscpy(ssdk_switch_names[p], dev->name, IFNAMSIZ);
++	}
++out:
++	spin_unlock_bh(&ssdk_netdev_cache_lock);
++}
++
++/* 1: owned snapshot; 0: never-managed legacy miss; -1: no fallback. */
++int ssdk_netdev_cache_name(a_uint32_t dev_id, a_uint32_t port_id,
++	char *name, size_t size)
++{
++	phy_info_t *phyinfo;
++	int ret = -1;
++
++	if (!name || size < IFNAMSIZ)
++		return -1;
++	name[0] = '\0';
++	if (dev_id >= SW_MAX_NR_DEV || port_id >= SW_MAX_NR_PORT)
++		return -1;
++	spin_lock_bh(&ssdk_netdev_cache_lock);
++	if (!ssdk_netdev_managed[dev_id][port_id]) {
++		ret = 0;
++	} else if (ssdk_netdev_cache_live) {
++		phyinfo = hsl_phy_info_get(dev_id);
++		if (phyinfo && phyinfo->netdev[port_id]) {
++			memcpy(name, ssdk_netdev_names[dev_id][port_id], IFNAMSIZ);
++			ret = 1;
++		}
++	}
++	spin_unlock_bh(&ssdk_netdev_cache_lock);
++	return ret;
++}
++
++int ssdk_netdev_cache_index(struct net_device *dev)
++{
++	ssdk_netdev_switch_t *sw;
++	int found = -1;
++	a_uint32_t p;
++
++	spin_lock_bh(&ssdk_netdev_cache_lock);
++	if (ssdk_netdev_cache_live && dev)
++		for (p = 0; p < SSDK_NETDEV_SWITCH_NUM; p++) {
++			sw = ssdk_dts_netdev_switch_get(p);
++			if (sw->dev == dev) {
++				found = p;
++				break;
++			}
++		}
++	spin_unlock_bh(&ssdk_netdev_cache_lock);
++	return found;
++}
++
++#if IS_ENABLED(CONFIG_NET_DSA)
++static struct net_device *ssdk_switch_netdev_get(a_uint32_t dev_id)
++{
++	ssdk_netdev_switch_t *sw;
++	struct net_device *dev = NULL;
++
++	spin_lock_bh(&ssdk_netdev_cache_lock);
++	if (ssdk_netdev_cache_live) {
++		sw = ssdk_dts_netdev_switch_find_by_devid(dev_id);
++		if (sw && sw->dev) {
++			dev = sw->dev;
++			dev_hold(dev);
++		}
++	}
++	spin_unlock_bh(&ssdk_netdev_cache_lock);
++	return dev;
++}
++#endif
++
++static void ssdk_switch_name_copy(a_uint32_t index, char *name)
++{
++	name[0] = '\0';
++	spin_lock_bh(&ssdk_netdev_cache_lock);
++	if (ssdk_netdev_cache_live && index < SSDK_NETDEV_SWITCH_NUM)
++		memcpy(name, ssdk_switch_names[index], IFNAMSIZ);
++	spin_unlock_bh(&ssdk_netdev_cache_lock);
++}
++
++sw_error_t ssdk_netdev_switch_init(struct net_device *dev)
++{
++	struct net_device *old[2];
++	ssdk_netdev_switch_t *sw;
++	a_uint32_t port_id, dev_id = 0, p, n = 0;
++	phy_info_t *phyinfo;
++	sw_error_t ret = SW_BAD_VALUE;
++
++	if (!dev)
++		return SW_BAD_VALUE;
++	port_id = ssdk_netdev_to_portid(dev);
++	if (port_id >= SW_MAX_NR_PORT)
++		return SW_BAD_VALUE;
++	spin_lock_bh(&ssdk_netdev_cache_lock);
++	if (!ssdk_netdev_cache_accepting)
++		goto out;
++	phyinfo = hsl_phy_info_get(dev_id);
++	if (!phyinfo || A_TRUE != hsl_port_prop_check(dev_id, port_id, HSL_PP_EXCL_CPU))
++		goto out;
++	if (phyinfo->netdev[port_id] != dev) {
++		dev_hold(dev);
++		if (phyinfo->netdev[port_id])
++			old[n++] = phyinfo->netdev[port_id];
++		phyinfo->netdev[port_id] = dev;
++	}
++	ssdk_netdev_managed[dev_id][port_id] = true;
++	strscpy(ssdk_netdev_names[dev_id][port_id], dev->name, IFNAMSIZ);
++	ret = SW_NOT_FOUND;
++	for (p = 0; p < SSDK_NETDEV_SWITCH_NUM; p++) {
++		sw = ssdk_dts_netdev_switch_get(p);
++		if (sw->switch_netdev_port != port_id)
++			continue;
++		if (sw->dev != dev) {
++			dev_hold(dev);
++			if (sw->dev)
++				old[n++] = sw->dev;
++			sw->dev = dev;
++		}
++		strscpy(ssdk_switch_names[p], dev->name, IFNAMSIZ);
++		ret = SW_OK;
++		break;
++	}
++out:
++	spin_unlock_bh(&ssdk_netdev_cache_lock);
++	while (n)
++		dev_put(old[--n]);
++	return ret;
++}
++
+ /* Set switch ERP standby status if required */
+ void ssdk_switch_set_standby_status(a_uint32_t dev_id, bool enable)
+ {
+@@ -1514,15 +1756,25 @@
+ 
+ #if IS_ENABLED(CONFIG_NET_DSA)
+ 	/* If DSA is enabled, notify to set DSA switch standby status */
+-	if (netdev_switch->dev && netdev_uses_dsa(netdev_switch->dev)) {
+-		struct dsa_switch *ds= netdev_switch->dev->dsa_ptr->ds;
+-		if (!ds || !ds->ops)
++	{
++		struct net_device *netdev = ssdk_switch_netdev_get(dev_id);
++		struct dsa_switch *ds;
++
++		if (!netdev)
+ 			return;
++		/* The local ref pins netdev allocation, not its DSA child/ops. */
++		if (!netdev_uses_dsa(netdev))
++			goto put;
++		ds = netdev->dsa_ptr->ds;
++		if (!ds || !ds->ops)
++			goto put;
+ 
+ 		if (enable && ds->ops->suspend)
+ 			ds->ops->suspend(ds);
+ 		if (!enable && ds->ops->resume)
+ 			ds->ops->resume(ds);
++	put:
++		dev_put(netdev);
+ 	}
+ #endif
+ }
+@@ -1530,11 +1782,15 @@
+ #if IS_ENABLED(CONFIG_NET_DSA)
+ a_bool_t ssdk_switch_enable_dsa(a_uint32_t dev_id)
+ {
+-	ssdk_netdev_switch_t *netdev_switch = ssdk_dts_netdev_switch_find_by_devid(dev_id);
+-	if (netdev_switch && netdev_switch->dev && netdev_uses_dsa(netdev_switch->dev))
+-		return A_TRUE;
++	struct net_device *netdev = ssdk_switch_netdev_get(dev_id);
++	a_bool_t enable = A_FALSE;
+ 
+-	return A_FALSE;
++	if (netdev) {
++		enable = netdev_uses_dsa(netdev) ? A_TRUE : A_FALSE;
++		dev_put(netdev);
++	}
++
++	return enable;
+ }
+ #endif
+ 
+@@ -1545,6 +1801,8 @@
+ 	ssdk_netdev_switch_t *netdev_switch = NULL;
+ 	a_bool_t enable = A_FALSE;
+ 	a_ulong_t port = 0, switch_pbmp = 0;
++	fal_pbmp_t member_bmp;
++	char ifname[IFNAMSIZ];
+ 
+ 	len += snprintf(buf + len, (ssize_t)(PAGE_SIZE - len),
+ 		"{\n \"switches\":\n [\n");
+@@ -1553,19 +1811,22 @@
+ 		if(netdev_switch->switch_connected)
+ 		{
+ 			dev_id = netdev_switch->switch_dev_id;
++			ssdk_switch_name_copy(index, ifname);
+ 			len += snprintf(buf + len, (ssize_t)(PAGE_SIZE - len),
+ 				"   {\n"
+ 				"     \"name\":\"%s\",\n" \
+ 				"     \"switch_connected\":\"%s\",\n" \
+ 				"     \"switch_device_id\":\"%d\",\n" \
+ 				"     \"switch_cpu_port\":\"%d\",\n",
+-				netdev_switch->dev->name,
++				ifname,
+ 				netdev_switch->switch_connected ? "yes": "no",
+ 				dev_id,
+ 				netdev_switch->switch_cpu_port
+ 			);
++			member_bmp = netdev_switch->switch_port_bmp;
+ 			fal_portvlan_member_get(dev_id, netdev_switch->switch_cpu_port,
+-				(fal_pbmp_t*)&netdev_switch->switch_port_bmp);
++				&member_bmp);
++			netdev_switch->switch_port_bmp = (a_uint8_t)member_bmp;
+ 			switch_pbmp = netdev_switch->switch_port_bmp;
+ 			len += snprintf(buf + len, (ssize_t)(PAGE_SIZE - len),
+ 				"     \"switch_ports\":\"");
+--- a/src/init/ssdk_init.c
++++ b/src/init/ssdk_init.c
+@@ -107,6 +107,8 @@
+ #endif
+ #include "ssdk_plat.h"
+ struct notifier_block ssdk_dev_notifier;
++static bool ssdk_dev_notifier_owned;
++static int ssdk_dev_notifier_error;
+ #ifdef IN_SFP_PHY
+ #include "sfp_phy.h"
+ #endif
+@@ -156,33 +158,34 @@
+ ssdk_ifname_to_port(a_uint32_t dev_id, const char *ifname)
+ {
+ 	struct net_device *eth_dev = NULL;
++	a_uint32_t port_id = 0;
++
+ 	eth_dev = dev_get_by_name(&init_net, ifname);
+-	if (!eth_dev || !eth_dev->phydev)
+-	{
++	if (!eth_dev)
+ 		return 0;
+-	}
++	/* Netdev ref does not serialize PHY attachment; retain the owner contract. */
++	if (eth_dev->phydev)
++		port_id = qca_ssdk_phydev_to_port(dev_id, eth_dev->phydev);
+ 	dev_put(eth_dev);
+-	return qca_ssdk_phydev_to_port(dev_id, eth_dev->phydev);
++	return port_id;
+ }
+ 
+-char *
+-ssdk_port_to_ifname(a_uint32_t dev_id, a_uint32_t port_id)
++bool ssdk_port_to_ifname_copy(a_uint32_t dev_id, a_uint32_t port_id,
++	char *name, size_t size)
+ {
+ 	struct phy_device *phydev = NULL;
+-	phy_info_t *phyinfo = hsl_phy_info_get(dev_id);
++	int cached = ssdk_netdev_cache_name(dev_id, port_id, name, size);
+ 
+-	if (phyinfo->netdev[port_id])
+-		return phyinfo->netdev[port_id]->name;
++	if (cached)
++		return cached > 0;
+ 
++	/* Never-managed legacy only: source/PHY/BH lifetime is still owner-defined. */
+ 	hsl_port_phydev_get(dev_id, port_id, &phydev);
+-	if (phydev && phydev->attached_dev)
+-	{
+-		return phydev->attached_dev->name;
++	if (phydev && phydev->attached_dev) {
++		strscpy(name, phydev->attached_dev->name, size);
++		return true;
+ 	}
+-	else
+-	{
+-		return NULL;
+-	}
++	return false;
+ }
+ 
+ static void
+@@ -1638,6 +1641,7 @@
+ {
+ 	sw_error_t rv;
+ 
++	ssdk_netdev_cache_stop();
+ 	ssdk_fdb_retire_controls();
+ 	rv = fal_cleanup(dev_id);
+ /*qca808x_end*/
+@@ -1880,11 +1884,24 @@
+ 	ssdk_init_cfg cfg;
+ #ifdef MP
+ 	a_uint32_t port_id = 0, dev_id = 0;
+-	struct qca_phy_priv *priv = ssdk_phy_priv_data_get(dev_id);
+-	adpt_api_t *p_api = adpt_api_ptr_get(dev_id);
++	struct qca_phy_priv *priv;
++	adpt_api_t *p_api;
+ #endif
+ 	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
+ 
++	/* Retirement/rename must not depend on chip, PHY or admission success. */
++	if (event == NETDEV_UNREGISTER) {
++		ssdk_netdev_cache_unregister(dev);
++		return NOTIFY_DONE;
++	}
++	if (event == NETDEV_CHANGENAME) {
++		ssdk_netdev_cache_rename(dev);
++		return NOTIFY_DONE;
++	}
++#ifdef MP
++	priv = ssdk_phy_priv_data_get(dev_id);
++	p_api = adpt_api_ptr_get(dev_id);
++#endif
+ 	ssdk_cfg_default_init(&cfg);
+ 	rv = chip_ver_get(0, &cfg);
+ 	if (rv) {
+@@ -1951,13 +1968,43 @@
+ 	}
+ 
+ 	return NOTIFY_DONE;
++}
++
++static void ssdk_netdev_notifier_register(void)
++{
++	if (ssdk_dev_notifier_owned)
++		return;
++	ssdk_netdev_cache_start();
++	ssdk_dev_notifier.notifier_call = ssdk_dev_event;
++	ssdk_dev_notifier.priority = 1;
++	ssdk_dev_notifier_error = register_netdevice_notifier(&ssdk_dev_notifier);
++	if (ssdk_dev_notifier_error) {
++		ssdk_dev_notifier_owned = false;
++		/* Replay rollback excludes its current failing device. */
++		ssdk_netdev_cache_stop();
++		SSDK_ERROR("optional netdev notifier registration failed (code: %d)\n",
++			ssdk_dev_notifier_error);
++		return;
++	}
++	ssdk_dev_notifier_owned = true;
++	ssdk_netdev_cache_commit();
+ }
+ 
++static void ssdk_netdev_notifier_unregister(void)
++{
++	ssdk_netdev_cache_stop();
++	if (ssdk_dev_notifier_owned) {
++		unregister_netdevice_notifier(&ssdk_dev_notifier);
++		ssdk_dev_notifier_owned = false;
++	}
++}
++
+ /*qca808x_start*/
+ static void ssdk_free_priv(void)
+ {
+ 	a_uint32_t dev_id, dev_num = 1;
+ 
++	ssdk_netdev_cache_stop();
+ 	ssdk_fdb_retire_controls();
+ 	if(!qca_phy_priv_global) {
+ 		return;
+@@ -2180,9 +2227,7 @@
+ 
+ 	if (rv == 0){
+ 		/* register the notifier later should be ok */
+-		ssdk_dev_notifier.notifier_call = ssdk_dev_event;
+-		ssdk_dev_notifier.priority = 1;
+-		register_netdevice_notifier(&ssdk_dev_notifier);
++		ssdk_netdev_notifier_register();
+ 	}
+ /*qca808x_start*/
+ 
+@@ -2208,7 +2253,7 @@
+ 	a_uint32_t dev_id, dev_num = 1;
+ 	sw_error_t rv = SW_OK;
+ /*qca808x_end*/
+-	unregister_netdevice_notifier(&ssdk_dev_notifier);
++	ssdk_netdev_notifier_unregister();
+ 	ssdk_fdb_retire_controls();
+ 
+ 	dev_num = ssdk_switch_device_num_get();
+--- a/src/init/ssdk_dts.c
++++ b/src/init/ssdk_dts.c
+@@ -320,14 +320,9 @@
+ ssdk_netdev_switch_t *
+ ssdk_dts_netdev_switch_find_by_netdev(struct net_device *netdev)
+ {
+-	a_uint32_t index = 0;
++	int index = ssdk_netdev_cache_index(netdev);
+ 
+-	for (index = 0; index < SSDK_NETDEV_SWITCH_NUM; index++) {
+-		if (ssdk_dt_global.netdev_switch[index].dev == netdev)
+-			return &ssdk_dt_global.netdev_switch[index];
+-	}
+-
+-	return NULL;
++	return index < 0 ? NULL : ssdk_dts_netdev_switch_get(index);
+ }
+ 
+ ssdk_netdev_switch_t *
+--- a/src/ref/ref_fdb.c
++++ b/src/ref/ref_fdb.c
+@@ -218,7 +218,7 @@
+ static sw_error_t
+ _ref_fdb_notify_mac(struct qca_phy_priv *priv)
+ {
+-	char *ifname = NULL;
++	char ifname[IFNAMSIZ];
+ 	ref_fdb_info_t *pfdb = NULL, *pfdb_next = NULL;
+ 	/* check and notify mac devices */
+ 	list_for_each_entry_safe(pfdb, pfdb_next, &(priv->sw_fdb_tbl), list)
+@@ -229,8 +229,8 @@
+ 		if (pfdb->state == REF_FDB_MAC_NEW)
+ 		{
+ 			if(SW_IS_PBMP_MEMBER(priv->fdb_sw_sync_port_map, pfdb->entry.port.id)) {
+-				ifname = ssdk_port_to_ifname(priv->device_id, pfdb->entry.port.id);
+-				if (ifname)
++				if (ssdk_port_to_ifname_copy(priv->device_id, pfdb->entry.port.id,
++					ifname, sizeof(ifname)))
+ 				{
+ 					SSDK_DEBUG("nofity new device on port %d ifname %s macaddr "
+ 						SW_MACSTR "\n", pfdb->entry.port.id,
+@@ -247,8 +247,8 @@
+ 		else if (pfdb->state == REF_FDB_MAC_EXPIRE)
+ 		{
+ 			if(SW_IS_PBMP_MEMBER(priv->fdb_sw_sync_port_map, pfdb->entry.port.id)) {
+-				ifname = ssdk_port_to_ifname(priv->device_id, pfdb->entry.port.id);
+-				if (ifname)
++				if (ssdk_port_to_ifname_copy(priv->device_id, pfdb->entry.port.id,
++					ifname, sizeof(ifname)))
+ 				{
+ 					SSDK_DEBUG("notify expire device on port %d ifname %s"
+ 						"macaddr "SW_MACSTR "\n", pfdb->entry.port.id,
+--- a/include/init/ssdk_init.h
++++ b/include/init/ssdk_init.h
+@@ -344,8 +344,10 @@
+ qca_hppe_port_mac_type_set(a_uint32_t dev_id, a_uint32_t port_id, a_uint32_t port_type);
+ a_uint32_t
+ ssdk_ifname_to_port(a_uint32_t dev_id, const char *ifname);
+-char *
+-ssdk_port_to_ifname(a_uint32_t dev_id, a_uint32_t port_id);
++bool ssdk_netdev_cache_ready(void);
++bool ssdk_netdev_cache_mark_native_port(a_uint32_t dev_id, a_uint32_t port_id);
++bool ssdk_port_to_ifname_copy(a_uint32_t dev_id, a_uint32_t port_id,
++	char *name, size_t size);
+ void ssdk_portvlan_init(a_uint32_t dev_id);
+ void qca_mac_port_status_init(a_uint32_t dev_id, a_uint32_t port_id);
+ /*qca808x_start*/
+--- a/include/init/ssdk_plat.h
++++ b/include/init/ssdk_plat.h
+@@ -530,6 +530,14 @@
+ #define qca_mht_mii_write qca_mii_write
+ #define qca_mht_mii_update qca_mii_update
+ sw_error_t ssdk_netdev_switch_init(struct net_device *dev);
++void ssdk_netdev_cache_start(void);
++void ssdk_netdev_cache_commit(void);
++void ssdk_netdev_cache_stop(void);
++void ssdk_netdev_cache_unregister(struct net_device *dev);
++void ssdk_netdev_cache_rename(struct net_device *dev);
++int ssdk_netdev_cache_name(a_uint32_t dev_id, a_uint32_t port_id,
++	char *name, size_t size);
++int ssdk_netdev_cache_index(struct net_device *dev);
+ #if IS_ENABLED(CONFIG_NET_DSA)
+ void ssdk_switch_set_standby_status(a_uint32_t dev_id, bool enable);
+ a_bool_t ssdk_switch_enable_dsa(a_uint32_t dev_id);
