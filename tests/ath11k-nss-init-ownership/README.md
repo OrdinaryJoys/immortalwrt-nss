@@ -1,7 +1,10 @@
 # NSS init ownership host test
 
 This test extracts seven complete functions from the prepared ath11k tree and
-eight registry/state functions from the exact prepared NSS driver. It does not
+eight legacy registry/state functions and, when present, both opaque-context
+registration functions from the exact prepared NSS driver. The registry
+structure is extracted from that driver's header rather than handwritten.
+It does not
 compile or execute a Linux module or firmware.
 
 ```sh
@@ -17,6 +20,9 @@ Covered contracts:
 - Preserve the original admission point: readiness may arrive during sleeping
   descriptor allocation, and a later retry on the same object must still work.
 - Preserve a foreign external interface when using/releasing the second slot.
+- Count either legacy netdevice or opaque ownership. The modeled provider-loss
+  injection observes registry publication (including release publication of
+  opaque context), not an obsolete assumption that registration takes a lock.
 - Descriptor CPU ownership, a successful DMA address zero, failed handles left
   untouched/zero/error-valued, metadata clearing and repeated host cleanup.
 - Real descriptor limits and both message arrays, 1/2/3 radio parameter shapes,
@@ -34,7 +40,7 @@ Limits:
   mismatch assertions are not proof of backend double-free: Linux guards NULL.
 - Locking, scheduling, allocation and firmware replies are modeled. Unsupported
   synthetic hardware/radio combinations are not actual device qualifications.
-- Only the descriptor message structures are copied from driver headers; other
+- Descriptor messages and the registry structure are copied from driver headers; other
   layouts, ring/interface IDs and firmware behavior are host contracts, not ABI.
 - Post-send failures preserve the existing init unwind behavior. The test does
   not establish firmware quiescence, callback draining or the full N03/N04 path.

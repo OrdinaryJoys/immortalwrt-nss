@@ -50,14 +50,13 @@ struct nss_wifili_msg;
 typedef void (*nss_wifili_callback_t)(struct net_device *, struct sk_buff *, struct napi_struct *);
 typedef nss_wifili_callback_t nss_phys_if_rx_callback_t;
 typedef nss_wifili_callback_t nss_phys_if_rx_ext_data_callback_t;
+typedef void (*nss_phys_if_xmit_callback_t)(void *, struct sk_buff *);
 typedef void (*nss_wifili_msg_callback_t)(void *, struct nss_wifili_msg *);
-struct nss_subsystem_dataplane_register {
-    nss_phys_if_rx_callback_t cb;
-    nss_phys_if_rx_ext_data_callback_t ext_cb;
-    void *app_data;
-    struct net_device *ndev;
-    u32 features, type;
-};
+typedef void (*nss_wifili_ctx_callback_t)(void *, struct sk_buff *, struct napi_struct *);
+HOST_REGISTRY
+static void host_registry_publication(void);
+#define smp_load_acquire(p) __atomic_load_n((p), __ATOMIC_ACQUIRE)
+#define smp_store_release(p,v) do { __atomic_store_n((p), (v), __ATOMIC_RELEASE); host_registry_publication(); } while (0)
 struct nss_ctx_instance { int state; struct nss_subsystem_dataplane_register subsys_dp_register[256]; };
 static struct { int lock, wifi_handler_id; struct nss_ctx_instance nss[1]; nss_wifili_msg_callback_t wifili_msg_callback; } nss_top_main;
 static struct { int lock; struct { int ifnum; bool in_use; } state_tbl[2]; } nss_wifi_eif_info;
@@ -100,12 +99,24 @@ static dma_addr_t next_dma;
 static struct { void *cpu; dma_addr_t dma; size_t size; bool live; } allocations[256];
 static void check_n01(bool value) { checks++; if (!value) { failures++; n01_failures++; } }
 static void check_n02(bool value) { checks++; if (!value) { failures++; n02_failures++; } }
+static bool registry_owned(const struct nss_subsystem_dataplane_register *reg)
+{
+#if HOST_OPAQUE_REGISTRY
+    return reg->ndev || reg->wifili_ctx;
+#else
+    return reg->ndev != NULL;
+#endif
+}
+static void host_registry_publication(void)
+{
+    if (active && fault == LOST_AFTER_PUBLICATION &&
+        registry_owned(&nss_top_main.nss[0].subsys_dp_register[active->nss.if_num]))
+        nss_top_main.nss[0].state = 0;
+}
 static void spin_lock_bh(int *lock)
 {
     BUG_ON((*lock)++);
-    if (lock == &nss_top_main.lock && fault == LOST_AFTER_PUBLICATION &&
-        nss_top_main.nss[0].subsys_dp_register[active->nss.if_num].ndev)
-        nss_top_main.nss[0].state = 0;
+    if (lock == &nss_top_main.lock) host_registry_publication();
 }
 static void spin_unlock_bh(int *lock) { BUG_ON(--(*lock)); }
 static void *kzalloc(size_t bytes, int flags)
@@ -143,7 +154,11 @@ static int of_property_read_u32(const int *node, const char *name, u32 *value)
 static void ath11k_nss_fill_srng_info(struct ath11k_base *ab, int ring, struct nss_wifili_hal_srng_info *info)
 { (void)ab; (void)ring; (void)info; }
 static void ath11k_nss_wifili_event_receive(void *ab, struct nss_wifili_msg *msg) { (void)ab; (void)msg; }
+#if HOST_OPAQUE_REGISTRY
+static void ath11k_nss_wifili_ext_callback_wrapper(void *dev, struct sk_buff *skb, struct napi_struct *napi)
+#else
 static void ath11k_nss_wifili_ext_callback_wrapper(struct net_device *dev, struct sk_buff *skb, struct napi_struct *napi)
+#endif
 { (void)dev; (void)skb; (void)napi; }
 static void nss_cmn_msg_init(void *cm, int num, int type, size_t size, nss_wifili_msg_callback_t cb, void *data)
 { (void)num; (void)size; (void)cb; (void)data; ((struct nss_wifili_msg *)cm)->cm.type = type; }
@@ -160,7 +175,7 @@ static int wait_for_completion_timeout(int *value, int timeout) { (void)value; (
 DRIVER_FUNCTIONS
 HOST_FUNCTIONS
 static unsigned live_dma(void) { unsigned n = 0; for (unsigned i = 0; i < count; i++) n += allocations[i].live; return n; }
-static unsigned registrations(void) { unsigned n = 0; for (int i = 0; i < 256; i++) n += nss_top_main.nss[0].subsys_dp_register[i].ndev != NULL; return n; }
+static unsigned registrations(void) { unsigned n = 0; for (int i = 0; i < 256; i++) n += registry_owned(&nss_top_main.nss[0].subsys_dp_register[i]); return n; }
 static void check_clean(struct ath11k_base *ab)
 {
     check_n01(live_dma() == 0 && invalid_dma == 0);

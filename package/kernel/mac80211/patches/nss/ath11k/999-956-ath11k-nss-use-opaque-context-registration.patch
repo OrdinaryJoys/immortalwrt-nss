@@ -1,0 +1,53 @@
+From: AX6 local correctness review <local@localhost>
+Subject: [PATCH] ath11k: use typed opaque WIFILI registrations
+
+Use the explicit host context API for both SoC and radio owners instead of
+presenting ab/ar as netdevices. Keep legacy patches unchanged and apply this
+after 955. This does not repair callback lifetime or FW shutdown protocols.
+
+--- a/drivers/net/wireless/ath/ath11k/nss.c
++++ b/drivers/net/wireless/ath/ath11k/nss.c
+@@ -529,14 +529,12 @@
+ 	}
+ }
+ 
+-static inline void ath11k_nss_wifili_ext_callback_wrapper(struct net_device *netdev,
++static inline void ath11k_nss_wifili_ext_callback_wrapper(void *context,
+ 						   struct sk_buff *skb,
+ 						   struct napi_struct *napi)
+ {
+-	// Retrieve the ath11k_base from the net_device's private data
+-	struct ath11k_base *ab = (struct ath11k_base *)netdev_priv(netdev);
++	struct ath11k_base *ab = context;
+ 
+-	// Call the original function with the retrieved ath11k_base
+ 	ath11k_nss_wifili_ext_callback_fn(ab, skb, napi);
+ }
+ 
+@@ -4514,10 +4512,10 @@
+ 	}
+ 
+ 	/* register callbacks for events and exceptions with nss */
+-	nss_contex = nss_register_wifili_if(ab->nss.if_num, NULL,
+-					    (nss_wifili_callback_t)ath11k_nss_wifili_ext_callback_wrapper,
+-					    (nss_wifili_msg_callback_t)ath11k_nss_wifili_event_receive,
+-					    (struct net_device *)ab, features);
++	nss_contex = nss_register_wifili_if_ctx(ab->nss.if_num,
++					     ath11k_nss_wifili_ext_callback_wrapper,
++					     ath11k_nss_wifili_event_receive,
++					     ab, features);
+ 
+ 	if (!nss_contex) {
+ 		ath11k_warn(ab, "nss wifili register failure\n");
+@@ -4674,9 +4672,8 @@
+ 	ar->nss.if_num = radio_if_num;
+ 
+ 	/* No callbacks are registered for radio specific events/data */
+-	ar->nss.ctx = nss_register_wifili_radio_if((u32)radio_if_num, NULL,
+-						   NULL, NULL, (struct net_device *)ar,
+-						   features);
++	ar->nss.ctx = nss_register_wifili_radio_if_ctx((u32)radio_if_num,
++						       ar, features);
+ 
+ 	if (!ar->nss.ctx) {
+ 		ath11k_warn(ab, "failure during nss pdev register\n");

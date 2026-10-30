@@ -27,7 +27,9 @@ assets = {p: p.read_bytes() for p in (Path(__file__), HERE / 'ath11k-nss-init-ow
     HERE / 'nss-dp-containment/extract_prepared_c.py')}
 driver = extract.Prepared(args.driver_prepared)
 driver_header = driver.read('exports/nss_wifili_if.h')
-driver_functions = ''.join(driver.function(path, symbol) for path, symbol in (
+opaque_registry = bool(re.search(r'^bool nss_core_register_wifili_ctx\(', driver.read('nss_core.c'), re.M))
+registry = driver.structure('nss_core.h', 'nss_subsystem_dataplane_register')
+driver_symbols = [
     ('nss_wifili.c', 'nss_wifili_release_external_if'),
     ('nss_wifili.c', 'nss_get_available_wifili_external_if'),
     ('nss_core.c', 'nss_core_register_subsys_dp'),
@@ -35,7 +37,11 @@ driver_functions = ''.join(driver.function(path, symbol) for path, symbol in (
     ('nss_wifili.c', 'nss_wifili_get_context'),
     ('nss_wifili.c', 'nss_register_wifili_if'),
     ('nss_wifili.c', 'nss_unregister_wifili_if'),
-    ('nss_cmn.c', 'nss_cmn_get_state')))
+    ('nss_cmn.c', 'nss_cmn_get_state')]
+if opaque_registry:
+    driver_symbols += [('nss_core.c', 'nss_core_register_wifili_ctx'),
+                       ('nss_wifili.c', 'nss_register_wifili_if_ctx')]
+driver_functions = ''.join(driver.function(path, symbol) for path, symbol in driver_symbols)
 structures = ''.join(extract.structure(driver_header, symbol) for symbol in
     ('nss_wifili_tx_desc_init_msg', 'nss_wifili_tx_desc_addtnl_mem_msg'))
 message_enum = extract.structure(driver_header, 'nss_wifili_msg_types', 'enum')
@@ -86,7 +92,9 @@ for variant, root, expected in variants:
     if variant == 'forget-dma-free':
         prefix = ('\nstatic void host_forget_dma_free(struct device *dev, size_t bytes, void *cpu, dma_addr_t dma)'
             ' { (void)dev; (void)bytes; (void)cpu; (void)dma; (void)dma_free_coherent; }\n')
-    code = fixture.replace('HOST_CONSTANTS', '\n'.join(macros)).replace('HOST_TX_STRUCTURES', structures)
+    code = '#define HOST_OPAQUE_REGISTRY ' + str(int(opaque_registry)) + '\n' + fixture
+    code = code.replace('HOST_REGISTRY', registry)
+    code = code.replace('HOST_CONSTANTS', '\n'.join(macros)).replace('HOST_TX_STRUCTURES', structures)
     code = code.replace('HOST_MESSAGE_ENUM', message_enum).replace('DRIVER_FUNCTIONS', driver_functions)
     code = code.replace('HOST_FUNCTIONS', prefix + functions)
     source = args.output / (variant + '.c')
@@ -114,6 +122,7 @@ assert len({r['normal_signature'] for r in records}) == 1
 assert all(p.read_bytes() == data for p, data in assets.items())
 (args.output / 'RESULT.json').write_text(json.dumps(dict(records=records, driver=driver.manifest(),
     assets={str(p): hashlib.sha256(b).hexdigest() for p,b in assets.items()},
-    scope='Seven full NSS functions, eight pinned driver ownership/state APIs. Non-descriptor struct layout, hardware IDs, DMA, locking and firmware are host contracts, not target ABI. Does not establish post-timeout DMA quiescence or callback draining.',
+    opaque_registry=opaque_registry,
+    scope='Seven full ath11k functions, eight legacy driver ownership/state APIs plus both opaque APIs when present, and the actual registry structure. Other non-descriptor layouts, hardware IDs, DMA, locking and firmware are host contracts, not target ABI. Does not establish post-timeout DMA quiescence or callback draining.',
     hardware_accessed=False, target_compiled=False), indent=2) + '\n')
 print(json.dumps([{k:r[k] for k in ('variant','scenarios','checks','failures','n01_failures','n02_failures')} for r in records]))

@@ -179,6 +179,35 @@ host substitutes. Real sockets, LSM, registration, final configuration, NSS
 payload/lifetime and MCS remain unverified. Do not enable dormant families on
 the strength of this 18-operation repair.
 
+## Item 5: separate WIFILI opaque objects from actual netdevices
+
+DRV 026 and ath11k 956 are a paired host-API repair. SoC ab and radio ar no
+longer masquerade as net_device. The new opaque registry fields carry exact
+context and per-owner callbacks; legacy ndev remains reserved for real devices.
+Opaque ext linearization uses declared registration features. Legacy ext keeps
+live ndev->features, including post-registration changes. Both legacy core
+writers and wrapper APIs reject opaque slot reuse; the first draft protected
+only set-type, and review caught the missing actual register guard.
+
+SoC/radio role checks, actual registration statements, ACK/notify context,
+netdev getters and normal/virtual drops are covered. Current SoC features=0
+is retained; this is not an SG/FRAGLIST performance enablement. No firmware
+message field, command, descriptor or radio configuration is changed. New
+exports require NSS/ath11k matched code; mixed old/new module deployment is not
+approved. Registration still requires caller serialization, and unregister
+requires prior callback quiescence. Acquire/release is not a callback drain.
+
+Final r8 Clang and GCC ASan/UBSan suites each pass 1000 checks, with empty
+candidate stderr and 24 empty compile logs. Actual old code, a cast-only
+repair and nine faulty source variants are rejected. The actual headers,
+functions and call statements are extracted, but skb/netdevice/ath11k object
+layouts, allocation, scheduling and firmware/DMA boundaries are substitutes.
+Unregister tests keep the owner alive and finish synchronous callbacks first.
+Target ABI/module loading, callback lifetime, late replies and performance
+remain open. Conditional mesh aliasing and legacy global notification fallback
+are not repaired by this SoC/radio change. MU-EDCA is still a separate unmodified
+ABI/dispatch work item, not part of these 1000 checks.
+
 ## Full-stack integration finding: QMI 939 stale context
 
 A fresh complete mac80211 patch replay, rather than the earlier selected-file

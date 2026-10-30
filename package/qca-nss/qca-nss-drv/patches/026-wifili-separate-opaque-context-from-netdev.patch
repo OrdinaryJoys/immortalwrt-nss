@@ -1,0 +1,267 @@
+From: AX6 local correctness review <local@localhost>
+Subject: [PATCH] nss: separate WIFILI opaque owners from legacy netdevices
+
+Keep legacy netdevice callbacks and dynamic features unchanged. New host-only
+WIFILI registrations carry explicit context and per-owner notify callbacks.
+No FW message layout or callback-drain/DMA-stop guarantee is added.
+
+--- a/nss_core.c
++++ b/nss_core.c
+@@ -318,7 +318,7 @@
+ 	/*
+ 	 * Check if there is already a subsystem registered at this interface number.
+ 	 */
+-	BUG_ON(reg->ndev && reg->ndev != ndev);
++	BUG_ON(reg->wifili_ctx || (reg->ndev && reg->ndev != ndev));
+ 
+ 	reg->type = type;
+ }
+@@ -361,7 +361,7 @@
+ 	/*
+ 	 * Check if there is already a subsystem registered at this interface number.
+ 	 */
+-	BUG_ON(reg->ndev && reg->ndev != ndev);
++	BUG_ON(reg->wifili_ctx || (reg->ndev && reg->ndev != ndev));
+ 
+ 	reg->cb = cb;
+ 	reg->ext_cb = ext_cb;
+@@ -387,6 +387,10 @@
+ 
+ 	reg = &nss_ctx->subsys_dp_register[if_num];
+ 
++	/* Caller must already have quiesced callbacks; clearing is not a drain. */
++	smp_store_release(&reg->wifili_ctx, NULL);
++	reg->wifili_ext_cb = NULL;
++	reg->wifili_msg_cb = NULL;
+ 	reg->cb = NULL;
+ 	reg->ext_cb = NULL;
+ 	reg->app_data = NULL;
+@@ -952,8 +956,32 @@
+ }
+ 
+ /*
++ * nss_core_register_wifili_ctx()
++ *	Register a host-only object. Callers serialize registry updates.
++ */
++bool nss_core_register_wifili_ctx(struct nss_ctx_instance *nss_ctx,
++		uint32_t if_num, nss_wifili_ctx_callback_t ext_cb,
++		nss_wifili_msg_callback_t msg_cb, void *context, uint32_t features)
++{
++	struct nss_subsystem_dataplane_register *reg;
++
++	if (if_num >= NSS_MAX_NET_INTERFACES || !context)
++		return false;
++
++	reg = &nss_ctx->subsys_dp_register[if_num];
++	if (reg->ndev || smp_load_acquire(&reg->wifili_ctx))
++		return false;
++
++	reg->features = features;
++	reg->wifili_ext_cb = ext_cb;
++	reg->wifili_msg_cb = msg_cb;
++	smp_store_release(&reg->wifili_ctx, context);
++	return true;
++}
++
++/*
+  * nss_core_handle_ext_buffer_pkt()
+- *	Handle Extended data plane packet received on physical or virtual interface.
++ *	Handle extended data on real netdevices or explicitly opaque WIFILI owners.
+  */
+ static inline void nss_core_handle_ext_buffer_pkt(struct nss_ctx_instance *nss_ctx,
+ 						unsigned int interface_num,
+@@ -965,6 +993,8 @@
+ 	struct nss_subsystem_dataplane_register *subsys_dp_reg = &nss_ctx->subsys_dp_register[interface_num];
+ 	struct net_device *ndev = NULL;
+ 	nss_phys_if_rx_ext_data_callback_t ext_cb;
++	nss_wifili_ctx_callback_t ctx_cb;
++	void *context;
+ 
+ 	NSS_PKT_STATS_INC(&nss_top->stats_drv[NSS_DRV_STATS_RX_EXT_PACKET]);
+ 
+@@ -976,6 +1006,21 @@
+ 		nbuf->ip_summed = CHECKSUM_NONE;
+ 	}
+ 
++	context = smp_load_acquire(&subsys_dp_reg->wifili_ctx);
++	if (context) {
++		ctx_cb = READ_ONCE(subsys_dp_reg->wifili_ext_cb);
++		if (!ctx_cb)
++			goto drop;
++
++		if (unlikely(skb_is_nonlinear(nbuf)) &&
++		    nss_core_skb_needs_linearize(nbuf, READ_ONCE(subsys_dp_reg->features)) &&
++		    __skb_linearize(nbuf))
++			goto drop;
++
++		ctx_cb(context, nbuf, napi);
++		return;
++	}
++
+ 	ndev = subsys_dp_reg->ndev;
+ 	ext_cb = subsys_dp_reg->ext_cb;
+ 	if (likely(ext_cb) && likely(ndev)) {
+@@ -991,9 +1036,11 @@
+ 		}
+ 
+ 		ext_cb(ndev, (void *)nbuf, napi);
+-	} else {
+-		dev_kfree_skb_any(nbuf);
++		return;
+ 	}
++
++drop:
++	dev_kfree_skb_any(nbuf);
+ }
+ 
+ /*
+--- a/nss_core.h
++++ b/nss_core.h
+@@ -451,6 +451,9 @@
+ 	struct net_device *ndev;	/* Netdevice associated with the interface */
+ 	uint32_t features;		/* skb types supported by this subsystem */
+ 	uint32_t type;			/* Indicates the type of this data plane */
++	void *wifili_ctx;		/* Opaque host object, never a net_device. */
++	nss_wifili_ctx_callback_t wifili_ext_cb;
++	nss_wifili_msg_callback_t wifili_msg_cb;
+ };
+ 
+ /*
+@@ -1009,6 +1012,10 @@
+ 					void *app_data, struct net_device *ndev,
+ 					uint32_t features);
+ extern void nss_core_unregister_subsys_dp(struct nss_ctx_instance *nss_ctx, uint32_t if_num);
++
++bool nss_core_register_wifili_ctx(struct nss_ctx_instance *nss_ctx,
++		uint32_t if_num, nss_wifili_ctx_callback_t ext_cb,
++		nss_wifili_msg_callback_t msg_cb, void *context, uint32_t features);
+ void nss_core_set_subsys_dp_type(struct nss_ctx_instance *nss_ctx, struct net_device *ndev, uint32_t if_num, uint32_t type);
+ extern bool nss_core_is_mq_enabled(void);
+ 
+--- a/nss_wifili.c
++++ b/nss_wifili.c
+@@ -95,6 +95,7 @@
+ static void nss_wifili_handler(struct nss_ctx_instance *nss_ctx, struct nss_cmn_msg *ncm, __attribute__((unused))void *app_data)
+ {
+ 	struct nss_wifili_msg *ntm = (struct nss_wifili_msg *)ncm;
++	struct nss_subsystem_dataplane_register *reg;
+ 	void *ctx;
+ 	nss_wifili_msg_callback_t cb;
+ 
+@@ -146,8 +147,11 @@
+ 	 * Update the callback and app_data for notify messages, wifili sends all notify messages
+ 	 * to the same callback/app_data.
+ 	 */
++	reg = &nss_ctx->subsys_dp_register[ncm->interface];
++	ctx = smp_load_acquire(&reg->wifili_ctx);
+ 	if (ncm->response == NSS_CMN_RESPONSE_NOTIFY) {
+-		ncm->cb = (nss_ptr_t)nss_ctx->nss_top->wifili_msg_callback;
++		ncm->cb = (nss_ptr_t)(ctx ? READ_ONCE(reg->wifili_msg_cb) :
++					nss_ctx->nss_top->wifili_msg_callback);
+ 	}
+ 
+ 	/*
+@@ -167,7 +171,8 @@
+ 	 * Get callback & context
+ 	 */
+ 	cb = (nss_wifili_msg_callback_t)ncm->cb;
+-	ctx = nss_ctx->subsys_dp_register[ncm->interface].ndev;
++	if (!ctx)
++		ctx = reg->ndev;
+ 
+ 	/*
+ 	 * call wifili msg callback
+@@ -573,6 +578,10 @@
+ 			|| (if_num == NSS_WIFILI_EXTERNAL_INTERFACE1));
+ 
+ 	nss_info("nss_register_wifili_if if_num %d wifictx %px", if_num, netdev);
++
++	if (if_num >= NSS_MAX_NET_INTERFACES ||
++	    smp_load_acquire(&nss_ctx->subsys_dp_register[if_num].wifili_ctx))
++		return NULL;
+ 
+ 	nss_core_register_subsys_dp(nss_ctx, if_num, wifili_callback, wifili_ext_callback, NULL, netdev, features);
+ 
+@@ -581,7 +590,26 @@
+ 	return (struct nss_ctx_instance *)&nss_top_main.nss[nss_top_main.wifi_handler_id];
+ }
+ EXPORT_SYMBOL(nss_register_wifili_if);
++
++struct nss_ctx_instance *nss_register_wifili_if_ctx(uint32_t if_num,
++		nss_wifili_ctx_callback_t ext_cb, nss_wifili_msg_callback_t msg_cb,
++		void *context, uint32_t features)
++{
++	struct nss_ctx_instance *nss_ctx = &nss_top_main.nss[nss_top_main.wifi_handler_id];
++
++	if (if_num != NSS_WIFILI_INTERNAL_INTERFACE &&
++	    if_num != NSS_WIFILI_EXTERNAL_INTERFACE0 &&
++	    if_num != NSS_WIFILI_EXTERNAL_INTERFACE1)
++		return NULL;
++
++	if (!nss_core_register_wifili_ctx(nss_ctx, if_num, ext_cb, msg_cb,
++					context, features))
++		return NULL;
+ 
++	return nss_ctx;
++}
++EXPORT_SYMBOL(nss_register_wifili_if_ctx);
++
+ /*
+  * nss_unregister_wifili_if()
+  *	Unregister wifili with nss driver
+@@ -618,12 +646,30 @@
+ 	nss_assert(nss_is_dynamic_interface(if_num));
+ 	nss_info("nss_register_wifili_if if_num %d wifictx %px", if_num, netdev);
+ 
++	if (if_num >= NSS_MAX_NET_INTERFACES ||
++	    smp_load_acquire(&nss_ctx->subsys_dp_register[if_num].wifili_ctx))
++		return NULL;
++
+ 	nss_core_register_subsys_dp(nss_ctx, if_num, wifili_callback, wifili_ext_callback, NULL, netdev, features);
+ 
+ 	return (struct nss_ctx_instance *)&nss_top_main.nss[nss_top_main.wifi_handler_id];
+ }
+ EXPORT_SYMBOL(nss_register_wifili_radio_if);
+ 
++struct nss_ctx_instance *nss_register_wifili_radio_if_ctx(uint32_t if_num,
++		void *context, uint32_t features)
++{
++	struct nss_ctx_instance *nss_ctx = &nss_top_main.nss[nss_top_main.wifi_handler_id];
++
++	if (!nss_is_dynamic_interface(if_num) ||
++	    !nss_core_register_wifili_ctx(nss_ctx, if_num, NULL, NULL,
++					context, features))
++		return NULL;
++
++	return nss_ctx;
++}
++EXPORT_SYMBOL(nss_register_wifili_radio_if_ctx);
++
+ /*
+  * nss_unregister_wifili_radio_if()
+  *	Unregister wifili radio with nss driver
+--- a/exports/nss_wifili_if.h
++++ b/exports/nss_wifili_if.h
+@@ -2190,6 +2190,22 @@
+  * void
+  */
+ typedef void (*nss_wifili_callback_t)(struct net_device *netdev, struct sk_buff *skb, struct napi_struct *napi);
++
++/* Host-only opaque registrations never expose context as a net_device. */
++typedef void (*nss_wifili_ctx_callback_t)(void *context, struct sk_buff *skb,
++					struct napi_struct *napi);
++
++/*
++ * No lifetime barrier is provided by registration or unregistration. The
++ * caller must serialize registry changes and quiesce in-flight callbacks
++ * before unregistering/freeing ctx.
++ * features declares SG/FRAGLIST support of the opaque extended callback.
++ */
++struct nss_ctx_instance *nss_register_wifili_if_ctx(uint32_t if_num,
++		nss_wifili_ctx_callback_t ext_cb, nss_wifili_msg_callback_t msg_cb,
++		void *context, uint32_t features);
++struct nss_ctx_instance *nss_register_wifili_radio_if_ctx(uint32_t if_num,
++		void *context, uint32_t features);
+ 
+ /**
+  * nss_register_wifili_if

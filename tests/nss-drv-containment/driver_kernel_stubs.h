@@ -37,6 +37,8 @@
 #define nss_assert(x) assert(x)
 #define READ_ONCE(x) __atomic_load_n(&(x),__ATOMIC_SEQ_CST)
 #define WRITE_ONCE(x,v) __atomic_store_n(&(x),(v),__ATOMIC_SEQ_CST)
+#define smp_load_acquire(p) __atomic_load_n((p),__ATOMIC_ACQUIRE)
+#define smp_store_release(p,v) __atomic_store_n((p),(v),__ATOMIC_RELEASE)
 #define likely(x) (x)
 #define unlikely(x) (x)
 #define might_sleep() ((void)0)
@@ -155,6 +157,9 @@ static void enable_irq(unsigned irq) { assert(irq); host_irq_rearm_calls++; }
 typedef void (*nss_phys_if_rx_callback_t)(struct net_device *,struct sk_buff *,struct napi_struct *);
 typedef void (*nss_phys_if_rx_ext_data_callback_t)(struct net_device *,struct sk_buff *,void *);
 typedef void (*nss_phys_if_xmit_callback_t)(void *,struct sk_buff *);
+struct nss_wifili_msg;
+typedef void (*nss_wifili_ctx_callback_t)(void *,struct sk_buff *,struct napi_struct *);
+typedef void (*nss_wifili_msg_callback_t)(void *,struct nss_wifili_msg *);
 static void napi_disable(struct napi_struct *napi) {
     assert(pthread_mutex_lock(&napi->lock)==0); napi->enabled=false;
     host_observe(HOST_NAPI_WAIT,napi->host_core);
