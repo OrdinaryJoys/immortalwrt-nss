@@ -82,6 +82,10 @@ static unsigned checks,failures,cases,refs,skb_live,unicast_calls,lookup_calls,a
 static bool missing_bridge,missing_mc,copy_failure,new_failure,put_failure,attach_failure;
 static unsigned rcu_depth;
 static unsigned capability_calls;
+static unsigned mc_lookup_calls,delete_calls;
+static struct mc_ip deleted_group;
+static u8 deleted_mac[6];
+static struct { unsigned family; u8 address[16]; } notifications[8];
 static unsigned char reply_bytes[8192];
 static size_t reply_length;
 static u32 reply_destination;
@@ -140,11 +144,11 @@ static int netlink_unicast(struct sock *sk,struct sk_buff *s,u32 pid,int flags) 
 }
 static struct net_device *dev_get_by_name(int *net,const char *name) { invariant(net==&init_net&&rcu_depth,"device-lookup-context");lookup_calls++;if(missing_bridge||strcmp(name,"br-lan"))return NULL;refs++;return &bridge; }
 static void dev_put(struct net_device *d) { invariant(d==&bridge&&refs,"device-reference");refs--; }
-static struct mc_struct *mc_dev_get(struct net_device *d) { invariant(d==&bridge&&rcu_depth,"mc-lookup-context");return missing_mc?NULL:&model; }
+static struct mc_struct *mc_dev_get(struct net_device *d) { invariant(d==&bridge&&rcu_depth,"mc-lookup-context");mc_lookup_calls++;return missing_mc?NULL:&model; }
 #define MC_DEV(d) mc_dev_get(d)
 static int mc_attach(struct net_device *d) { invariant(d==&bridge,"attach-owner");attach_calls++;return attach_failure?-ENOMEM:0; }
 static void mc_detach(struct net_device *d) { invariant(d==&bridge,"detach-owner");detach_calls++; }
-static int mc_mdb_destroy_by_port(struct mc_struct *m,struct mc_ip *g,u8 *mac,u32 index) { (void)g;(void)mac;invariant(m==&model&&index==7,"delete-MDB-owner");return 1; }
+static int mc_mdb_destroy_by_port(struct mc_struct *m,struct mc_ip *g,u8 *mac,u32 index) { invariant(m==&model&&index==7,"delete-MDB-owner");delete_calls++;memcpy(&deleted_group,g,sizeof(*g));memcpy(deleted_mac,mac,6);return 1; }
 static int timer_pending(struct timer_list *t) { return t->pending; }
 static int timer_delete_sync_try(struct timer_list *t) { t->pending=false;return 1; }
 static int time_after(unsigned long a,unsigned long b) { return (long)(b-a)<0; }
@@ -153,8 +157,8 @@ static unsigned long jiffies_to_msecs(unsigned long j) { return j*10; }
 static u8 *mc_fdb_mac_get(struct mc_fdb_group *f) { return f->mac; }
 typedef void (*mc_bridge_ipv4_update_callback_t)(struct net_device *,__be32);
 typedef void (*mc_bridge_ipv6_update_callback_t)(struct net_device *,struct in6_addr *);
-static void notify4(struct net_device *d,__be32 g) { (void)g;invariant(d==&bridge,"notify-owner");notify_calls++; }
-static void notify6(struct net_device *d,struct in6_addr *g) { (void)g;invariant(d==&bridge,"notify-owner");notify_calls++; }
+static void notify4(struct net_device *d,__be32 g) { invariant(d==&bridge&&notify_calls<8,"notify-owner");notifications[notify_calls].family=4;memcpy(notifications[notify_calls++].address,&g,4); }
+static void notify6(struct net_device *d,struct in6_addr *g) { invariant(d==&bridge&&notify_calls<8,"notify-owner");notifications[notify_calls].family=6;memcpy(notifications[notify_calls++].address,g,16); }
 static mc_bridge_ipv4_update_callback_t mc_bridge_ipv4_update_callback_get(void) { return notify4; }
 static mc_bridge_ipv6_update_callback_t mc_bridge_ipv6_update_callback_get(void) { return notify6; }
 static ssize_t strscpy(char *d,const char *s,size_t n) { size_t l=strnlen(s,n);if(!n)return -E2BIG;size_t count=l<n?l:n-1;memcpy(d,s,count);d[count]=0;return l<n?(ssize_t)count:-E2BIG; }
@@ -179,7 +183,7 @@ static void reset(void) {
     model.dev=&bridge;model.started=1;model.hash[0].first=&mdb;mdb.users=1;mdb.pslist.first=&pg;mdb.group.pro=htons(ETH_P_IP);mdb.group.u.ip4=htonl(0xef010101);
     pg.port=&bridge;pg.fslist.first=&host_fg;host_fg.a.nsrcs=1;host_fg.a.srcs[0]=1;host_fg.mac[0]=2;
     missing_bridge=missing_mc=copy_failure=new_failure=put_failure=attach_failure=false;unicast_calls=lookup_calls=attach_calls=detach_calls=notify_calls=0;
-    capability_calls=0;reply_length=0;reply_destination=0;memset(reply_bytes,0xcc,sizeof(reply_bytes));mc_nl_sk=&model_socket;event_pid=MC_INVALID_PID;cases++;
+    capability_calls=mc_lookup_calls=delete_calls=0;memset(&deleted_group,0,sizeof(deleted_group));memset(deleted_mac,0,sizeof(deleted_mac));memset(notifications,0,sizeof(notifications));reply_length=0;reply_destination=0;memset(reply_bytes,0xcc,sizeof(reply_bytes));mc_nl_sk=&model_socket;event_pid=MC_INVALID_PID;cases++;
 }
 static struct sk_buff *request(unsigned type,size_t payload,u32 declared) {
     struct sk_buff *s=new_skb(NLMSG_LENGTH(MC_MSG_HDRLEN+payload));memset(s->data,0,s->len);s->privileged=true;s->cb.portid=777;
@@ -385,10 +389,155 @@ static void output_cases(void) {
     unsigned previous=unicast_calls;mc_netlink_event_send(&model,MC_EVENT_MDB_UPDATED,1,NULL);mc_netlink_event_send(&model,0,0,NULL);check(previous==unicast_calls,"unsupported-event-no-send");
 }
 static void failure_cases(void) {
-    for(unsigned fault=0;fault<5;fault++){reset();struct sk_buff *s=request(MC_MSG_SET_ENABLE,4,4);*(u32 *)MC_MSG_DATA(nlmsg_hdr(s))=1;
+    for(unsigned fault=0;fault<5;fault++){reset();struct sk_buff *s=request(fault==2?MC_MSG_SET_DEBUG:MC_MSG_SET_ENABLE,4,4);*(u32 *)MC_MSG_DATA(nlmsg_hdr(s))=1;
     copy_failure=fault==0;missing_bridge=fault==1;missing_mc=fault==2;attach_failure=fault==3;if(fault==4)s->privileged=false;deliver(s);
-    check(!refs&&!skb_live,"failure-no-resource-leak");if(fault==0||fault==4)check(!attach_calls&&!unicast_calls,"allocation-or-capability-before-effects");if(fault==3)check(response()->status==MC_STATUS_FAILURE,"attach-failure-propagated");}
+    check(!refs&&!skb_live,"failure-no-resource-leak");if(fault==0||fault==4)check(!attach_calls&&!unicast_calls,"allocation-or-capability-before-effects");if(fault==1)check(unicast_calls==1&&response()->status==MC_STATUS_NOT_FOUND&&!attach_calls&&!mc_lookup_calls,"missing-bridge-status-and-no-effect");if(fault==2)check(unicast_calls==1&&response()->status==MC_STATUS_FAILURE&&mc_lookup_calls==1&&!model.debug&&!attach_calls&&!notify_calls,"missing-MC-status-and-no-effect");if(fault==3)check(response()->status==MC_STATUS_FAILURE,"attach-failure-propagated");}
     reset();event_pid=999;new_failure=true;mc_netlink_event_send(&model,MC_EVENT_MDB_UPDATED,0,NULL);check(!skb_live&&!unicast_calls,"event-allocation-failure");new_failure=false;put_failure=true;mc_netlink_event_send(&model,MC_EVENT_MDB_UPDATED,0,NULL);check(!skb_live&&!unicast_calls,"event-put-failure");
+}
+static bool bytes_zero(const void *data,size_t length) {
+    const u8 *p=data;for(size_t i=0;i<length;i++)if(p[i])return false;return true;
+}
+static void packed_lookup_case(void) {
+    reset();struct sk_buff *s=request(MC_MSG_SET_PSW_ENCAP,2*sizeof(struct __mc_encaptbl_entry),2*sizeof(struct __mc_encaptbl_entry));
+    struct __mc_encaptbl_entry *e=MC_MSG_DATA(nlmsg_hdr(s));
+    for(unsigned i=0;i<2;i++){
+        e[i].group.pro=htons(ETH_P_IP);e[i].group.u.ip4=i?mdb.group.u.ip4:htonl(0xef090909);
+        e[i].dev_cnt=1;e[i].dev[0].ifindex=i?91:19;memset(e[i].dev[0].mac,i?0x5a:0x19,6);
+        e[i].dev[0].in_nsrcs=2;e[i].dev[0].ex_nsrcs=MC_DEF_EX_SRCS_INVAL;
+        __be32 sources[2]={htonl(0xc0000201+i),htonl(0xc000020a+i)};
+        memcpy(e[i].dev[0].in_srcs,sources,sizeof(sources));
+    }
+    struct __mc_encaptbl_dev expected;memcpy(&expected,&e[1].dev[0],sizeof(expected));deliver(s);
+    check(unicast_calls==1&&response()->status==MC_STATUS_SUCCESS&&mdb.encap_dev_cnt==1&&mdb.encap_dev[0].ifindex==91,"packed-second-entry-selected");
+    check(!memcmp(&mdb.encap_dev[0],&expected,sizeof(expected)),"packed-second-entry-full-content");
+}
+static void check_get_result(size_t capacity,size_t unit,size_t total,const void *expected,size_t actual,bool router) {
+    size_t count=capacity/unit;if(count>total)count=total;size_t written=count*unit;
+    const u8 *data=reply_bytes+NLMSG_HDRLEN+MC_MSG_HDRLEN;
+    check(unicast_calls==1&&reply_length==NLMSG_LENGTH(MC_MSG_HDRLEN+actual)&&
+          response()->status==(count<total?MC_STATUS_BUFFER_OVERFLOW:MC_STATUS_SUCCESS)&&
+          response()->bytes_written==written&&response()->bytes_needed==(count<total?total*unit:0),
+          router?"router-capacity-floor":"MDB-capacity-floor");
+    check(!memcmp(data,expected,written),router?"router-output-item-content":"MDB-output-item-content");
+    check(bytes_zero(data+written,actual-written),router?"router-unused-payload-zero":"MDB-unused-payload-zero");
+}
+static void mdb_capacity_cases(void) {
+    for(unsigned ipv6=0;ipv6<2;ipv6++){
+#ifndef MC_SUPPORT_MLD
+        if(ipv6)continue;
+#endif
+        const size_t unit=sizeof(struct __mc_mdb_entry),total=3,actual=3*unit+7;
+        for(size_t capacity=0;capacity<=3*unit+1;capacity++){
+            reset();struct mc_fdb_group groups[3];memset(groups,0,sizeof(groups));
+            struct __mc_mdb_entry expected[3];memset(expected,0,sizeof(expected));pg.fslist.first=&groups[0];
+#ifdef MC_SUPPORT_MLD
+            if(ipv6){mdb.group.pro=htons(ETH_P_IPV6);memset(&mdb.group.u.ip6,0,16);mdb.group.u.ip6.s6_addr[0]=0xff;mdb.group.u.ip6.s6_addr[15]=9;}
+#endif
+            for(unsigned i=0;i<3;i++){
+                groups[i].fslist.next=i+1<3?&groups[i+1]:NULL;groups[i].a.nsrcs=i+1;
+                groups[i].ageing_timer=jiffies-(i+1)*HZ;groups[i].filter_mode=i+1;groups[i].fdb_age_out=i;
+                for(unsigned b=0;b<6;b++)groups[i].mac[b]=0x20+i*8+b;
+                for(unsigned source=0;source<=i;source++){
+                    if(ipv6){u8 address[16]={0};address[0]=0x20;address[1]=1;address[15]=i*4+source+1;memcpy(groups[i].a.srcs+source*16,address,16);}
+                    else {__be32 address=htonl(0xc0000201+i*4+source);memcpy(groups[i].a.srcs+source*4,&address,4);}
+                }
+                expected[i].group.pro=mdb.group.pro;
+#ifdef MC_SUPPORT_MLD
+                if(ipv6)memcpy(expected[i].group.u.ip6,&mdb.group.u.ip6,16);else
+#endif
+                expected[i].group.u.ip4=mdb.group.u.ip4;
+                expected[i].ifindex=bridge.ifindex;expected[i].num_host=1;expected[i].nsrcs=i+1;
+                memcpy(expected[i].srcs,groups[i].a.srcs,(i+1)*(ipv6?16:4));
+                expected[i].aging=i+1;expected[i].filter_mode=i+1;expected[i].fdb_age_out=i;memcpy(expected[i].mac,groups[i].mac,6);
+            }
+            struct sk_buff *s=request(MC_MSG_GET_MDB,actual,capacity);memset(MC_MSG_DATA(nlmsg_hdr(s)),0xee,actual);deliver(s);
+            check_get_result(capacity,unit,total,expected,actual,false);
+        }
+    }
+}
+static void router_capacity_cases(void) {
+#ifdef MC_SUPPORT_MLD
+    const unsigned total=4;
+#else
+    const unsigned total=2;
+#endif
+    const size_t unit=sizeof(struct __mc_rtport_entry),actual=total*unit+7;
+    for(size_t capacity=0;capacity<=total*unit+1;capacity++){
+        reset();struct mc_querier_entry v4[2];memset(v4,0,sizeof(v4));
+        struct __mc_rtport_entry expected[4];memset(expected,0,sizeof(expected));
+        model.rp.igmp_rlist.first=&v4[0];
+        for(unsigned i=0;i<2;i++){v4[i].rlist.next=i?NULL:&v4[1];v4[i].ifindex=11+i;expected[i].ifindex=11+i;expected[i].ipv4=1;}
+#ifdef MC_SUPPORT_MLD
+        struct mc_querier_entry v6[2];memset(v6,0,sizeof(v6));model.rp.mld_rlist.first=&v6[0];
+        for(unsigned i=0;i<2;i++){v6[i].rlist.next=i?NULL:&v6[1];v6[i].ifindex=21+i;expected[2+i].ifindex=21+i;}
+#endif
+        struct sk_buff *s=request(MC_MSG_GET_ROUTER_PORT,actual,capacity);memset(MC_MSG_DATA(nlmsg_hdr(s)),0xee,actual);deliver(s);
+        check_get_result(capacity,unit,total,expected,actual,true);
+    }
+}
+static void notify_cases(void) {
+#ifdef MC_SUPPORT_MLD
+    const unsigned count=3;
+#else
+    const unsigned count=2;
+#endif
+    for(unsigned bad=0;bad<2;bad++){
+        reset();struct __mc_group groups[3];memset(groups,0,sizeof(groups));
+        groups[0].pro=groups[1].pro=htons(ETH_P_IP);groups[0].u.ip4=htonl(0xef010203);groups[1].u.ip4=htonl(0xef040506);
+#ifdef MC_SUPPORT_MLD
+        groups[2].pro=htons(ETH_P_IPV6);groups[2].u.ip6[0]=0xff;groups[2].u.ip6[1]=2;groups[2].u.ip6[15]=1;
+#endif
+        if(bad)groups[count-1].pro=htons(0x1234);
+        struct sk_buff *s=request(MC_MSG_SET_NOTIFY,count*sizeof(groups[0]),count*sizeof(groups[0]));
+        memcpy(MC_MSG_DATA(nlmsg_hdr(s)),groups,count*sizeof(groups[0]));deliver(s);
+        bool correct=unicast_calls==1&&response()->status==(bad?MC_STATUS_INVALID_PARAMETER:MC_STATUS_SUCCESS)&&notify_calls==(bad?0:count);
+        if(!bad)for(unsigned i=0;i<count;i++){
+            unsigned family=i<2?4:6;const void *address=i<2?(const void *)&groups[i].u.ip4:(const void *)groups[i].u.ip6;
+            correct=correct&&notifications[i].family==family&&!memcmp(notifications[i].address,address,family==4?4:16);
+        }
+        check(correct,"notification-callback-sequence");
+    }
+}
+static void fixed_effect_cases(void) {
+    const unsigned types[]={MC_MSG_SET_DEBUG,MC_MSG_SET_CONVERT_ALL,MC_MSG_SET_M2I3_FILTER,MC_MSG_SET_TBIT,MC_MSG_SET_ROUTER};
+    for(unsigned i=0;i<sizeof(types)/sizeof(types[0]);i++){
+        reset();u32 value=0x103;struct sk_buff *s=request(types[i],4,4);memcpy(MC_MSG_DATA(nlmsg_hdr(s)),&value,4);deliver(s);
+        u32 actual=types[i]==MC_MSG_SET_DEBUG?model.debug:types[i]==MC_MSG_SET_CONVERT_ALL?model.convert_all:types[i]==MC_MSG_SET_M2I3_FILTER?model.m2i3_filter_enable:types[i]==MC_MSG_SET_TBIT?model.ignore_tbit:model.multicast_router;
+        check(response()->status==MC_STATUS_SUCCESS&&actual==(types[i]==MC_MSG_SET_ROUTER?(u8)value:value),"fixed-value-side-effect");
+    }
+    for(unsigned enabled=0;enabled<2;enabled++){
+        reset();struct sk_buff *s=request(MC_MSG_SET_ENABLE,4,0);memcpy(MC_MSG_DATA(nlmsg_hdr(s)),&enabled,4);deliver(s);
+        check(response()->status==MC_STATUS_SUCCESS&&attach_calls==enabled&&detach_calls==!enabled,"enable-disable-side-effects");
+        reset();s=request(MC_MSG_SET_POLICY,4,4);memcpy(MC_MSG_DATA(nlmsg_hdr(s)),&enabled,4);deliver(s);
+        check(response()->status==MC_STATUS_SUCCESS&&model.forward_policy==enabled,"policy-side-effects");
+    }
+    reset();struct sk_buff *s=request(MC_MSG_SET_RETAG,sizeof(struct __mc_param_retag),0);
+    struct __mc_param_retag retag={.enable=3,.dscp=0x1234};memcpy(MC_MSG_DATA(nlmsg_hdr(s)),&retag,sizeof(retag));deliver(s);
+    check(response()->status==MC_STATUS_SUCCESS&&model.enable_retag==3&&model.dscp==0x34,"retag-side-effects");
+    reset();s=request(MC_MSG_SET_ROUTER_PORT,sizeof(struct __mc_param_router_port),0);
+    struct __mc_param_router_port port={.type=MC_RTPORT_SPECIFY,.ifindex=33};memcpy(MC_MSG_DATA(nlmsg_hdr(s)),&port,sizeof(port));deliver(s);
+    check(response()->status==MC_STATUS_SUCCESS&&model.rp.type==MC_RTPORT_SPECIFY&&model.rp.ifindex==33,"router-port-side-effects");
+    for(unsigned from=0;from<3;from++){
+        reset();model.timeout_gsq_enable=11;model.timeout_asq_enable=12;model.timeout_gmi_enable=13;
+        s=request(MC_MSG_SET_TIMEOUT,sizeof(struct __mc_param_timeout),0);struct __mc_param_timeout timeout={.from=from,.enable=7};
+        memcpy(MC_MSG_DATA(nlmsg_hdr(s)),&timeout,sizeof(timeout));deliver(s);
+        check(response()->status==MC_STATUS_SUCCESS&&model.timeout_gsq_enable==(from==0?7:11)&&model.timeout_asq_enable==(from==1?7:12)&&model.timeout_gmi_enable==(from==2?7:13),"timeout-side-effects");
+    }
+    reset();s=request(MC_MSG_SET_MEMBERSHIP_INTERVAL,4,4);u32 seconds=17;memcpy(MC_MSG_DATA(nlmsg_hdr(s)),&seconds,4);deliver(s);
+    check(response()->status==MC_STATUS_SUCCESS&&model.membership_interval==17*HZ,"membership-side-effects");
+    for(unsigned active=0;active<2;active++){
+        reset();model.local_query_interval=77;model.qtimer.expires=1234;model.qtimer.pending=!active;
+        s=request(MC_MSG_SET_LOCAL_QUERY_INTERVAL,4,4);seconds=active?13:0;memcpy(MC_MSG_DATA(nlmsg_hdr(s)),&seconds,4);deliver(s);
+        check(response()->status==MC_STATUS_SUCCESS&&model.local_query_interval==(active?13*HZ:77)&&model.qtimer.pending&&model.qtimer.expires==(active?jiffies+13*HZ:1234),"local-query-side-effects");
+    }
+    reset();struct __mc_param_acl_rule rule={0};rule.pattern.rule=MC_ACL_RULE_MULTICAST;rule.pattern.ip[0]=239;rule.pattern.ip[3]=9;
+    s=request(MC_MSG_SET_ADD_ACL_RULE,sizeof(rule),sizeof(rule));memcpy(MC_MSG_DATA(nlmsg_hdr(s)),&rule,sizeof(rule));deliver(s);
+    check(response()->status==MC_STATUS_SUCCESS&&model.igmp_acl.pattern_count==1&&model.igmp_acl.patterns[0].rule==rule.pattern.rule&&!memcmp(&model.igmp_acl.patterns[0].ip.ip4,rule.pattern.ip,4),"ACL-dispatch-add-side-effects");
+    s=request(MC_MSG_SET_FLUSH_ACL_RULE,4,0);deliver(s);check(response()->status==MC_STATUS_SUCCESS&&!model.igmp_acl.pattern_count,"ACL-dispatch-flush-side-effects");
+    reset();s=request(MC_MSG_DEL_MDB,sizeof(struct __mc_mdb_entry),sizeof(struct __mc_mdb_entry));
+    struct __mc_mdb_entry entry={0};entry.group.pro=htons(ETH_P_IP);entry.group.u.ip4=mdb.group.u.ip4;entry.ifindex=7;memset(entry.mac,0x42,6);
+    memcpy(MC_MSG_DATA(nlmsg_hdr(s)),&entry,sizeof(entry));deliver(s);
+    check(response()->status==MC_STATUS_SUCCESS&&delete_calls==1&&deleted_group.pro==entry.group.pro&&deleted_group.u.ip4==entry.group.u.ip4&&!memcmp(deleted_mac,entry.mac,6),"delete-MDB-side-effects");
 }
 int main(int argc,char **argv) {
     const char *test=argc>1?argv[1]:"all";
@@ -397,6 +546,11 @@ int main(int argc,char **argv) {
     if(!strcmp(test,"all")||!strcmp(test,"bounds"))bounds_cases();
     if(!strcmp(test,"all")||!strcmp(test,"domains"))domain_cases();
     if(!strcmp(test,"all")||!strcmp(test,"compatibility"))compatibility_cases();
+    if(!strcmp(test,"all")||!strcmp(test,"packed-lookup"))packed_lookup_case();
+    if(!strcmp(test,"all")||!strcmp(test,"get-MDB"))mdb_capacity_cases();
+    if(!strcmp(test,"all")||!strcmp(test,"get-router"))router_capacity_cases();
+    if(!strcmp(test,"all")||!strcmp(test,"notify"))notify_cases();
+    if(!strcmp(test,"all")||!strcmp(test,"fixed-effects"))fixed_effect_cases();
     if(!strcmp(test,"all")||!strcmp(test,"acl"))acl_cases();
     if(!strcmp(test,"all")||!strcmp(test,"nested"))nested_cases();
     if(!strcmp(test,"all")||!strcmp(test,"source-match"))source_match_cases();

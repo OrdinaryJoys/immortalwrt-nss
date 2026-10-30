@@ -38,6 +38,17 @@ update/deletion, GET capacity floor/zeroing/metadata, MDB internal-count
 validation, event initialization/routing and selected allocation/ref failures.
 Actual ECM IPv4/IPv6 INCLUDE/EXCLUDE hit/miss, packed address comparisons,
 internal flood source counts and zero destination capacity are exercised.
+The ENCAP lookup has a nonmatching first packed entry and a matching second
+entry with distinct ifindex, MAC and source bytes; the stored full entry is
+compared. Nonempty MDB tables exercise IPv4 and IPv6 source serialization,
+and nonempty router-port lists exercise both protocol lists in order. Each
+MDB/router consumer scans byte capacities through the full table plus one byte,
+checking complete-item floor, status, sizing, item contents and cleared tail.
+The missing-instance request uses DEBUG, not ENABLE, and verifies the actual
+MC_DEV lookup, failure status, absent effects and retired references. Nonempty
+SET_NOTIFY requests check callback family, order and exact group address;
+an invalid last group must cause no callback. Fixed commands also check their
+actual value, mask, timer, ACL, attach/detach and MDB-delete effects.
 The real packet-header helper and private raw-address helper retain distinct
 contracts. A capability stub requires nonzero trusted sender portid before it
 can run; the unicast stub refuses kernel destination zero. This models the
@@ -68,6 +79,26 @@ function or negative control may stop before later cases. Clang ASan/UBSan
 runs halt on errors; leak sanitizer is disabled, while modeled allocations
 and references have explicit ledgers. Warning exceptions are listed in the
 runner and are not full-module warning qualification.
+Semantic negatives declare an exact allowed-and-required diagnostic set and
+exit type. Every stderr line must be a declared FAIL or HOST_CONTRACT marker;
+ordinary failures must match the JSON failure count, and fatal controls must
+end at their sole declared invariant without a JSON summary. The baseline ACL
+control permits exactly its known MLD-update failure and overlapping-copy
+invariant, not arbitrary trailing failures. The runner tests this oracle with
+unexpected-marker, substring, exit, signal, sanitizer and summary controls.
+Counter records observed per-marker counts; it does not compare a complete
+independent expected multiset for each marker or scenario. The checked contract
+is the exact marker set, exit type and total ordinary FAIL count, not that
+stronger per-scenario multiplicity claim. An unknown fixture testcase can
+return zero cases with exit zero; the runner's positive minimum-case/check
+gate rejects that result. This is not general-purpose CLI safety validation.
+Function-scoped mutants target second-entry selection, MDB/router floor and
+contents, missing-instance status, callback addresses and DSCP masking.
+
+These additions are authored test completion, not an independent review or
+self-approval of the production patch. Fresh output directories preserve
+failed attempts as well as later successful runs. The r8 review and evidence
+remain historical and are not overwritten by this completion work.
 
 Patch 021 keeps the wire structures, low raw command numbers, flags=0
 behavior, fixed SET compatibility and explicit privileged event destination.

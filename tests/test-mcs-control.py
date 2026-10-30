@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Actual MCS control functions with host transport/list/RCU substitutes only."""
 import argparse
+from collections import Counter
 import hashlib
 import importlib.util
 import json
@@ -51,6 +52,77 @@ def replace_once(text, old, new):
     if text.count(old) != 1:
         raise ValueError('mutation anchor not unique: ' + old)
     return text.replace(old, new, 1)
+
+
+def mutate_function(text, name, old, new):
+    definition = extract.function(text, name)
+    return replace_once(text, definition, replace_once(definition, old, new))
+
+
+def negative_contract(label, diagnostic):
+    name = re.sub(r'-mld-(?:on|off)$', '', label)
+    multiple = {
+        'baseline-permission': {'FAIL request-data-unchanged', 'FAIL unprivileged-command-refused'},
+        'baseline-response': {'FAIL request-data-unchanged', 'FAIL trusted-reply-route'},
+        'baseline-ACL': {'FAIL full-MLD-update-matched-index', 'MCS_HOST_CONTRACT overlapping-memcpy'},
+        'no-inner-bound': {'FAIL nested-include-count', 'FAIL invalid-nested-no-side-effect'},
+        'jiffy-limit-bypass': {'FAIL jiffy-limit-and-no-side-effect', 'FAIL jiffy-exact-boundary'},
+        'packed-first-result': {'FAIL packed-second-entry-selected', 'FAIL packed-second-entry-full-content'},
+        'MDB-capacity-ceil': {'FAIL MDB-capacity-floor', 'FAIL MDB-unused-payload-zero'},
+        'router-capacity-ceil': {'FAIL router-capacity-floor', 'FAIL router-unused-payload-zero'},
+    }
+    fatal = {'overlap-delete': 'overlapping-memcpy',
+             'event-zero-emit': 'zero-kernel-unicast-forbidden',
+             'zero-ingress': 'zero-ingress-before-capability'}
+    markers = multiple.get(name, {'MCS_HOST_CONTRACT ' + fatal[name]} if name in fatal else {'FAIL ' + diagnostic})
+    return {'markers': sorted(markers),
+            'returncode': 86 if any(x.startswith('MCS_HOST_CONTRACT ') for x in markers) else 1}
+
+
+def validate_negative(returncode, stdout, stderr, contract):
+    lines = stderr.splitlines()
+    if (returncode != contract['returncode'] or not lines or
+            any(not re.fullmatch(r'(?:FAIL|MCS_HOST_CONTRACT) [A-Za-z0-9_-]+', line) for line in lines) or
+            set(lines) != set(contract['markers'])):
+        raise ValueError('negative exit or exact diagnostic set mismatch')
+    counts = Counter(lines)
+    fatal = [line for line in lines if line.startswith('MCS_HOST_CONTRACT ')]
+    if fatal:
+        if stdout or len(fatal) != 1 or lines[-1] != fatal[0]:
+            raise ValueError('negative fatal contract mismatch')
+        data = None
+    else:
+        data = json.loads(stdout)
+        if (data['failures'] != len(lines) or data['failures'] < 1 or
+                data['checks'] < data['failures'] or data['cases'] < 1):
+            raise ValueError('negative summary does not account for every FAIL')
+    return data, dict(sorted(counts.items()))
+
+
+def oracle_selftest():
+    contract = {'markers': ['FAIL intended'], 'returncode': 1}
+    summary = json.dumps({'cases': 1, 'checks': 1, 'failures': 1})
+    validate_negative(1, summary, 'FAIL intended\n', contract)
+    rejected = 0
+    controls = [
+        (1, summary, 'FAIL intended\nFAIL unexpected-tail\n'),
+        (86, '', 'FAIL intended\nMCS_HOST_CONTRACT unrelated\n'),
+        (1, summary, 'FAIL intended-suffix\n'),
+        (1, summary, 'FAIL intended\nruntime error: load of misaligned address\n'),
+        (0, summary, 'FAIL intended\n'),
+        (-6, '', 'FAIL intended\n'),
+        (1, json.dumps({'cases': 1, 'checks': 1, 'failures': 0}), 'FAIL intended\n'),
+    ]
+    for code, out, err in controls:
+        try:
+            validate_negative(code, out, err, contract)
+        except (ValueError, KeyError, TypeError):
+            rejected += 1
+        else:
+            raise ValueError('negative oracle selftest accepted an invalid result')
+    known = negative_contract('baseline-ACL-mld-on', 'full-MLD-update-matched-index')
+    validate_negative(86, '', 'FAIL full-MLD-update-matched-index\nMCS_HOST_CONTRACT overlapping-memcpy\n', known)
+    return {'accepted_valid_contracts': 2, 'rejected_invalid_controls': rejected}
 
 
 def main():
@@ -117,13 +189,20 @@ def main():
             if r.returncode or r.stderr or data['failures'] or data['cases'] < 250 or data['checks'] < 1000:
                 raise ValueError('positive failure/incomplete suite: ' + label)
         else:
-            if r.returncode not in (1, 86) or not diagnostic or diagnostic not in r.stderr:
-                raise ValueError('negative missed designated defect: ' + label)
-            data = json.loads(r.stdout) if r.stdout else None
+            if not diagnostic:
+                raise ValueError('negative requires a declared contract: ' + label)
+            contract = negative_contract(label, diagnostic)
+            try:
+                data, markers = validate_negative(r.returncode, r.stdout, r.stderr, contract)
+            except (ValueError, KeyError, TypeError) as error:
+                raise ValueError('negative exact contract failed: ' + label) from error
         record['runs'].append({'label': label, 'case': case, 'returncode': r.returncode,
-                               'positive': positive, 'summary': data, 'expected_diagnostic': diagnostic})
+                               'positive': positive, 'summary': data, 'expected_diagnostic': diagnostic,
+                               'exact_negative_contract': None if positive else contract,
+                               'observed_marker_counts': {} if positive else markers})
 
     try:
+        record['negative_oracle_selftest'] = oracle_selftest()
         compiler = command([args.cc, '--version'], 'compiler-version')
         if compiler.returncode:
             raise ValueError('compiler unavailable')
@@ -161,14 +240,23 @@ def main():
                 ('ECM-capacity-zero', 'if (!max_dst) {', 'if (false) {', 'ecm-capacity', 'ECM-zero-capacity-no-write'),
                 ('ECM-internal-source-bound', 'if (fg->a.nsrcs < 0 || fg->a.nsrcs > MC_DEF_SRCS_MAX)\n\t\t\t\tcontinue;',
                  'if (false)\n\t\t\t\tcontinue;', 'ecm-flood', 'ECM-flood-source-bound-and-match'),
+                ('packed-first-result', 'return entry;', 'return param;', 'packed-lookup', 'packed-second-entry-selected', 'mc_find_entry_by_mdb'),
+                ('MDB-capacity-ceil', 'num_entries = buflen / sizeof(*entry);', 'num_entries = (buflen + sizeof(*entry) - 1) / sizeof(*entry);', 'get-MDB', 'MDB-capacity-floor', 'mc_mdbtbl_fillbuf'),
+                ('router-capacity-ceil', 'num_entries = buflen / sizeof(*entry);', 'num_entries = (buflen + sizeof(*entry) - 1) / sizeof(*entry);', 'get-router', 'router-capacity-floor', 'mc_rtports_fillbuf'),
+                ('MDB-item-corrupt', 'entry->ifindex = ((struct net_device *)pg->port)->ifindex;', 'entry->ifindex = 0;', 'get-MDB', 'MDB-output-item-content', 'mc_mdbtbl_fillbuf'),
+                ('router-item-corrupt', 'entry->ifindex = qe->ifindex;\n\t\t\tentry->ipv4 = 1;', 'entry->ifindex = 0;\n\t\t\tentry->ipv4 = 1;', 'get-router', 'router-output-item-content', 'mc_rtports_fillbuf'),
+                ('missing-instance-success', 'msghdr->status = MC_STATUS_FAILURE;\n\t\t\tdev_put(brdev);\n\t\t\tbreak;', 'msghdr->status = MC_STATUS_SUCCESS;\n\t\t\tdev_put(brdev);\n\t\t\tbreak;', 'failure', 'missing-MC-status-and-no-effect', '__mc_netlink_receive'),
+                ('notify-address-corrupt', 'ipv4_mc_event_cb(brdev, pgroup->u.ip4);', 'ipv4_mc_event_cb(brdev, 0);', 'notify', 'notification-callback-sequence', 'mc_group_notify_one'),
+                ('retag-mask-missing', 'mc->dscp = t->dscp & 0xff;', 'mc->dscp = t->dscp;', 'fixed-effects', 'retag-side-effects'),
             ]
             if mld:
                 mutations += [('MLD-wrong-index', 'memcpy(&mc->mld_acl.patterns[i], &pattern, sizeof pattern);',
                                'memcpy(&mc->mld_acl.patterns[mc->mld_acl.pattern_count], &pattern, sizeof pattern);', 'acl', 'full-MLD-update-matched-index')]
                 mutations += [('ECM-header-mismatch', 'mc_translate_filter_address(mdb->encap_dev, &mc_source->u, mdb->group.pro)',
                                'mc_translate_filter_source(mdb->encap_dev, &mc_source->u.ip4, mdb->group.pro)', 'ecm-v4', 'ECM-source-address-and-filter-result')]
-            for name, before, after, case, diagnostic in mutations:
-                mutated = replace_once(candidate, before, after)
+            for mutation in mutations:
+                name, before, after, case, diagnostic = mutation[:5]
+                mutated = mutate_function(candidate, mutation[5], before, after) if len(mutation) == 6 else replace_once(candidate, before, after)
                 binary = compile_code(mutated, name + '-' + suffix, mld)
                 run_case(binary, case, name + '-' + suffix, False, diagnostic)
             if args.sanitize:

@@ -117,6 +117,26 @@ and stricter general negative diagnostics. They must be separately completed
 and reviewed, not silently claimed by r8. Unknown userspace query/event
 callers, recipient reuse, full lifecycle, target and runtime remain open.
 
+MCS test-completion follow-up: r9 closes the four named P2 fixture gaps within
+their host scope, without changing patch 021 or its package release. A legal
+first nonmatching ENCAP entry forces lookup of the second packed entry and
+checks its complete copied content. Three MDB records and nonempty IPv4/IPv6
+router lists scan capacity boundaries and compare actual items/unused output.
+DEBUG now actually exercises missing MC; failure status/effects are checked.
+Nonempty NOTIFY checks exact callback address order, with invalid final group
+causing zero callbacks. Fixed-value effects and a separate set of new mutants
+are covered. Negatives require exact marker sets, exit kind and aggregate FAIL
+counts; they do not assert a per-scenario independent expected multiset.
+
+GCC r9 has 61 semantic runs and Clang ASan/UBSan 60, plus the same separately
+classified sanitizer/old-compile controls. Four positive profiles pass with
+963/3852, 967/3862, 1335/5663 and 1339/5673 cases/checks. Seven oracle-poison
+controls are rejected. Parent read the full test diff, independently reran GCC
+in mcs-parent-gcc-r10 and audited all three groups' assets, source hashes and
+raw compile/runtime logs. The test author is not called an independent final
+reviewer. These tests reveal no additional production defect and do not close
+the actual kernel, unknown userspace, full lifecycle or performance gates.
+
 ## Phase 2 item 2: EDMA TX tuple retirement
 
 Patch 014 / qca-nss-dp release 6 is bound to exact d8f802f plus 001-013.
