@@ -1,0 +1,278 @@
+--- a/include/nss_dp_dev.h
++++ b/include/nss_dp_dev.h
+@@ -42,6 +42,11 @@
+ #include "nss_dp_hal_info.h"
+ #ifdef NSS_DP_PPEDS_SUPPORT
+ #include "nss_dp_ppeds.h"
++#endif
++
++#if defined(NSS_DP_IPQ807X) && defined(NSS_DP_PPE_SUPPORT) && \
++	(LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0)) && !defined(NSS_DP_SW_BR_OPS)
++#define NSS_DP_NATIVE_INIT_STAGES
+ #endif
+ 
+ #define NSS_DP_ACL_DEV_ID 0
+@@ -428,8 +433,13 @@
+  * nss data plane switchdev helpers
+  */
+ #ifdef CONFIG_NET_SWITCHDEV
++#ifdef NSS_DP_NATIVE_INIT_STAGES
++int nss_dp_switchdev_init(void);
++void nss_dp_switchdev_exit(void);
++#else
+ void nss_dp_switchdev_setup(struct net_device *dev);
+ void nss_dp_switchdev_cleanup(struct net_device *dev);
++#endif
+ bool nss_dp_is_phy_dev(struct net_device *dev);
+ extern struct notifier_block nss_dp_netdev_notifier;
+ #endif
+--- a/nss_dp_main.c
++++ b/nss_dp_main.c
+@@ -45,7 +45,9 @@
+ #include <net/hotdata.h>
+ #include <net/rps.h>
+ #endif
+-#if defined(NSS_DP_MAC_POLL_SUPPORT)
++#if defined(NSS_DP_MAC_POLL_SUPPORT) || \
++	(defined(NSS_DP_IPQ807X) && defined(NSS_DP_PPE_SUPPORT) && \
++	 (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0)) && !defined(NSS_DP_SW_BR_OPS))
+ #include <init/ssdk_init.h>
+ #endif
+ #include "nss_dp_hal.h"
+@@ -1235,7 +1237,7 @@
+ 	netdev->netdev_ops = &nss_dp_netdev_ops;
+ 	netdev->gso_max_segs = NSS_DP_GSO_MAX_SEGS;
+ 	nss_dp_set_ethtool_ops(netdev);
+-#ifdef CONFIG_NET_SWITCHDEV
++#if defined(CONFIG_NET_SWITCHDEV) && !defined(NSS_DP_NATIVE_INIT_STAGES)
+ 	nss_dp_switchdev_setup(netdev);
+ #endif
+ 
+@@ -1244,7 +1246,16 @@
+ 	ret = nss_dp_of_get_pdata(np, netdev, &gmac_hal_pdata);
+ 	if (ret != 0) {
+ 		goto fail;
++	}
++
++#ifdef NSS_DP_NATIVE_INIT_STAGES
++	/* Classify before publishing a host context or attaching a PHY. */
++	if (!ssdk_netdev_cache_mark_native_port(0, dp_priv->macid)) {
++		netdev_err(netdev, "SSDK native port classification unavailable\n");
++		free_netdev(netdev);
++		return -EFAULT;
+ 	}
++#endif
+ 
+ 	/* Use data plane ops as per the configured SoC */
+ 	dp_priv->data_plane_ops = nss_dp_hal_get_data_plane_ops();
+@@ -1362,7 +1373,9 @@
+ 	}
+ 
+ 	dp_global_ctx.nss_dp[nss_dp_get_idx_from_macid(dp_priv->macid)] = dp_priv;
++#ifndef NSS_DP_NATIVE_INIT_STAGES
+ 	dp_global_ctx.slowproto_acl_bm = 0;
++#endif
+ 
+ 	netdev_dbg(netdev, "Init NSS DP GMAC%d (base = 0x%lx)\n", dp_priv->macid, netdev->base_addr);
+ 
+@@ -1467,7 +1480,7 @@
+ 		dp_ops->deinit(dp_priv->dpc);
+ #endif
+ 
+-#ifdef CONFIG_NET_SWITCHDEV
++#if defined(CONFIG_NET_SWITCHDEV) && !defined(NSS_DP_NATIVE_INIT_STAGES)
+ 		nss_dp_switchdev_cleanup(dp_priv->netdev);
+ #endif
+ 
+@@ -1570,6 +1583,35 @@
+ }
+ EXPORT_SYMBOL(nss_dp_nsm_sawf_sc_stats_read);
+ 
++#ifdef NSS_DP_NATIVE_INIT_STAGES
++static bool nss_dp_hal_owned;
++static bool nss_dp_platform_owned;
++#ifdef CONFIG_NET_SWITCHDEV
++static bool nss_dp_netdev_owned;
++#endif
++
++static void nss_dp_release_stages(void)
++{
++	/* Port-unlink callbacks still need N, S and HAL services. */
++	if (nss_dp_platform_owned) {
++		platform_driver_unregister(&nss_dp_drv);
++		nss_dp_platform_owned = false;
++	}
++#ifdef CONFIG_NET_SWITCHDEV
++	if (nss_dp_netdev_owned) {
++		WARN_ON_ONCE(unregister_netdevice_notifier(&nss_dp_netdev_notifier));
++		nss_dp_netdev_owned = false;
++	}
++	nss_dp_switchdev_exit();
++#endif
++	if (nss_dp_hal_owned) {
++		nss_dp_hal_cleanup();
++		nss_dp_hal_owned = false;
++	}
++	dp_global_ctx.common_init_done = false;
++}
++#endif
++
+ /*
+  * nss_dp_init()
+  */
+@@ -1579,6 +1621,11 @@
+ 
+ 	dp_global_ctx.common_init_done = false;
+ 
++#ifdef NSS_DP_NATIVE_INIT_STAGES
++	/* Initialize shared callback state before the first subscription/port. */
++	dp_global_ctx.slowproto_acl_bm = 0;
++#endif
++
+ #if defined(NSS_DP_MAC_POLL_SUPPORT)
+ 	dp_global_ctx.enable_polling_task = false;
+ #endif
+@@ -1637,6 +1684,14 @@
+ 		dp_global_ctx.nss_dp[i] = NULL;
+ 	}
+ 
++#ifdef NSS_DP_NATIVE_INIT_STAGES
++	/* Cache lifecycle only, not a claim of FAL/hardware readiness. */
++	if (!ssdk_netdev_cache_ready()) {
++		pr_err("SSDK netdev cache lifecycle unavailable\n");
++		return -ENODEV;
++	}
++#endif
++
+ 	/*
+ 	 * Check platform compatibility and
+ 	 * set GMAC and data_plane ops.
+@@ -1646,11 +1701,35 @@
+ 		return -EFAULT;
+ 	}
+ 
+-	ret = platform_driver_register(&nss_dp_drv);
++#ifdef NSS_DP_NATIVE_INIT_STAGES
++	nss_dp_hal_owned = true;
++#ifdef CONFIG_NET_SWITCHDEV
++	ret = nss_dp_switchdev_init();
+ 	if (ret)
++		goto fail;
++
++	/* Ports become externally reachable before P finishes probing. */
++	ret = register_netdevice_notifier(&nss_dp_netdev_notifier);
++	if (ret) {
++		pr_warn("NSS DP netdevice notifier register failed: ret=%d\n", ret);
++		goto fail;
++	}
++	nss_dp_netdev_owned = true;
++#endif
++#endif
++
++	ret = platform_driver_register(&nss_dp_drv);
++	if (ret) {
+ 		pr_info("NSS DP platform drv register failed\n");
++#ifdef NSS_DP_NATIVE_INIT_STAGES
++		goto fail;
++#endif
++	}
++#ifdef NSS_DP_NATIVE_INIT_STAGES
++	nss_dp_platform_owned = true;
++#endif
+ 
+-#ifdef CONFIG_NET_SWITCHDEV
++#if defined(CONFIG_NET_SWITCHDEV) && !defined(NSS_DP_NATIVE_INIT_STAGES)
+ 	ret = register_netdevice_notifier(&nss_dp_netdev_notifier);
+ 	if (ret)
+ 		pr_warn("NSS DP netdevice notifier register failed: ret=%d\n", ret);
+@@ -1662,6 +1741,12 @@
+ 	pr_info("**********************************************************\n");
+ 
+ 	return ret;
++
++#ifdef NSS_DP_NATIVE_INIT_STAGES
++fail:
++	nss_dp_release_stages();
++	return ret;
++#endif
+ }
+ 
+ /*
+@@ -1669,6 +1754,9 @@
+  */
+ static void __exit nss_dp_exit(void)
+ {
++#ifdef NSS_DP_NATIVE_INIT_STAGES
++	nss_dp_release_stages();
++#else
+ 	/*
+ 	 * Ensure netdev remove is done before HAL cleanup.
+ 	 */
+@@ -1682,6 +1770,7 @@
+ 		nss_dp_hal_cleanup();
+ 		dp_global_ctx.common_init_done = false;
+ 	}
++#endif
+ }
+ 
+ module_init(nss_dp_init);
+--- a/nss_dp_switchdev.c
++++ b/nss_dp_switchdev.c
+@@ -97,7 +97,12 @@
+ 	.notifier_call = nss_dp_netdev_event,
+ };
+ 
++#ifdef NSS_DP_NATIVE_INIT_STAGES
++static bool switchdev_blocking_owned;
++static bool switchdev_atomic_owned;
++#else
+ static bool switch_init_done;
++#endif
+ 
+ /*
+  * nss_dp_set_slow_proto_filter()
+@@ -699,7 +704,38 @@
+ 	return 0;
+ }
+ #endif /* NSS_DP_SW_BR_OPS */
++
++#ifdef NSS_DP_NATIVE_INIT_STAGES
++void nss_dp_switchdev_exit(void)
++{
++	if (switchdev_atomic_owned) {
++		WARN_ON_ONCE(unregister_switchdev_notifier(nss_dp_sw_ev_nb));
++		switchdev_atomic_owned = false;
++	}
++	if (switchdev_blocking_owned) {
++		WARN_ON_ONCE(unregister_switchdev_blocking_notifier(&nss_dp_switchdev_notifier));
++		switchdev_blocking_owned = false;
++	}
++}
+ 
++int nss_dp_switchdev_init(void)
++{
++	int ret;
++
++	ret = register_switchdev_blocking_notifier(&nss_dp_switchdev_notifier);
++	if (ret)
++		return ret;
++	switchdev_blocking_owned = true;
++
++	ret = register_switchdev_notifier(nss_dp_sw_ev_nb);
++	if (ret) {
++		nss_dp_switchdev_exit();
++		return ret;
++	}
++	switchdev_atomic_owned = true;
++	return 0;
++}
++#else
+ /*
+  * nss_dp_switchdev_cleanup()
+  *      Cleanup switch dev
+@@ -748,4 +784,5 @@
+ 
+ 	switch_init_done = true;
+ }
++#endif /* NSS_DP_NATIVE_INIT_STAGES */
+ #endif
