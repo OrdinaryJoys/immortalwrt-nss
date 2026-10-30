@@ -1,0 +1,1081 @@
+From: OpenWrt Build System <openwrt@localhost>
+Subject: [PATCH] ssdk: serialize and retire FDB work and control producers
+
+Own delayed/IRQ/control producers and preserve the last private waitqueue
+use under its state lock; final drain synchronizes even without IN_FDB.
+This does not certify legacy PHY/DSA/cache or complete module/FW retirement.
+
+diff --git a/include/init/ssdk_init.h b/include/init/ssdk_init.h
+--- a/include/init/ssdk_init.h
++++ b/include/init/ssdk_init.h
+@@ -359,6 +359,13 @@
+ int qca_mac_sw_sync_work_init(struct qca_phy_priv *priv);
+ int qca_fdb_sw_sync_work_start(struct qca_phy_priv *priv, fal_pbmp_t port_map);
+ void qca_fdb_sw_sync_work_stop(struct qca_phy_priv *priv, fal_pbmp_t port_map);
++void qca_fdb_sw_sync_work_setup(struct qca_phy_priv *priv);
++void qca_fdb_sw_sync_work_fini(struct qca_phy_priv *priv);
++bool qca_fdb_sw_sync_enter(struct qca_phy_priv *priv);
++void qca_fdb_sw_sync_leave(struct qca_phy_priv *priv);
++#ifdef IN_NETLINK
++void ssdk_genl_stop_controls(void);
++#endif
+ void qca_phy_mib_work_pause(struct qca_phy_priv *priv);
+ int qca_phy_mib_work_resume(struct qca_phy_priv *priv);
+ sw_error_t ssdk_ppe_hw_recover(a_uint32_t dev_id);
+diff --git a/include/init/ssdk_interrupt.h b/include/init/ssdk_interrupt.h
+--- a/include/init/ssdk_interrupt.h
++++ b/include/init/ssdk_interrupt.h
+@@ -27,6 +27,7 @@
+ int qca_phy_enable_intr(struct qca_phy_priv *priv);
+ int qca_phy_disable_intr(struct qca_phy_priv *priv);
+ int qca_intr_init(struct qca_phy_priv *priv);
++void qca_intr_work_init(struct qca_phy_priv *priv);
+ void qca_intr_deinit(struct qca_phy_priv *priv);
+ void qca_intr_work_pause(struct qca_phy_priv *priv);
+ void qca_intr_work_resume(struct qca_phy_priv *priv);
+diff --git a/include/init/ssdk_plat.h b/include/init/ssdk_plat.h
+--- a/include/init/ssdk_plat.h
++++ b/include/init/ssdk_plat.h
+@@ -33,6 +33,7 @@
+ /*qca808x_start*/
+ #include <linux/phy.h>
+ #include <linux/bitfield.h>
++#include <linux/wait.h>
+ 
+ #ifndef BIT
+ #define BIT(_n)                                      (1UL << (_n))
+@@ -337,6 +338,15 @@
+ 	/* When set to TRUE, polling will execute only once and not reschedule itself */
+ 	a_bool_t polling_once;
+ 	struct work_struct	 intr_workqueue;
++	struct mutex intr_ctrl_lock;
++	struct mutex intr_rearm_lock;
++	spinlock_t intr_state_lock;
++	bool intr_work_initialized;
++	bool intr_requested;
++	bool intr_stopping;
++	bool intr_paused;
++	bool intr_masked;
++	bool intr_gpio_requested;
+ 	/*qm_err_check end*/
+ /*qca808x_start*/
+ 	a_uint8_t device_id;
+@@ -352,6 +362,13 @@
+ 	/*hppe_mac_sw_sync end*/
+ 	/*hppe_fdb_sw_sync*/
+ 	aos_lock_t fdb_sw_sync_lock;
++	struct mutex fdb_ctrl_lock;
++	wait_queue_head_t fdb_wait;
++	bool fdb_work_initialized;
++	bool fdb_ready;
++	bool fdb_stopping;
++	bool fdb_draining;
++	unsigned int fdb_users;
+ 	struct delayed_work fdb_sw_sync_dwork;
+ 	fal_pbmp_t fdb_sw_sync_port_map;
+ 	struct list_head sw_fdb_tbl;
+diff --git a/include/ref/ref_fdb.h b/include/ref/ref_fdb.h
+--- a/include/ref/ref_fdb.h
++++ b/include/ref/ref_fdb.h
+@@ -72,6 +72,7 @@
+ ref_fdb_sw_sync_task(struct qca_phy_priv *priv);
+ sw_error_t
+ ref_fdb_sw_sync_reset(struct qca_phy_priv *priv, fal_pbmp_t port_map);
++void ref_fdb_sw_sync_fini(struct qca_phy_priv *priv);
+ 
+ #ifdef __cplusplus
+ }
+diff --git a/src/init/ssdk_dts.c b/src/init/ssdk_dts.c
+--- a/src/init/ssdk_dts.c
++++ b/src/init/ssdk_dts.c
+@@ -1097,10 +1097,12 @@
+ 				return SW_FAIL;
+ 			}
+ 			priv->intr_gpio_num = intr_gpio_num;
++			priv->intr_gpio_requested = true;
+ 			priv->interrupt_no = gpio_to_irq (intr_gpio_num);
+ 			if (priv->interrupt_no < 0) {
+ 				SSDK_ERROR("gpio to irq faild\n");
+ 				gpio_free(intr_gpio_num);
++				priv->intr_gpio_requested = false;
+ 				return SW_FAIL;
+ 			}
+ 			SSDK_INFO("interrupt gpio:0x%x, interrupt number: 0x%x\n",
+diff --git a/src/init/ssdk_init.c b/src/init/ssdk_init.c
+--- a/src/init/ssdk_init.c
++++ b/src/init/ssdk_init.c
+@@ -1134,31 +1134,87 @@
+ 	return rv;
+ }
+ EXPORT_SYMBOL(ssdk_mac_sw_sync_work_start);
++
++static bool qca_fdb_sw_sync_supported(struct qca_phy_priv *priv)
++{
++	return priv->version == QCA_VER_HPPE || priv->version == QCA_VER_APPE ||
++		priv->version == QCA_VER_MRPPE || priv->version == QCA_VER_MHT;
++}
++
++bool qca_fdb_sw_sync_enter(struct qca_phy_priv *priv)
++{
++	bool admitted = false;
++
++	if (!priv->fdb_work_initialized || !qca_fdb_sw_sync_supported(priv))
++		return false;
++	aos_lock_bh(&priv->fdb_sw_sync_lock);
++	if (priv->fdb_ready && !priv->fdb_stopping && !priv->fdb_draining) {
++		++priv->fdb_users;
++		admitted = true;
++	}
++	aos_unlock_bh(&priv->fdb_sw_sync_lock);
++	return admitted;
++}
++
++void qca_fdb_sw_sync_leave(struct qca_phy_priv *priv)
++{
++	bool drained;
++
++	aos_lock_bh(&priv->fdb_sw_sync_lock);
++	drained = --priv->fdb_users == 0;
++	if (drained)
++		wake_up_all(&priv->fdb_wait);
++	aos_unlock_bh(&priv->fdb_sw_sync_lock);
++}
+ 
+ void
+ qca_fdb_sw_sync_work_task(struct work_struct *work)
+ {
+ 	struct qca_phy_priv *priv = container_of(work, struct qca_phy_priv,
+ 		fdb_sw_sync_dwork.work);
++	bool running;
+ 
++	aos_lock_bh(&priv->fdb_sw_sync_lock);
++	running = priv->fdb_polling_started && !priv->fdb_stopping &&
++		!priv->fdb_draining;
++	aos_unlock_bh(&priv->fdb_sw_sync_lock);
++	if (!running)
++		return;
++
+ #ifdef IN_FDB
+ 	ref_fdb_sw_sync_task(priv);
+ #endif
+-	schedule_delayed_work(&priv->fdb_sw_sync_dwork,
+-		msecs_to_jiffies(QCA_FDB_SW_SYNC_WORK_DELAY));
++	aos_lock_bh(&priv->fdb_sw_sync_lock);
++	if (priv->fdb_polling_started && !priv->fdb_stopping && !priv->fdb_draining)
++		schedule_delayed_work(&priv->fdb_sw_sync_dwork,
++			msecs_to_jiffies(QCA_FDB_SW_SYNC_WORK_DELAY));
++	aos_unlock_bh(&priv->fdb_sw_sync_lock);
+ }
+ 
++void qca_fdb_sw_sync_work_setup(struct qca_phy_priv *priv)
++{
++	mutex_init(&priv->fdb_ctrl_lock);
++	aos_lock_init(&priv->fdb_sw_sync_lock);
++	init_waitqueue_head(&priv->fdb_wait);
++	INIT_LIST_HEAD(&priv->sw_fdb_tbl);
++	INIT_DELAYED_WORK(&priv->fdb_sw_sync_dwork, qca_fdb_sw_sync_work_task);
++	priv->fdb_work_initialized = true;
++}
++
+ int
+ qca_fdb_sw_sync_work_init(struct qca_phy_priv *priv)
+ {
+-	if ((priv->version != QCA_VER_HPPE) && (priv->version != QCA_VER_APPE) &&
+-		(priv->version != QCA_VER_MRPPE) && (priv->version != QCA_VER_MHT))
+-	{
++	if (!qca_fdb_sw_sync_supported(priv))
+ 		return 0;
+-	}
++	if (!priv->fdb_work_initialized)
++		return -EINVAL;
++	mutex_lock(&priv->fdb_ctrl_lock);
++	aos_lock_bh(&priv->fdb_sw_sync_lock);
++	if (!priv->fdb_stopping)
++		priv->fdb_ready = true;
++	aos_unlock_bh(&priv->fdb_sw_sync_lock);
++	mutex_unlock(&priv->fdb_ctrl_lock);
+ 
+-	aos_lock_init(&priv->fdb_sw_sync_lock);
+-
+ 	return 0;
+ }
+ 
+@@ -1168,27 +1224,28 @@
+ int
+ qca_fdb_sw_sync_work_start(struct qca_phy_priv *priv, fal_pbmp_t port_map)
+ {
+-	if ((priv->version != QCA_VER_HPPE) && (priv->version != QCA_VER_APPE) &&
+-		(priv->version != QCA_VER_MRPPE) && (priv->version != QCA_VER_MHT))
+-	{
+-		return 0;
+-	}
++	int ret = 0;
++	if (!qca_fdb_sw_sync_supported(priv))
++		return -EOPNOTSUPP;
++	if (!priv->fdb_work_initialized)
++		return -EINVAL;
+ 
++	mutex_lock(&priv->fdb_ctrl_lock);
+ 	aos_lock_bh(&priv->fdb_sw_sync_lock);
+-	SSDK_DEBUG("fdb_sw_sync_port_map 0x%x\n", priv->fdb_sw_sync_port_map);
+-	if (priv->fdb_sw_sync_port_map == 0 && priv->fdb_polling_started == A_FALSE)
+-	{
+-		INIT_DELAYED_WORK(&priv->fdb_sw_sync_dwork,
+-						qca_fdb_sw_sync_work_task);
+-		schedule_delayed_work(&priv->fdb_sw_sync_dwork,
+-						msecs_to_jiffies(QCA_FDB_SW_SYNC_WORK_DELAY));
+-		priv->fdb_polling_started = A_TRUE;
++	if (!priv->fdb_ready || priv->fdb_stopping) {
++		ret = -ESHUTDOWN;
++		goto out;
+ 	}
+ 	SW_PBMP_OR(priv->fdb_sw_sync_port_map, port_map);
+-	SSDK_DEBUG("fdb_sw_sync_port_map 0x%x\n", priv->fdb_sw_sync_port_map);
++	if (priv->fdb_sw_sync_port_map && !priv->fdb_polling_started) {
++		priv->fdb_polling_started = A_TRUE;
++		schedule_delayed_work(&priv->fdb_sw_sync_dwork,
++			msecs_to_jiffies(QCA_FDB_SW_SYNC_WORK_DELAY));
++	}
++out:
+ 	aos_unlock_bh(&priv->fdb_sw_sync_lock);
+-
+-	return 0;
++	mutex_unlock(&priv->fdb_ctrl_lock);
++	return ret;
+ }
+ 
+ /**
+@@ -1197,29 +1254,53 @@
+ void
+ qca_fdb_sw_sync_work_stop(struct qca_phy_priv *priv, fal_pbmp_t port_map)
+ {
+-	if ((priv->version != QCA_VER_HPPE) && (priv->version != QCA_VER_APPE) &&
+-		(priv->version != QCA_VER_MRPPE))
+-	{
++	if (!priv->fdb_work_initialized || !qca_fdb_sw_sync_supported(priv))
+ 		return;
+-	}
+ 
++	mutex_lock(&priv->fdb_ctrl_lock);
+ 	aos_lock_bh(&priv->fdb_sw_sync_lock);
+-	SSDK_DEBUG("fdb_sw_sync_port_map 0x%x\n", priv->fdb_sw_sync_port_map);
++	priv->fdb_draining = true;
++	priv->fdb_polling_started = A_FALSE;
+ 	SW_PBMP_AND(priv->fdb_sw_sync_port_map, ~port_map);
+-	if (priv->fdb_sw_sync_port_map == 0 && priv->fdb_polling_started == A_TRUE)
+-	{
+-		aos_unlock_bh(&priv->fdb_sw_sync_lock);
+-		cancel_delayed_work_sync(&priv->fdb_sw_sync_dwork);
+-		priv->fdb_polling_started = A_FALSE;
+-	}
+-	else
+-		aos_unlock_bh(&priv->fdb_sw_sync_lock);
++	aos_unlock_bh(&priv->fdb_sw_sync_lock);
++	cancel_delayed_work_sync(&priv->fdb_sw_sync_dwork);
++	wait_event(priv->fdb_wait, !READ_ONCE(priv->fdb_users));
+ #ifdef IN_FDB
+ 	ref_fdb_sw_sync_reset(priv, port_map);
+ #endif
+-	SSDK_DEBUG("fdb_sw_sync_port_map 0x%x\n", priv->fdb_sw_sync_port_map);
++	aos_lock_bh(&priv->fdb_sw_sync_lock);
++	priv->fdb_draining = false;
++	if (!priv->fdb_stopping && priv->fdb_sw_sync_port_map) {
++		priv->fdb_polling_started = A_TRUE;
++		schedule_delayed_work(&priv->fdb_sw_sync_dwork,
++			msecs_to_jiffies(QCA_FDB_SW_SYNC_WORK_DELAY));
++	}
++	aos_unlock_bh(&priv->fdb_sw_sync_lock);
++	mutex_unlock(&priv->fdb_ctrl_lock);
+ }
+ 
++void qca_fdb_sw_sync_work_fini(struct qca_phy_priv *priv)
++{
++	if (!priv->fdb_work_initialized)
++		return;
++	mutex_lock(&priv->fdb_ctrl_lock);
++	aos_lock_bh(&priv->fdb_sw_sync_lock);
++	priv->fdb_stopping = true;
++	priv->fdb_draining = true;
++	priv->fdb_polling_started = A_FALSE;
++	priv->fdb_sw_sync_port_map = 0;
++	aos_unlock_bh(&priv->fdb_sw_sync_lock);
++	cancel_delayed_work_sync(&priv->fdb_sw_sync_dwork);
++	wait_event(priv->fdb_wait, !READ_ONCE(priv->fdb_users));
++	/* Zero users can be observed before the final locked wake returns. */
++	aos_lock_bh(&priv->fdb_sw_sync_lock);
++	aos_unlock_bh(&priv->fdb_sw_sync_lock);
++#ifdef IN_FDB
++	ref_fdb_sw_sync_fini(priv);
++#endif
++	mutex_unlock(&priv->fdb_ctrl_lock);
++}
++
+ #if defined(APPE)
+ sw_error_t ssdk_ppe_hw_recover(a_uint32_t dev_id)
+ {
+@@ -1360,6 +1441,12 @@
+ 
+ 	mutex_init(&priv->reg_mutex);
+ 
++#if defined(HPPE) || defined(MHT)
++	ret = qca_fdb_sw_sync_work_init(priv);
++	if (ret)
++		return ret;
++#endif
++
+ #if defined(IN_SWCONFIG)
+ 	ret = qca_switchdev_register(priv);
+ 	if (ret != SW_OK) {
+@@ -1392,14 +1479,6 @@
+ 		}
+ #endif
+ 	}
+-#if defined(HPPE) || defined(MHT)
+-	ret = qca_fdb_sw_sync_work_init(priv);
+-	if (ret != 0) {
+-		SSDK_ERROR("qca_fdb_sw_sync_work_init failed on chip 0x%02x%02x\n",
+-				priv->version, priv->revision);
+-		return ret;
+-	}
+-#endif
+ 	if(priv->interrupt_no > 0)
+ 	{
+ 		snprintf(priv->intr_name, IFNAMSIZ, "switch%d", dev_id);
+@@ -1447,6 +1526,7 @@
+ 
+ 	if (priv->interrupt_no > 0)
+ 		qca_intr_deinit(priv);
++	qca_fdb_sw_sync_work_fini(priv);
+ 
+ #if defined(IN_SWCONFIG)
+ 	unregister_switch(&qca_phy_priv_global[dev_id]->sw_dev);
+@@ -1527,6 +1607,30 @@
+ 	}
+ 
+ 	return rv;
++}
++
++static void ssdk_fdb_retire_controls(void)
++{
++	a_uint32_t dev_id, dev_num;
++
++#ifdef IN_NETLINK
++	ssdk_genl_stop_controls();
++#endif
++	ssdk_sysfs_exit();
++	if (qca_phy_priv_global) {
++		dev_num = ssdk_switch_device_num_get();
++		for (dev_id = 0; dev_id < dev_num; ++dev_id) {
++			struct qca_phy_priv *priv = qca_phy_priv_global[dev_id];
++			if (!priv)
++				continue;
++			qca_intr_deinit(priv);
++			qca_fdb_sw_sync_work_fini(priv);
++		}
++	}
++#ifdef IN_NETLINK
++	/* Accepted FDB/IRQ notification producers have returned before unlink. */
++	ssdk_genl_deinit();
++#endif
+ }
+ 
+ sw_error_t
+@@ -1534,6 +1638,7 @@
+ {
+ 	sw_error_t rv;
+ 
++	ssdk_fdb_retire_controls();
+ 	rv = fal_cleanup(dev_id);
+ /*qca808x_end*/
+ 	if(!ssdk_is_emulation(dev_id))
+@@ -1853,6 +1958,7 @@
+ {
+ 	a_uint32_t dev_id, dev_num = 1;
+ 
++	ssdk_fdb_retire_controls();
+ 	if(!qca_phy_priv_global) {
+ 		return;
+ 	}
+@@ -1892,6 +1998,8 @@
+ 		}
+ /*qca808x_end*/
+ 		qca_phy_priv_global[dev_id]->qca_ssdk_sw_dev_registered = A_FALSE;
++		qca_fdb_sw_sync_work_setup(qca_phy_priv_global[dev_id]);
++		qca_intr_work_init(qca_phy_priv_global[dev_id]);
+ /*qca808x_start*/
+ 		qca_ssdk_port_bmp_init(dev_id);
+ 		qca_ssdk_phy_info_init(dev_id);
+@@ -1978,7 +2086,6 @@
+ 		/* device id is the array index */
+ 		qca_phy_priv_global[dev_id]->device_id = ssdk_device_id_get(dev_id);
+ 		qca_phy_priv_global[dev_id]->of_node = ssdk_dts_node_get(dev_id);
+-		INIT_LIST_HEAD(&(qca_phy_priv_global[dev_id]->sw_fdb_tbl));
+ 		qca_phy_priv_global[dev_id]->ports = SSDK_PHYSICAL_PORT7;
+ /*qca808x_start*/
+ 		rv = ssdk_plat_init(&cfg, dev_id);
+@@ -2102,6 +2209,7 @@
+ 	sw_error_t rv = SW_OK;
+ /*qca808x_end*/
+ 	unregister_netdevice_notifier(&ssdk_dev_notifier);
++	ssdk_fdb_retire_controls();
+ 
+ 	dev_num = ssdk_switch_device_num_get();
+ 	for (dev_id = 0; dev_id < dev_num; dev_id++) {
+@@ -2122,13 +2230,9 @@
+ 		SSDK_ERROR("qca-%s module exit failed! (code: %d)\n", SSDK_STR, rv);
+ /*qca808x_end*/
+ 
+-	ssdk_sysfs_exit();
+ 	for (dev_id = 0; dev_id < dev_num; dev_id++) {
+ 		ssdk_plat_exit(dev_id);
+ 	}
+-#ifdef IN_NETLINK
+-	ssdk_genl_deinit();
+-#endif
+ 
+ /*qca808x_start*/
+ 	ssdk_free_priv();
+diff --git a/src/init/ssdk_interrupt.c b/src/init/ssdk_interrupt.c
+--- a/src/init/ssdk_interrupt.c
++++ b/src/init/ssdk_interrupt.c
+@@ -190,7 +190,16 @@
+ {
+ 	a_uint32_t intr_status;
+ 	struct qca_phy_priv *priv = container_of(work, struct qca_phy_priv,  intr_workqueue);
++	unsigned long flags;
++	bool rearm = false;
+ 
++	spin_lock_irqsave(&priv->intr_state_lock, flags);
++	if (priv->intr_stopping) {
++		spin_unlock_irqrestore(&priv->intr_state_lock, flags);
++		return;
++	}
++	spin_unlock_irqrestore(&priv->intr_state_lock, flags);
++
+ 	fal_intr_status_get(priv->device_id, &intr_status);
+ 	SSDK_DEBUG("intr_status:%x, priv->version:%x\n", intr_status, priv->version);
+ 	if(intr_status & FAL_SWITCH_INTR_LINK_STATUS)
+@@ -207,55 +216,128 @@
+ #endif
+ 	}
+ 
+-	enable_irq(priv->interrupt_no);
++	mutex_lock(&priv->intr_rearm_lock);
++	spin_lock_irqsave(&priv->intr_state_lock, flags);
++	if (!priv->intr_stopping && !priv->intr_paused && priv->intr_masked) {
++		priv->intr_masked = false;
++		rearm = true;
++	}
++	spin_unlock_irqrestore(&priv->intr_state_lock, flags);
++	if (rearm)
++		enable_irq(priv->interrupt_no);
++	mutex_unlock(&priv->intr_rearm_lock);
+ }
+ 
+- static irqreturn_t  qca_intr_handle(int irq, void *phy_priv)
+- {
++static irqreturn_t qca_intr_handle(int irq, void *phy_priv)
++{
+ 	struct qca_phy_priv *priv = (struct qca_phy_priv *)phy_priv;
++	unsigned long flags;
+ 
+-	 disable_irq_nosync(irq);
+-	 schedule_work(&priv->intr_workqueue);
+-        SSDK_DEBUG("irq number is :%x\n",irq);
++	spin_lock_irqsave(&priv->intr_state_lock, flags);
++	if (!priv->intr_stopping && !priv->intr_paused && !priv->intr_masked) {
++		priv->intr_masked = true;
++		disable_irq_nosync(irq);
++		schedule_work(&priv->intr_workqueue);
++	}
++	spin_unlock_irqrestore(&priv->intr_state_lock, flags);
++	return IRQ_HANDLED;
++}
+ 
+-	 return IRQ_HANDLED;
+- }
++void qca_intr_work_init(struct qca_phy_priv *priv)
++{
++	mutex_init(&priv->qm_lock);
++	mutex_init(&priv->intr_ctrl_lock);
++	mutex_init(&priv->intr_rearm_lock);
++	spin_lock_init(&priv->intr_state_lock);
++	INIT_WORK(&priv->intr_workqueue, qca_intr_workqueue_task);
++	priv->intr_work_initialized = true;
++}
+ 
+ void qca_intr_work_pause(struct qca_phy_priv *priv)
+ {
+-	if(!priv)
++	unsigned long flags;
++	if (!priv || !priv->intr_work_initialized)
+ 		return;
+ 
+-	/* Disable irq, the following intr irq will not come up */
+-	disable_irq(priv->interrupt_no);
+-
+-	/* Flush the work which have in the workqueue already */
++	mutex_lock(&priv->intr_ctrl_lock);
++	mutex_lock(&priv->intr_rearm_lock);
++	spin_lock_irqsave(&priv->intr_state_lock, flags);
++	priv->intr_paused = true;
++	if (priv->intr_requested && !priv->intr_masked) {
++		priv->intr_masked = true;
++		disable_irq_nosync(priv->interrupt_no);
++	}
++	spin_unlock_irqrestore(&priv->intr_state_lock, flags);
++	mutex_unlock(&priv->intr_rearm_lock);
++	if (priv->intr_requested)
++		synchronize_irq(priv->interrupt_no);
+ 	flush_work(&priv->intr_workqueue);
++	mutex_unlock(&priv->intr_ctrl_lock);
+ }
+ 
+ void qca_intr_work_resume(struct qca_phy_priv *priv)
+ {
+-	if(!priv)
++	unsigned long flags;
++	bool rearm = false;
++	if (!priv || !priv->intr_work_initialized)
+ 		return;
+ 
+-	enable_irq(priv->interrupt_no);
++	mutex_lock(&priv->intr_ctrl_lock);
++	mutex_lock(&priv->intr_rearm_lock);
++	spin_lock_irqsave(&priv->intr_state_lock, flags);
++	if (!priv->intr_stopping) {
++		priv->intr_paused = false;
++		if (priv->intr_requested && priv->intr_masked) {
++			priv->intr_masked = false;
++			rearm = true;
++		}
++	}
++	spin_unlock_irqrestore(&priv->intr_state_lock, flags);
++	if (rearm)
++		enable_irq(priv->interrupt_no);
++	mutex_unlock(&priv->intr_rearm_lock);
++	mutex_unlock(&priv->intr_ctrl_lock);
+ }
+ 
+ void qca_intr_deinit(struct qca_phy_priv *priv)
+ {
+-	if (!priv)
++	unsigned long flags;
++	if (!priv || !priv->intr_work_initialized)
+ 		return;
+ 
+-	flush_work(&priv->intr_workqueue);
+-	free_irq(priv->interrupt_no, priv);
+-	gpio_free(priv->intr_gpio_num);
++	mutex_lock(&priv->intr_ctrl_lock);
++	mutex_lock(&priv->intr_rearm_lock);
++	spin_lock_irqsave(&priv->intr_state_lock, flags);
++	priv->intr_stopping = true;
++	if (priv->intr_requested && !priv->intr_masked) {
++		priv->intr_masked = true;
++		disable_irq_nosync(priv->interrupt_no);
++	}
++	spin_unlock_irqrestore(&priv->intr_state_lock, flags);
++	mutex_unlock(&priv->intr_rearm_lock);
++	if (priv->intr_requested) {
++		free_irq(priv->interrupt_no, priv);
++		priv->intr_requested = false;
++	}
++	cancel_work_sync(&priv->intr_workqueue);
++	if (priv->intr_gpio_requested) {
++		gpio_free(priv->intr_gpio_num);
++		priv->intr_gpio_requested = false;
++	}
++	mutex_unlock(&priv->intr_ctrl_lock);
+ }
+ 
+ int qca_intr_init(struct qca_phy_priv *priv)
+ {
++	int ret;
++	if (!priv->intr_work_initialized)
++		return -EINVAL;
++	mutex_lock(&priv->intr_ctrl_lock);
++	if (priv->intr_requested || priv->intr_stopping) {
++		mutex_unlock(&priv->intr_ctrl_lock);
++		return -EBUSY;
++	}
+ 	SSDK_DEBUG("start to  init the interrupt!\n");
+-	mutex_init(&priv->qm_lock);
+-	INIT_WORK(&priv->intr_workqueue, qca_intr_workqueue_task);
+ 	if(priv->link_polling_required == A_FALSE)
+ 	{
+ 		qca_phy_disable_intr(priv);
+@@ -265,9 +347,13 @@
+ 	if(priv->fdb_sync == FDB_SYNC_INTR)
+ 		qca_switch_disable_intr(priv, FAL_SWITCH_INTR_FDB_CHANGE);
+ 
+-	if(request_irq(priv->interrupt_no, qca_intr_handle, priv->interrupt_flag,
+-		priv->intr_name, priv))
+-		return -1;
++	ret = request_irq(priv->interrupt_no, qca_intr_handle, priv->interrupt_flag,
++		priv->intr_name, priv);
++	if (ret) {
++		mutex_unlock(&priv->intr_ctrl_lock);
++		return ret;
++	}
++	priv->intr_requested = true;
+ 	if(priv->link_polling_required == A_FALSE)
+ 	{
+ 		qca_phy_enable_intr(priv);
+@@ -276,6 +362,7 @@
+ 	if(priv->fdb_sync == FDB_SYNC_INTR)
+ 		qca_switch_enable_intr(priv, FAL_SWITCH_INTR_FDB_CHANGE);
+ 
++	mutex_unlock(&priv->intr_ctrl_lock);
+ 	return 0;
+ }
+ 
+diff --git a/src/init/ssdk_netlink.c b/src/init/ssdk_netlink.c
+--- a/src/init/ssdk_netlink.c
++++ b/src/init/ssdk_netlink.c
+@@ -25,6 +25,23 @@
+ #include "ssdk_init.h"
+ #include "ssdk_plat.h"
+ 
++static DEFINE_MUTEX(ssdk_genl_lifecycle_lock);
++static DEFINE_MUTEX(ssdk_genl_control_lock);
++static DEFINE_SPINLOCK(ssdk_genl_notify_lock);
++static DECLARE_WAIT_QUEUE_HEAD(ssdk_genl_notify_wait);
++static bool ssdk_genl_accepting;
++static bool ssdk_genl_registered;
++static bool ssdk_genl_notify_stopping = true;
++static unsigned int ssdk_genl_notify_users;
++
++void ssdk_genl_stop_controls(void)
++{
++	/* A POLL_MAC handler retains this lock through its last private use. */
++	mutex_lock(&ssdk_genl_control_lock);
++	ssdk_genl_accepting = false;
++	mutex_unlock(&ssdk_genl_control_lock);
++}
++
+ struct nla_policy ssdk_genl_policy[] = {
+ 	[SSDK_ATTR_IFNAME] = { .type = NLA_NUL_STRING, .len = IFNAMSIZ - 1},
+ 	[SSDK_ATTR_MACADDR] = { .type = NLA_BINARY, .len = ETH_ALEN},
+@@ -44,10 +61,19 @@
+ static int ssdk_poll_mac(struct sk_buff *skb, struct genl_info *info)
+ {
+ 	unsigned int port_id = 0, dev_id = 0;
+-	struct qca_phy_priv *priv = ssdk_phy_priv_data_get(dev_id);
++	struct qca_phy_priv *priv;
++	int ret = 0;
++
++	mutex_lock(&ssdk_genl_control_lock);
++	if (!ssdk_genl_accepting) {
++		ret = -ESHUTDOWN;
++		goto out;
++	}
++	priv = ssdk_phy_priv_data_get(dev_id);
+ 	if (!priv)
+ 	{
+-		return -ENOENT;
++		ret = -ENOENT;
++		goto out;
+ 	}
+ 
+ 	if (info->attrs[SSDK_ATTR_IFNAME])
+@@ -58,14 +84,15 @@
+ 	if (port_id < SSDK_PHYSICAL_PORT1 || port_id > SSDK_PHYSICAL_PORT6)
+ 	{
+ 		SSDK_ERROR("do not support poll mac on port %d\n", port_id);
+-		return -EINVAL;
++		ret = -EINVAL;
++		goto out;
+ 	}
+ 	if (info->attrs[SSDK_ATTR_MACPOLL])
+ 	{
+ 		if (nla_get_u8(info->attrs[SSDK_ATTR_MACPOLL]) == 1)
+ 		{
+ 			SSDK_DEBUG("enable fdb polling task: port_id %d\n", port_id);
+-			qca_fdb_sw_sync_work_start(priv, BIT(port_id));
++			ret = qca_fdb_sw_sync_work_start(priv, BIT(port_id));
+ 		}
+ 		if (nla_get_u8(info->attrs[SSDK_ATTR_MACPOLL]) == 0)
+ 		{
+@@ -74,7 +101,9 @@
+ 		}
+ 	}
+ 
+-	return 0;
++out:
++	mutex_unlock(&ssdk_genl_control_lock);
++	return ret;
+ }
+ 
+ struct genl_ops ssdk_genl_ops[] = {
+@@ -110,6 +139,7 @@
+  * ssdk family definition
+  */
+ struct genl_family ssdk_family = {
++	.module = THIS_MODULE,
+ #if (LINUX_VERSION_CODE <= KERNEL_VERSION(4, 9, 0))
+ 	.id = GENL_ID_GENERATE,				/* Auto generate ID */
+ #endif
+@@ -130,7 +160,7 @@
+ };
+ 
+ 
+-int ssdk_genl_notify_mac_info(char cmd, char *ifname, unsigned char *addr)
++static int ssdk_genl_send_mac_info(char cmd, char *ifname, unsigned char *addr)
+ {
+ 	struct sk_buff *skb;
+ 	void *msg_head;
+@@ -195,29 +225,81 @@
+ 	}
+ 	SSDK_DEBUG("Multicasting message Success to group id %u\n", ssdk_family.mcgrp_offset);
+ 	return 0;
++}
++
++int ssdk_genl_notify_mac_info(char cmd, char *ifname, unsigned char *addr)
++{
++	unsigned long flags;
++	int ret;
++	bool drained;
++
++	spin_lock_irqsave(&ssdk_genl_notify_lock, flags);
++	if (!ssdk_genl_registered || ssdk_genl_notify_stopping) {
++		spin_unlock_irqrestore(&ssdk_genl_notify_lock, flags);
++		return -ESHUTDOWN;
++	}
++	++ssdk_genl_notify_users;
++	spin_unlock_irqrestore(&ssdk_genl_notify_lock, flags);
++	ret = ssdk_genl_send_mac_info(cmd, ifname, addr);
++	spin_lock_irqsave(&ssdk_genl_notify_lock, flags);
++	drained = --ssdk_genl_notify_users == 0;
++	spin_unlock_irqrestore(&ssdk_genl_notify_lock, flags);
++	if (drained)
++		wake_up_all(&ssdk_genl_notify_wait);
++	return ret;
+ }
+ 
+ int ssdk_genl_init(void)
+ {
+ 	int error;
++	unsigned long flags;
+ 
++	mutex_lock(&ssdk_genl_lifecycle_lock);
++	if (ssdk_genl_registered) {
++		mutex_unlock(&ssdk_genl_lifecycle_lock);
++		return -EBUSY;
++	}
++	mutex_lock(&ssdk_genl_control_lock);
+ 	error = genl_register_family(&ssdk_family);
+ 	if (error)
+ 	{
+ 		SSDK_ERROR("ssdk genl family register fail: %d\n", error);
+ 	}
++	else {
++		spin_lock_irqsave(&ssdk_genl_notify_lock, flags);
++		ssdk_genl_registered = true;
++		ssdk_genl_notify_stopping = false;
++		spin_unlock_irqrestore(&ssdk_genl_notify_lock, flags);
++		ssdk_genl_accepting = true;
++	}
++	mutex_unlock(&ssdk_genl_control_lock);
++	mutex_unlock(&ssdk_genl_lifecycle_lock);
+ 	return error;
+ }
+ 
+ int ssdk_genl_deinit(void)
+ {
+-	int error;
++	int error = 0;
++	unsigned long flags;
+ 
+-	error = genl_unregister_family(&ssdk_family);
++	mutex_lock(&ssdk_genl_lifecycle_lock);
++	ssdk_genl_stop_controls();
++	spin_lock_irqsave(&ssdk_genl_notify_lock, flags);
++	ssdk_genl_notify_stopping = true;
++	spin_unlock_irqrestore(&ssdk_genl_notify_lock, flags);
++	wait_event(ssdk_genl_notify_wait, !READ_ONCE(ssdk_genl_notify_users));
++	if (ssdk_genl_registered)
++		error = genl_unregister_family(&ssdk_family);
+ 	if (error)
+ 	{
+ 		SSDK_ERROR("ssdk genl family unregister fail: %d\n", error);
+ 	}
++	else {
++		spin_lock_irqsave(&ssdk_genl_notify_lock, flags);
++		ssdk_genl_registered = false;
++		spin_unlock_irqrestore(&ssdk_genl_notify_lock, flags);
++	}
++	mutex_unlock(&ssdk_genl_lifecycle_lock);
+ 	return error;
+ }
+ 
+diff --git a/src/init/ssdk_plat.c b/src/init/ssdk_plat.c
+--- a/src/init/ssdk_plat.c
++++ b/src/init/ssdk_plat.c
+@@ -1659,153 +1659,69 @@
+ 	__ATTR(mac_polling, 0660, NULL, ssdk_mac_polling_set);
+ 
+ struct kobject *ssdk_sys = NULL;
+-
+-int ssdk_sysfs_init (void)
++static DEFINE_MUTEX(ssdk_sysfs_lock);
++static unsigned int ssdk_sysfs_created;
++static const struct attribute *ssdk_sysfs_attrs[] = {
++	&ssdk_dev_id_attr.attr,
++	&ssdk_log_level_attr.attr,
++	&ssdk_packet_counter_attr.attr,
++	&ssdk_byte_counter_attr.attr,
++	&ssdk_dts_dump_attr.attr,
++	&ssdk_phy_write_reg_attr.attr,
++	&ssdk_phy_read_reg_attr.attr,
++#ifdef IN_LINUX_STD_PTP
++	&ssdk_ptp_counter_attr.attr,
++#endif
++#ifdef MHT
++	&ssdk_clk_cfg_attr.attr,
++#endif
++	&ssdk_eth_switch_attr.attr,
++	&ssdk_mac_polling_attr.attr,
++};
++
++static void ssdk_sysfs_remove_locked(void)
+ {
++	if (!ssdk_sys)
++		return;
++	/* Removal waits for active callbacks while their backing state is live. */
++	while (ssdk_sysfs_created)
++		sysfs_remove_file(ssdk_sys, ssdk_sysfs_attrs[--ssdk_sysfs_created]);
++	kobject_put(ssdk_sys);
++	ssdk_sys = NULL;
++}
++
++int ssdk_sysfs_init(void)
++{
+ 	int ret = 0;
+ 
+-	/* create /sys/ssdk/ dir */
++	mutex_lock(&ssdk_sysfs_lock);
++	if (ssdk_sys) {
++		ret = -EBUSY;
++		goto out;
++	}
+ 	ssdk_sys = kobject_create_and_add("ssdk", NULL);
+ 	if (!ssdk_sys) {
+-		printk("Failed to register SSDK sysfs\n");
+-		return ret;
+-	}
+-
+-	/* create /sys/ssdk/dev_id file */
+-	ret = sysfs_create_file(ssdk_sys, &ssdk_dev_id_attr.attr);
+-	if (ret) {
+-		printk("Failed to register SSDK dev id SysFS file\n");
+-		goto CLEANUP_1;
++		ret = -ENOMEM;
++		goto out;
+ 	}
+-
+-	/* create /sys/ssdk/log_level file */
+-	ret = sysfs_create_file(ssdk_sys, &ssdk_log_level_attr.attr);
+-	if (ret) {
+-		printk("Failed to register SSDK log level SysFS file\n");
+-		goto CLEANUP_2;
+-	}
+-
+-	/* create /sys/ssdk/packet_counter file */
+-	ret = sysfs_create_file(ssdk_sys, &ssdk_packet_counter_attr.attr);
+-	if (ret) {
+-		printk("Failed to register SSDK switch counter SysFS file\n");
+-		goto CLEANUP_3;
+-	}
+-
+-	/* create /sys/ssdk/byte_counter file */
+-	ret = sysfs_create_file(ssdk_sys, &ssdk_byte_counter_attr.attr);
+-	if (ret) {
+-		printk("Failed to register SSDK switch counter bytes SysFS file\n");
+-		goto CLEANUP_4;
+-	}
+-
+-	/* create /sys/ssdk/dts_dump file */
+-	ret = sysfs_create_file(ssdk_sys, &ssdk_dts_dump_attr.attr);
+-	if (ret) {
+-		printk("Failed to register SSDK switch show dts SysFS file\n");
+-		goto CLEANUP_5;
+-	}
+-
+-	/* create /sys/ssdk/phy_write_reg file */
+-	ret = sysfs_create_file(ssdk_sys, &ssdk_phy_write_reg_attr.attr);
+-	if (ret) {
+-		printk("Failed to register SSDK phy write reg file\n");
+-		goto CLEANUP_6;
+-	}
+-
+-	/* create /sys/ssdk/phy_read_reg file */
+-	ret = sysfs_create_file(ssdk_sys, &ssdk_phy_read_reg_attr.attr);
+-	if (ret) {
+-		printk("Failed to register SSDK phy read reg file\n");
+-		goto CLEANUP_7;
++	while (ssdk_sysfs_created < ARRAY_SIZE(ssdk_sysfs_attrs)) {
++		ret = sysfs_create_file(ssdk_sys, ssdk_sysfs_attrs[ssdk_sysfs_created]);
++		if (ret) {
++			ssdk_sysfs_remove_locked();
++			goto out;
++		}
++		++ssdk_sysfs_created;
+ 	}
+-
+-#ifdef IN_LINUX_STD_PTP
+-	/* create /sys/ssdk/ptp_packet_counter file */
+-	ret = sysfs_create_file(ssdk_sys, &ssdk_ptp_counter_attr.attr);
+-	if (ret) {
+-		printk("Failed to register SSDK ptp counter file\n");
+-		goto CLEANUP_8;
+-	}
+-#endif
+-
+-#if defined(MHT)
+-	/* create /sys/ssdk/dts_clk file */
+-	ret = sysfs_create_file(ssdk_sys, &ssdk_clk_cfg_attr.attr);
+-	if (ret) {
+-		printk("Failed to register SSDK clk_cfg file\n");
+-		goto CLEANUP_9;
+-	}
+-#endif
+-	/* create /sys/ssdk/switch_external*/
+-	ret = sysfs_create_file(ssdk_sys, &ssdk_eth_switch_attr.attr);
+-	if (ret) {
+-		printk("Failed to register switch_external file\n");
+-		goto CLEANUP_10;
+-	}
+-
+-	/* create /sys/ssdk/mac_polling */
+-	ret = sysfs_create_file(ssdk_sys, &ssdk_mac_polling_attr.attr);
+-	if (ret) {
+-		printk("Failed to register SSDK mac polling SysFS file\n");
+-		goto CLEANUP_11;
+-	}
+-
+-	return 0;
+-
+-CLEANUP_11:
+-	sysfs_remove_file(ssdk_sys, &ssdk_mac_polling_attr.attr);
+-
+-CLEANUP_10:
+-	sysfs_remove_file(ssdk_sys, &ssdk_eth_switch_attr.attr);
+-
+-#if defined(MHT)
+-CLEANUP_9:
+-#if defined(IN_LINUX_STD_PTP)
+-	sysfs_remove_file(ssdk_sys, &ssdk_ptp_counter_attr.attr);
+-#endif
+-#endif
+-
+-#ifdef IN_LINUX_STD_PTP
+-CLEANUP_8:
+-	sysfs_remove_file(ssdk_sys, &ssdk_phy_read_reg_attr.attr);
+-#endif
+-CLEANUP_7:
+-	sysfs_remove_file(ssdk_sys, &ssdk_phy_write_reg_attr.attr);
+-CLEANUP_6:
+-	sysfs_remove_file(ssdk_sys, &ssdk_dts_dump_attr.attr);
+-CLEANUP_5:
+-	sysfs_remove_file(ssdk_sys, &ssdk_byte_counter_attr.attr);
+-CLEANUP_4:
+-	sysfs_remove_file(ssdk_sys, &ssdk_packet_counter_attr.attr);
+-CLEANUP_3:
+-	sysfs_remove_file(ssdk_sys, &ssdk_log_level_attr.attr);
+-CLEANUP_2:
+-	sysfs_remove_file(ssdk_sys, &ssdk_dev_id_attr.attr);
+-CLEANUP_1:
+-	kobject_put(ssdk_sys);
+-
++out:
++	mutex_unlock(&ssdk_sysfs_lock);
+ 	return ret;
+ }
+ 
+-void ssdk_sysfs_exit (void)
++void ssdk_sysfs_exit(void)
+ {
+-#if defined(MHT)
+-	sysfs_remove_file(ssdk_sys, &ssdk_clk_cfg_attr.attr);
+-#endif
+-
+-#ifdef IN_LINUX_STD_PTP
+-	sysfs_remove_file(ssdk_sys, &ssdk_ptp_counter_attr.attr);
+-#endif
+-	sysfs_remove_file(ssdk_sys, &ssdk_phy_read_reg_attr.attr);
+-	sysfs_remove_file(ssdk_sys, &ssdk_phy_write_reg_attr.attr);
+-	sysfs_remove_file(ssdk_sys, &ssdk_dts_dump_attr.attr);
+-	sysfs_remove_file(ssdk_sys, &ssdk_byte_counter_attr.attr);
+-	sysfs_remove_file(ssdk_sys, &ssdk_packet_counter_attr.attr);
+-	sysfs_remove_file(ssdk_sys, &ssdk_log_level_attr.attr);
+-	sysfs_remove_file(ssdk_sys, &ssdk_dev_id_attr.attr);
+-	sysfs_remove_file(ssdk_sys, &ssdk_eth_switch_attr.attr);
+-	kobject_put(ssdk_sys);
++	mutex_lock(&ssdk_sysfs_lock);
++	ssdk_sysfs_remove_locked();
++	mutex_unlock(&ssdk_sysfs_lock);
+ }
+ 
+ /*qca808x_start*/
+diff --git a/src/ref/ref_fdb.c b/src/ref/ref_fdb.c
+--- a/src/ref/ref_fdb.c
++++ b/src/ref/ref_fdb.c
+@@ -278,6 +278,7 @@
+ 	ref_fdb_info_t *pfdb = NULL, *pfdb_next = NULL;
+ 
+ 	SSDK_DEBUG("port_map 0x%x\n", port_map);
++	aos_lock_bh(&priv->fdb_sw_sync_lock);
+ 	list_for_each_entry_safe(pfdb, pfdb_next, &(priv->sw_fdb_tbl), list)
+ 	{
+ 		if (SW_IS_PBMP_MEMBER(port_map, pfdb->entry.port.id))
+@@ -286,7 +287,20 @@
+ 			pfdb->state = REF_FDB_MAC_NEW;
+ 		}
+ 	}
++	aos_unlock_bh(&priv->fdb_sw_sync_lock);
+ 	return SW_OK;
++}
++
++void ref_fdb_sw_sync_fini(struct qca_phy_priv *priv)
++{
++	ref_fdb_info_t *entry, *next;
++
++	aos_lock_bh(&priv->fdb_sw_sync_lock);
++	list_for_each_entry_safe(entry, next, &priv->sw_fdb_tbl, list) {
++		list_del(&entry->list);
++		kfree(entry);
++	}
++	aos_unlock_bh(&priv->fdb_sw_sync_lock);
+ }
+ 
+ sw_error_t
+@@ -296,6 +310,9 @@
+ 	fal_fdb_entry_t entry = {0};
+ 	fal_fdb_op_t fdb_op = {0};
+ 
++	if (!qca_fdb_sw_sync_enter(priv))
++		return SW_BUSY;
++
+ 	entry.type = HW_ENTRY;
+ 	rv = fal_fdb_entry_extend_getfirst(priv->device_id, &fdb_op, &entry);
+ 	if(rv == SW_OK)
+@@ -308,7 +325,8 @@
+ 			aos_lock_bh(&priv->fdb_sw_sync_lock);
+ 			rv = _ref_fdb_sw_table_update(priv, &entry);
+ 			aos_unlock_bh(&priv->fdb_sw_sync_lock);
+-			SW_RTN_ON_ERROR(rv);
++			if (rv != SW_OK)
++				goto out;
+ 			entry.type = HW_ENTRY;
+ 			rv = fal_fdb_entry_extend_getnext(priv->device_id, &fdb_op, &entry);
+ 		} while (rv == SW_OK);
+@@ -317,6 +335,8 @@
+ 	rv = _ref_fdb_notify_mac(priv);
+ 	aos_unlock_bh(&priv->fdb_sw_sync_lock);
+ 
++out:
++	qca_fdb_sw_sync_leave(priv);
+ 	return rv;
+ }
+ 
