@@ -1,0 +1,165 @@
+Subject: [PATCH] nss: validate complete MATCH nexthop commands and preserve errors
+
+--- a/match/nss_match_cmd.c
++++ b/match/nss_match_cmd.c
+@@ -422,42 +422,44 @@
+ static int nss_match_cmd_procfs_reset_nexthop(const struct ctl_table *ctl, int write, void __user *buffer, size_t *lenp, loff_t *ppos)
+ {
+ 	struct net_device *dev;
+-	uint32_t if_num, type = 0;
++	int32_t if_num;
++	uint32_t type = 0;
+ 	int ret;
+-	char *pos;
+-	char cmd_buf[IFNAMSIZ] = {0};
++	char *dev_name;
++	char cmd_buf[IFNAMSIZ + 1] = {0};
+ 	nss_tx_status_t nss_tx_status;
+ 	struct nss_ctx_instance *nss_ctx = nss_match_get_context();
+ 	struct nss_ctx_instance *wifili_nss_ctx = nss_wifili_get_context();
+ 	size_t count = *lenp;
+ 
+-	if (!nss_ctx || !wifili_nss_ctx) {
+-		pr_warn("%px: NSS Context not found. wifili_nss_ctx: %px. Reset nexthop failed", nss_ctx, wifili_nss_ctx);
+-		return -ENOMEM;
++	if (*ppos < 0 || (write && *ppos)) {
++		return -EINVAL;
+ 	}
+ 
+ 	ret = proc_dostring(ctl, write, buffer, lenp, ppos);
+-	if (!write) {
+-		pr_warn("%px: Reset nexthop failed.\n", nss_ctx);
++	if (ret || !write || !count) {
+ 		return ret;
+ 	}
+ 
+-	if (count >= sizeof(cmd_buf)) {
++	if (!count || count >= sizeof(cmd_buf) || memchr(buffer, '\0', count)) {
+ 		nss_match_warn("%px: Input too large: %zu\n", ctl, count);
+ 		return -EINVAL;
+ 	}
+ 
+ 	memcpy(cmd_buf, buffer, count);
+-	cmd_buf[count] = '\0'; /* Ensure null termination */
++	dev_name = strim(cmd_buf);
++	if (!*dev_name || strlen(dev_name) >= IFNAMSIZ || strpbrk(dev_name, " \t\r\n")) {
++		return -EINVAL;
++	}
+ 
+-	if ((pos = strrchr(cmd_buf, '\n')) != NULL) {
+-		*pos = '\0';
++	if (!nss_ctx || !wifili_nss_ctx) {
++		return -ENOMEM;
+ 	}
+ 
+ 	/*
+ 	 * Parse and read the devname from command.
+ 	 */
+-	dev = dev_get_by_name(&init_net, cmd_buf);
++	dev = dev_get_by_name(&init_net, dev_name);
+ 	if (!dev) {
+ 		pr_warn("%px: Cannot find the net device: %s. Reset nexthop failed.\n", nss_ctx, cmd_buf);
+ 		return -ENODEV;
+@@ -489,6 +491,8 @@
+ 
+ 	if (nss_tx_status != NSS_TX_SUCCESS) {
+ 		pr_warn("%px: Sending message failed, cannot reset nexthop\n", nss_ctx);
++		dev_put(dev);
++		return -EIO;
+ 	}
+ 
+ 	dev_put(dev);
+@@ -504,18 +508,24 @@
+ static int nss_match_cmd_procfs_set_if_nexthop(const struct ctl_table *ctl, int write, void __user *buffer, size_t *lenp, loff_t *ppos)
+ {
+ 	struct net_device *dev;
+-	uint32_t if_num, type = 0;
++	int32_t if_num;
++	uint32_t type = 0;
+ 	uint32_t nh_if_num;
+ 	int table_id;
+ 	struct nss_ctx_instance *nss_ctx = nss_match_get_context();
+ 	struct nss_ctx_instance *wifili_nss_ctx = nss_wifili_get_context();
+-	char *dev_name, *pos;
+-	char *cmd_buf = NULL;
++	char input[sizeof(nss_match_data)] = {0};
++	char *dev_name, *cmd_buf = input;
+ 	size_t count = *lenp;
+ 	nss_tx_status_t nss_tx_status;
+-	int ret = proc_dostring(ctl, write, buffer, lenp, ppos);
++	int ret;
+ 
+-	if (!write) {
++	if (*ppos < 0 || (write && *ppos)) {
++		return -EINVAL;
++	}
++
++	ret = proc_dostring(ctl, write, buffer, lenp, ppos);
++	if (ret || !write || !count) {
+ 		return ret;
+ 	}
+ 
+@@ -524,19 +534,24 @@
+ 		return -ENOMEM;
+ 	}
+ 
+-	if (count >= sizeof(cmd_buf)) {
++	if (!count || count >= sizeof(input) || memchr(buffer, '\0', count)) {
+ 		nss_match_warn("%px: Input too large: %zu\n", ctl, count);
+ 		return -EINVAL;
+ 	}
+ 
+ 	memcpy(cmd_buf, buffer, count);
+-	cmd_buf[count] = '\0'; /* Ensure null termination */
+ 
+-	if ((pos = strrchr(cmd_buf, '\n')) != NULL) {
+-		*pos = '\0';
++	dev_name = strsep(&cmd_buf, " \t");
++	if (!*dev_name || strlen(dev_name) >= IFNAMSIZ || !cmd_buf) {
++		return -EINVAL;
+ 	}
+ 
+-	dev_name = strsep(&cmd_buf, " ");
++	cmd_buf = strim(cmd_buf);
++	if (!isdigit(cmd_buf[0]) || kstrtouint(cmd_buf, 10, &nh_if_num) ||
++	    nh_if_num >= NSS_MAX_NET_INTERFACES) {
++		return -EINVAL;
++	}
++
+ 	dev = dev_get_by_name(&init_net, dev_name);
+ 	if (!dev) {
+ 		pr_warn("%px: Cannot find the net device\n", nss_ctx);
+@@ -550,24 +565,6 @@
+ 		return -ENODEV;
+ 	}
+ 
+-	if (isdigit(cmd_buf[0])) {
+-		if (!sscanf(cmd_buf, "%u", &nh_if_num)) {
+-			pr_warn("%px, Failed to write the nexthop if_num token to integer\n", nss_ctx);
+-			dev_put(dev);
+-			return -EFAULT;
+-		}
+-	} else {
+-		pr_warn("%px: Invalid nexthop interface number.\n", nss_ctx);
+-		dev_put(dev);
+-		return -ENODEV;
+-	}
+-
+-	if (nh_if_num < 0) {
+-		pr_warn("%px: Invalid nexthop interface number:%d\n", nss_ctx, if_num);
+-		dev_put(dev);
+-		return -ENODEV;
+-	}
+-
+ 	table_id = nss_match_get_table_id_by_ifnum(nh_if_num);
+ 	if (table_id <= 0 || table_id > NSS_MATCH_INSTANCE_MAX) {
+ 		pr_warn("Invalid match interface. Failed to set %d as nexthop.\n", nh_if_num);
+@@ -593,6 +590,8 @@
+ 
+ 	if (nss_tx_status != NSS_TX_SUCCESS) {
+ 		pr_warn("%px: Sending message failed, cannot change nexthop\n", nss_ctx);
++		dev_put(dev);
++		return -EIO;
+ 	}
+ 
+ 	dev_put(dev);
