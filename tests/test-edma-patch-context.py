@@ -25,6 +25,21 @@ def sha(data):
     return hashlib.sha256(data).hexdigest()
 
 
+def compare_sources(current, compared, allowed, preimages):
+    extras = sorted(set(compared)-set(current))
+    require(extras == sorted(allowed), 'unexpected comparison extra files')
+    remaining = dict(compared)
+    records = {}
+    for extra in extras:
+        base = extra[:-5] if extra.endswith('.orig') else ''
+        require(base in current and compared[extra] in preimages.get(base,()),
+                'comparison backup is not a known prepatch source')
+        records[extra] = {'sha256':remaining.pop(extra),
+                          'matches_known_prepatch_data':True}
+    require(remaining == current,'comparison source bytes differ')
+    return records
+
+
 def controls():
     results = {}
     with tempfile.TemporaryDirectory(prefix='edma-context-') as temp:
@@ -86,6 +101,29 @@ def controls():
             results['wrong-output'] = 'REJECTED'
         else:
             raise RuntimeError('wrong output accepted')
+    current = {'a.c':'source-hash'}
+    known = {'a.c':['prepatch-hash']}
+    compared = dict(current,**{'a.c.orig':'prepatch-hash'})
+    require(compare_sources(current,current,[],known) == {},'plain comparison')
+    require(compare_sources(current,compared,['a.c.orig'],known) ==
+            {'a.c.orig':{'sha256':'prepatch-hash','matches_known_prepatch_data':True}},
+            'explicit backup comparison')
+    results['valid-comparison'] = results['valid-explicit-backup'] = 'PASS'
+    for name,other,allowed in [
+        ('unlisted-backup',compared,[]),
+        ('wrong-backup-hash',dict(current,**{'a.c.orig':'unrelated'}),['a.c.orig']),
+        ('non-orig-alias',dict(current,**{'a.c.backup':'prepatch-hash'}),['a.c.backup']),
+        ('changed-source',{'a.c':'changed','a.c.orig':'prepatch-hash'},['a.c.orig']),
+        ('missing-source',{},[]),
+        ('missing-backup-base',dict(current,**{'b.c.orig':'prepatch-hash'}),['b.c.orig']),
+        ('duplicate-allowlist',compared,['a.c.orig','a.c.orig']),
+    ]:
+        try:
+            compare_sources(current,other,allowed,known)
+        except RuntimeError:
+            results[name] = 'REJECTED'
+        else:
+            raise RuntimeError('comparison pollution accepted: '+name)
     return results
 
 
@@ -145,22 +183,31 @@ def main():
             other = args.compare_to.resolve()
             compared = {str(p.relative_to(other)):sha(p.read_bytes())
                         for p in sorted(other.rglob('*')) if p.is_file()}
-            extras = sorted(set(compared)-set(result['files']))
-            require(extras == sorted(args.allowed_comparison_backup),
-                    'unexpected comparison extra files')
-            backup_records = {}
-            for extra in extras:
-                base = extra[:-5] if extra.endswith('.orig') else ''
-                known = [entry['declared_context'][base]['before_sha256']
-                         for entry in result['patches'] if base in entry['declared_context']]
-                require(base in result['files'] and compared[extra] in known,
-                        'comparison backup is not a known prepatch source')
-                backup_records[extra] = {'sha256':compared.pop(extra),
-                                          'matches_known_prepatch_data':True}
-            require(compared == result['files'],'comparison source bytes differ')
+            preimages = {}
+            for entry in result['patches']:
+                for name,item in entry['declared_context'].items():
+                    preimages.setdefault(name,[]).append(item['before_sha256'])
+            backup_records = compare_sources(result['files'],compared,
+                                               args.allowed_comparison_backup,preimages)
             result['comparison'] = {'path':str(other),'all_file_bytes_match':True,
-                                    'files':len(compared),'data_only':True,
+                                    'files':len(result['files']),'data_only':True,
                                     'explicit_backups':backup_records}
+        require(result['test_inputs'] == {str(p):sha(p.read_bytes()) for p in
+                                          [Path(__file__),SOURCE/'tests/edma_patch_context.py']},
+                'test/helper changed during run')
+        require(all(sha(Path(item['path']).read_bytes()) == item['sha256'] and
+                    sha((out/Path(item['path']).name).read_bytes()) == item['sha256']
+                    for item in result['patches']), 'patch data drift')
+        require([p.name for p in paths] == [p.name for p in
+                 sorted((SOURCE/'package/qca-nss'/args.package/'patches').glob('*.patch'))
+                 if args.package != 'qca-nss-dp' or int(p.name[:3]) <= args.through],
+                'selected patch inventory drift')
+        require(result['archive_sha256'] == sha((out/'upstream.tar').read_bytes()),
+                'archive drift')
+        require(result['files'] == {str(p.relative_to(root)):sha(p.read_bytes())
+                                   for p in sorted(root.rglob('*')) if p.is_file()},
+                'prepared source drift')
+        result['input_stability'] = 'PASS'
         result['status'] = 'PASS_DECLARED_CONTEXT'
     except Exception as exc:
         result['status']='FAIL';result['error']=str(exc)

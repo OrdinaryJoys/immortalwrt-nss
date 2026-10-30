@@ -220,6 +220,15 @@ prepatch hash, not blindly ignored. Other packages' log-only claims are not
 upgraded by this check. New host CPU/TX runs bind the helper; both runners
 qualify only selected 001-015, not the independently evolving 016 candidate.
 
+The separate comparison-wrapper follow-up adds two valid and seven rejecting
+backup/source controls, for 29 pure controls (8 valid, 21 rejecting), and a
+final rehash of selected inventory, saved/live patches, helper/test, archive
+and prepared bytes. Full DP001-016 and MCS10-layer textual records pass under
+that exact new wrapper and were independently reviewed. This is stable-input
+evidence, not an atomic filesystem lock or live-file drift-fault injection.
+The core context helper and executing driver fixtures are unchanged; old
+20-control runs are not relabeled as having executed the new nine controls.
+
 Read-only SSDK review binds exact d9a1964 plus the unchanged 16 local patches.
 It confirms conditional source risks, not active AX6 failures: raw PHY/switch
 netdev caches publish at REGISTER but have no UNREGISTER retirement; DSA child
