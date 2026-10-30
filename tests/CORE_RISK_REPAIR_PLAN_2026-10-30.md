@@ -206,6 +206,31 @@ that 015 covers it. The build lock is unchanged and does not contain this batch.
 
 ## Adjacent owner dependencies and remaining phase-2 order
 
+OF016 / qca-nss-dp release 8 pairs the independently acquired global node and
+platform-device references. Frozen patch SHA256 is
+43a793fa3232f793b9a08d41ab1a22f150bb2532334fabdbe22165f9abdd6798.
+Only edma_data_plane.c changes, within four functions. Pdata and every init
+failure put only this attempt's gets after their last local use. Failed
+region requests do not release a foreign region. A preowned entry returns
+EBUSY without puts; physical probe abort does not retire shared references.
+Override keeps them through the final false cleanup, which finishes IRQ,
+NAPI/dummy/ring-DMA/MMIO and own drvdata use before puts. Partial no-map refs
+and repeated final are accounted. Initial foreign drvdata publication and
+unsynchronized foreign writers are not repaired by a final pointer-equality
+clear, and arbitrary concurrent init/final is not a new supported operation.
+
+Both native host compilers' r2 suites pass 36 top-level scenarios/4522 checks,
+node65/65 and device62/62, 14 exact semantic mutants and three actual old-source
+reference-balance counterexamples. Parent independently reran GCC; complete
+001-016 declared-position replay and matching 80-file candidate are confirmed.
+Independent frozen source/oracle review accepts only this global ownership
+contract, not all lifecycle/platform teardown or FW/target/performance. Twenty
+definitions and three headers are extracted and compiled; edma_if_close is
+not invoked by this fixture. Actual pdata executes, while hw_init/ring cleanup,
+IRQ/RCU/DMA/device APIs remain models. Active-cleanup refusal is static-only;
+arbitrary pdev-only/resource-only states and concurrent lifecycle are not
+claimed runtime-covered. The README wording is corrected accordingly.
+
 Replay qualification correction: log-only Apple patch runs did not prove zero
 offset. Independent integration review found silent -3 displacement in 012;
 parent's declared-line gate also found an inconsistent new coordinate in 008

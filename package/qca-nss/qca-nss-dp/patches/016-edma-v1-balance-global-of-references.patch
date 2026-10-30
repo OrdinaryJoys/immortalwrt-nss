@@ -1,0 +1,107 @@
+From: OpenWrt Build System <openwrt@localhost>
+Subject: [PATCH] edma-v1: balance global OF reference ownership
+
+Pair the global node/device acquisitions after the last local use. Keep
+references through host override until final exit, and do not release a
+region that a failed init never acquired. Reject pre-owned init state and
+only clear platform drvdata when it still names this EDMA instance.
+
+No per-port put, outer module-init rollback or DMA-idle claim is added.
+
+diff --git a/hal/dp_ops/edma_dp/edma_v1/edma_data_plane.c b/hal/dp_ops/edma_dp/edma_v1/edma_data_plane.c
+--- a/hal/dp_ops/edma_dp/edma_v1/edma_data_plane.c
++++ b/hal/dp_ops/edma_dp/edma_v1/edma_data_plane.c
+@@ -250,6 +250,19 @@
+ 	return 0;
+ }
+ 
++static void edma_release_of_refs(void)
++{
++	struct platform_device *pdev = edma_hw.pdev;
++	struct device_node *node = edma_hw.device_node;
++
++	edma_hw.pdev = NULL;
++	edma_hw.device_node = NULL;
++	if (pdev)
++		put_device(&pdev->dev);
++	if (node)
++		of_node_put(node);
++}
++
+ /*
+  * edma_init()
+  *	EDMA init
+@@ -259,7 +272,8 @@
+ 	int ret = 0;
+ 	struct resource res_edma;
+ 
+-	if (WARN_ON(edma_hw.reg_base || edma_hw.napi_dev))
++	if (WARN_ON(edma_hw.reg_base || edma_hw.reg_resource ||
++			edma_hw.napi_dev || edma_hw.device_node || edma_hw.pdev))
+ 		return -EBUSY;
+ 
+ 	/*
+@@ -267,7 +281,8 @@
+ 	 */
+ 	if (edma_of_get_pdata(&res_edma) < 0) {
+ 		pr_warn("Unable to get EDMA DTS data.\n");
+-		return -EINVAL;
++		ret = -EINVAL;
++		goto edma_init_of_refs_fail;
+ 	}
+ 
+ 	/*
+@@ -278,7 +293,8 @@
+ 				EDMA_DEVICE_NODE_NAME);
+ 	if (!edma_hw.reg_resource) {
+ 		pr_warn("Unable to request EDMA register memory.\n");
+-		return -EFAULT;
++		ret = -EFAULT;
++		goto edma_init_of_refs_fail;
+ 	}
+ 
+ 	/*
+@@ -319,6 +335,8 @@
+ 	release_mem_region((edma_hw.reg_resource)->start,
+ 			   resource_size(edma_hw.reg_resource));
+ 	edma_hw.reg_resource = NULL;
++edma_init_of_refs_fail:
++	edma_release_of_refs();
+ 	return ret;
+ }
+ 
+@@ -359,7 +377,8 @@
+ static void edma_release_mmio(void)
+ {
+ 	ASSERT_RTNL();
+-	platform_set_drvdata(edma_hw.pdev, NULL);
++	if (edma_hw.pdev && platform_get_drvdata(edma_hw.pdev) == &edma_hw)
++		platform_set_drvdata(edma_hw.pdev, NULL);
+ 	if (edma_hw.reg_base) {
+ 		iounmap(edma_hw.reg_base);
+ 		edma_hw.reg_base = NULL;
+@@ -389,9 +408,12 @@
+ 	 * or from module_exit, we want to cleanup only once
+ 	 */
+ 	if (!edma_hw.edma_initialized) {
+-		if (!is_dp_override && edma_hw.reg_base) {
+-			edma_disable_port();
+-			edma_release_mmio();
++		if (!is_dp_override) {
++			if (edma_hw.reg_base)
++				edma_disable_port();
++			if (edma_hw.reg_base || edma_hw.reg_resource)
++				edma_release_mmio();
++			edma_release_of_refs();
+ 		}
+ 		return;
+ 	}
+@@ -465,6 +487,8 @@
+ 	 * try to cleanup again
+ 	 */
+ 	edma_hw.edma_initialized = false;
++	if (!is_dp_override)
++		edma_release_of_refs();
+ }
+ 
+ void edma_cleanup(bool is_dp_override)

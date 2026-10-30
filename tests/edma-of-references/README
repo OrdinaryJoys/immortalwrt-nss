@@ -1,0 +1,107 @@
+EDMA v1 global OF reference ownership (patch 016)
+================================================
+
+Run from the source worktree with a fresh evidence directory:
+
+  /usr/bin/python3 tests/test-edma-of-references.py \
+    --upstream-cache /Volumes/FX-MD87/Review-AX6/upstreams/nss/qca-nss-dp \
+    --output /Volumes/FX-MD87/Review-AX6/audits/20261030/core-risk-phase2/EDMA-OF016-gcc-r2 \
+    --compiler /opt/homebrew/bin/gcc-16
+
+For Clang use --compiler /usr/bin/clang --sanitize and another fresh output.
+No make, firmware/target build, hardware, network or archived program is used.
+
+Source and patch binding
+------------------------
+The runner exports local git pin d8f802f08fd8ff31057ba58edb20bbe448e7b505
+twice. It applies current 001-015 to both and 016 only to candidate. Every
+patch is checked at its full declared old/new hunk positions by the shared
+tests/edma_patch_context.py before patch, then verify_applied checks exact
+expected file bytes after patch. INPUTS.json records the helper SHA, every
+patch SHA, per-hunk declared coordinates, before/after file SHAs and complete
+prepared-tree file SHAs. Patch-tool stdout alone is not an offset oracle.
+Final qualification uses the header-maintained 008/012 chain, not old r5
+zero-offset claims. Older r5 may retain exact-context behavior evidence only.
+
+Only edma_data_plane.c may differ between prepared trees. After removing the
+four authorized changed function bodies, all remaining C tokens must match.
+The runner, fixture, README, shared lexer/helper and patch bytes must remain
+stable through each run. No shared file is modified by this runner.
+
+Actual definitions extracted and compiled
+-----------------------------------------
+Complete bodies are extracted unchanged using the unchanged 014 C lexer:
+
+  edma_of_get_pdata, edma_release_of_refs (candidate only), edma_init,
+  edma_free_irqs, edma_stop_napi, edma_release_mmio, edma_cleanup_locked,
+  edma_cleanup, edma_disable_port, edma_disable_interrupts,
+  edma_enable_interrupts, edma_close_member, edma_retire_port, edma_if_open,
+  edma_if_close, edma_irq_init, edma_register_netdevice, edma_if_init,
+  nss_dp_clear_host_ctx, nss_dp_abort_host_probe.
+
+The original pdata function is NOT stubbed. Complete current arch, register
+and EDMA dataplane headers are included with only include directives removed.
+Each extracted function's source path, line and SHA are saved in fragments
+JSON; generated C and binaries are preserved. There is no source scheduling
+insertion. Physical probe/open/close/remove as a whole are not run here.
+Extraction/compilation does not mean every listed definition is individually
+executed. In particular edma_if_close is compiled but is not invoked by this
+fixture; no new direct close-path runtime coverage is claimed from this suite.
+
+Model boundaries
+-----------------
+Bottom-level OF lookups, property/address reads, reference counters,
+reservations, mappings, dummy allocation, IRQ/NAPI/RCU/RTNL and DMA/ring APIs
+are host ledger models, not kernel implementations. edma_hw_init and
+edma_cleanup_rings are explicit mocks with pdev last-use checks. The 15th
+injection models the unpublished hw-init error return; it does not rerun all
+013 allocation sites or the real DMA teardown code. It proves ordering at
+the called API boundary, not DMA idle, firmware behavior or device release.
+External initial node/device counts remain 5 and 7; puts may consume only
+the reference acquired by this global EDMA init. CONFIG_OF_DYNAMIC on/off is
+modeled separately: logical get/put pairing is checked even when node refs
+are physical no-ops. IRQ use includes the actual stored pdev dev_id.
+
+36 positive scenarios cover both node configurations, all 15 init failure
+points, a successful failed-init retry after each, a foreign busy region,
+node-only/both-ref partial state, live-init rejection, replacement drvdata,
+override/repeat override/final/repeat final, and a physical host probe-abort
+helper with a live peer. Failed request_mem_region must not release the
+foreign reservation. Partial refs must be put even without a mapping.
+Override keeps refs/mapping until the final false cleanup. Every put checks
+IRQ, ring/DMA, dummy, mapping and reservation retirement and cleared global
+reference pointers. Trace output is a modeled API ledger, not an HW trace.
+
+Foreign drvdata protection means final cleanup does not clear drvdata that
+has since changed to a foreign value. Successful init STILL unconditionally
+sets drvdata to &edma_hw and may overwrite an initial foreign value. That
+pre-existing behavior is not repaired or asserted to occur on actual boards.
+Retry qualification is failed-init retry only, not live reset, NSS-to-EDMA
+reverse handoff or global counter/state reinitialization.
+
+Oracles
+--------
+All host fixture compiles require exit zero and empty compiler stdout/stderr. Candidate
+suite and trace require exit zero and empty stderr. Suite accounting must
+match exactly 36 cases / 4522 checks / node 65/65 / device 62/62 / DMA API
+uses 70 / IRQ uses 8. Trace has one fewer mode-dispatch check.
+
+Each of 14 semantic mutants must exit exactly 86, have empty stdout and emit
+exactly its assigned single EDMA_OF016 marker on stderr. Wrong exit, extra
+stdout, extra stderr and synthetic unrelated sanitizer diagnostics are four
+rejected oracle-poison cases. Crashes, arbitrary nonzero exits and sanitizer
+failures cannot satisfy a semantic mutant. Three actual old-001-015-source
+runs (missing pdev, region failure, success/final) must fail specifically at
+node-get-put-balance. Separate Clang ASan and UBSan canaries require positive
+diagnostics and nonzero exits; they are not counted as semantic mutants.
+Failures, commands, compiler streams and generated inputs are retained.
+
+Residual scope
+---------------
+This is global EDMA-owned OF/device reference pairing, not a general lifetime
+closure. External NSS/SSDK/PHY caches, asynchronous skb->dev/PTP, firmware
+references, DMA idle/duplicate opaque epoch, common MDIO, EDMA v2 and target
+compilation/runtime remain OPEN. The separate conditional P1 in outer
+nss_dp_init failure rollback is not fixed by 016. The runner performs no
+ring/IRQ tuning, forced DMA sweep, release/version/lock changes, staging or
+commits. Parent package-release maintenance is a separate recorded action.
