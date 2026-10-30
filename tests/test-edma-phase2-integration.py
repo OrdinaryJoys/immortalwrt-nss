@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""TESTONLY: qualify 014 TX against a freshly replayed, frozen 001-015 tree."""
+"""TESTONLY: qualify 014 TX under a frozen 001-015 or 001-016 source tree."""
 import argparse
 import hashlib
 import importlib.util
@@ -24,6 +24,7 @@ REL = Path('hal/dp_ops/edma_dp/edma_v1')
 PATCHES = SOURCE / 'package/qca-nss/qca-nss-dp/patches'
 PATCH14 = '014-edma-v1-pair-tx-slot-ownership.patch'
 PATCH15 = '015-edma-v1-retire-probe-and-host-napi-owners.patch'
+PATCH16 = '016-edma-v1-balance-global-of-references.patch'
 TX_RUNNER = SOURCE / 'tests/test-edma-tx-slot-ownership.py'
 TX_FIXTURE = SOURCE / 'tests/edma-tx-slot-ownership/fixture.c'
 README = SOURCE / 'tests/edma-phase2-integration/README.md'
@@ -90,15 +91,15 @@ def identities(paths):
     return {str(path): sha(path.read_bytes()) for path in paths}
 
 
-def unchanged_inputs(paths, initial, patches):
-    require(selected_patches() == patches,
+def unchanged_inputs(paths, initial, patches, through):
+    require(selected_patches(through) == patches,
             'patch directory inventory changed after freeze capture')
     require(identities(paths) == initial, 'bound repository inputs changed')
 
 
-def selected_patches():
+def selected_patches(through):
     return [p for p in sorted(PATCHES.glob('*.patch'))
-            if re.match(r'^\d{3}-',p.name) and int(p.name[:3]) <= 15]
+            if re.match(r'^\d{3}-',p.name) and int(p.name[:3]) <= through]
 
 
 def file_hashes(root):
@@ -125,7 +126,7 @@ def prepare(cache, output, patches, expected):
     (output / 'upstream.tar').write_bytes(archive)
     manifest = {'pin': PIN, 'git_archive_sha256': sha(archive), 'patches': [],
                 'method': 'full fresh package replay, --fuzz=0; offsets forbidden'}
-    roots = {name: output / name for name in ('before15', 'after15')}
+    roots = {name: output / name for name in ('before15', 'after')}
     for root in roots.values():
         root.mkdir()
         with tarfile.open(fileobj=io.BytesIO(archive)) as tar:
@@ -150,7 +151,7 @@ def prepare(cache, output, patches, expected):
         manifest['patches'].append(entry)
         # Persist partial preparation evidence even if a later patch fails.
         write_json(output / 'INPUTS.json', manifest)
-        targets = ('after15',) if patch.name == PATCH15 else ('before15', 'after15')
+        targets = ('after',) if int(patch.name[:3]) >= 15 else ('before15', 'after')
         for name in targets:
             expected_bytes, context = inspect_patch(roots[name],data)
             entry.setdefault('declared_context',{})[name] = context
@@ -187,7 +188,7 @@ def prepare(cache, output, patches, expected):
     require(all(not list(root.rglob('*.rej')) and not list(root.rglob('*.orig'))
                 for root in roots.values()), 'patch rejection/backup artifacts')
     before, after = (manifest['prepared_files'][name] for name in roots)
-    manifest['changed_by_015'] = [p for p in sorted(set(before) | set(after))
+    manifest['changed_by_015_onward'] = [p for p in sorted(set(before) | set(after))
                                   if before.get(p) != after.get(p)]
     write_json(output / 'INPUTS.json', manifest)
     return roots, manifest
@@ -223,7 +224,7 @@ def structure(tx, text, name):
 
 
 def header_contract(tx, roots):
-    before, after = (roots[name] for name in ('before15', 'after15'))
+    before, after = (roots[name] for name in ('before15', 'after'))
     hw = [(root / REL / 'edma_data_plane.h').read_text() for root in (before, after)]
     reduced = tx.mask(hw[1])
     owner = structure(tx, hw[1], 'edma_hw')
@@ -315,16 +316,16 @@ def extract_contract(tx, roots, output):
                 require(hits, 'missing TX call edge: ' + caller + ' -> ' + target)
                 calls[stage][caller + ' -> ' + target] = hits
         write_json(output / (stage + '-FRAGMENTS.json'), records)
-    before, after = (roots[name] for name in ('before15', 'after15'))
+    before, after = (roots[name] for name in ('before15', 'after'))
     require((before / REL / 'edma_cfg.c').read_bytes() ==
             (after / REL / 'edma_cfg.c').read_bytes(), '015 changed complete config/setup/teardown file')
-    require(bodies['before15'] == bodies['after15'], '014 TX/config function body hash drift under 015')
+    require(bodies['before15'] == bodies['after'], '014 TX/config function body hash drift under final selected chain')
     normalized = {stage: {name: [canonical(tx, text) for text in value]
                            for name, value in edges.items()}
                   for stage, edges in calls.items()}
-    require(normalized['before15'] == normalized['after15'], '014 TX call contract changed')
+    require(normalized['before15'] == normalized['after'], '014 TX call contract changed')
     comparisons = {name: {'before15': sha(code.encode()),
-                          'after15': sha(bodies['after15'][name].encode()), 'equal': True}
+                          'after': sha(bodies['after'][name].encode()), 'equal': True}
                    for name, code in bodies['before15'].items()}
     write_json(output / 'FUNCTION-COMPARISON.json', comparisons)
     write_json(output / 'CALL-CONTRACT.json', calls)
@@ -394,11 +395,11 @@ def compiler_suite(tx, compiler, sanitize, output, extracted):
             require(p['returncode'] == 0 and not p['stderr'] and p['stdout'],
                     'positive successful trace gate: ' + stage)
             traces[stage] = p['stdout']
-            if stage == 'after15':
+            if stage == 'after':
                 result['suite'] = suite_summary(run(stage + '.suite', binary, ['suite']))
-        require(traces['before15'] == traces['after15'], 'before15/after15 successful trace drift')
-        result['successful_trace_sha256'] = sha(traces['after15'].encode())
-        headers, funcs = extracted['after15']
+        require(traces['before15'] == traces['after'], 'before/final successful trace drift')
+        result['successful_trace_sha256'] = sha(traces['after'].encode())
+        headers, funcs = extracted['after']
         variants = tx.mutants(funcs)
         require(set(variants) == EXPECTED_MUTANTS, 'exact existing 16 TX mutants required')
         for name, (changed, marker) in variants.items():
@@ -443,16 +444,26 @@ def main():
     parser.add_argument('--clang', required=True)
     parser.add_argument('--frozen-015-sha256', required=True,
                         help='Only supply the SHA explicitly released by the parent after freeze')
+    parser.add_argument('--frozen-016-sha256',
+                        help='Explicitly unlock the separately reviewed 001-016 subset')
     args = parser.parse_args()
     require(re.fullmatch(r'[0-9a-f]{64}', args.frozen_015_sha256) is not None,
             'a parent-confirmed frozen 015 SHA256 is mandatory; do not run WIP')
-    patches = selected_patches()
-    require(len(patches) == 15 and
+    through = 16 if args.frozen_016_sha256 is not None else 15
+    if through == 16:
+        require(re.fullmatch(r'[0-9a-f]{64}',args.frozen_016_sha256) is not None,
+                'a separately confirmed frozen 016 SHA256 is mandatory')
+    patches = selected_patches(through)
+    require(len(patches) == through and
             [int(p.name[:3]) if re.match(r'^\d{3}-', p.name) else -1 for p in patches]
-            == list(range(1, 16)) and patches[-2].name == PATCH14 and
-            patches[-1].name == PATCH15, 'exact ordered package patches 001-015 required')
-    require(sha(patches[-1].read_bytes()) == args.frozen_015_sha256,
+            == list(range(1, through+1)) and patches[13].name == PATCH14 and
+            patches[14].name == PATCH15 and (through == 15 or patches[15].name == PATCH16),
+            'exact ordered selected package patches required')
+    require(sha(patches[14].read_bytes()) == args.frozen_015_sha256,
             '015 does not match parent-confirmed freeze; do not run WIP')
+    if through == 16:
+        require(sha(patches[15].read_bytes()) == args.frozen_016_sha256,
+                '016 does not match parent-confirmed freeze; do not run WIP')
     recipe = SOURCE / 'package/qca-nss/qca-nss-dp/Makefile'
     require(re.search(r'^PKG_SOURCE_VERSION:=' + PIN + r'\s*$',
                       recipe.read_text(), re.M), 'current recipe is not exact d8f train')
@@ -462,18 +473,23 @@ def main():
     bound = [Path(__file__).resolve(), README, TX_RUNNER, TX_FIXTURE, recipe,
              SOURCE/'tests/edma_patch_context.py', *patches]
     initial = identities(bound)
-    require(initial[str(patches[-1])] == args.frozen_015_sha256,
+    require(initial[str(patches[14])] == args.frozen_015_sha256,
             '015 changed during input capture; do not run WIP')
+    if through == 16:
+        require(initial[str(patches[15])] == args.frozen_016_sha256,
+                '016 changed during input capture; do not run WIP')
     output.mkdir(exist_ok=False)
     result = {'status': 'INCOMPLETE', 'output': str(output), 'pin': PIN,
               'parent_confirmed_015_sha256': args.frozen_015_sha256,
+              'parent_confirmed_016_sha256': args.frozen_016_sha256,
+              'qualified_through': through,
               'initial_source_HEAD': clean_command(['git', '-C', str(SOURCE), 'rev-parse', 'HEAD']).decode().strip(),
               'source_branch': clean_command(['git', '-C', str(SOURCE), 'branch', '--show-current']).decode().strip(),
               'input_identities': initial, 'compilers': {},
               'excluded_patch_names': [p.name for p in sorted(PATCHES.glob('*.patch'))
                                        if p not in patches],
               'accepted_TX_reference': ACCEPTED_TX_REF,
-              'qualification': '014 TX host tuple behavior under actual 001-015 headers/source only; '
+              'qualification': f'014 TX host tuple behavior under actual 001-{through:03} headers/source only; '
                                'NOT 015 CPU lifecycle/RCU, FW/DMA idle, target build or device acceptance'}
     try:
         for path in (TX_RUNNER, TX_FIXTURE, PATCHES / PATCH14):
@@ -488,9 +504,9 @@ def main():
             dest.write_bytes(path.read_bytes())
             require(sha(dest.read_bytes()) == initial[str(path)], 'snapshot changed while reading')
         tx = load_tx()
-        unchanged_inputs(bound, initial, patches)
+        unchanged_inputs(bound, initial, patches, through)
         roots, inputs = prepare(args.upstream_cache.resolve(), output, patches, initial)
-        unchanged_inputs(bound, initial, patches)
+        unchanged_inputs(bound, initial, patches, through)
         extracted = extract_contract(tx, roots, output)
         result['inputs_sha256'] = sha((output / 'INPUTS.json').read_bytes())
         write_json(output / 'RESULTS.json', result)
@@ -500,7 +516,7 @@ def main():
         require(result['compilers']['gcc']['successful_trace_sha256'] ==
                 result['compilers']['clang-asan-ubsan']['successful_trace_sha256'],
                 'successful trace differs between GCC and Clang')
-        unchanged_inputs(bound, initial, patches)
+        unchanged_inputs(bound, initial, patches, through)
         require({name: file_hashes(root) for name, root in roots.items()}
                 == inputs['prepared_files'], 'prepared source/header drift during host execution')
         require(sha((output / 'upstream.tar').read_bytes()) == inputs['git_archive_sha256'],

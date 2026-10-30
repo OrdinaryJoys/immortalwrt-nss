@@ -22,13 +22,19 @@ missing/mismatched freeze hash before preparing source or invoking compilers.
 Only a fresh `EDMA-INTEGRATION-*` directory immediately under the phase2 audit
 root is accepted. A hash does not itself authorize execution: wait for the
 parent's notification. Future revisions of 015 require a fresh confirmation.
+By default only 001-015 is selected. After the separate OF016 freeze/review,
+add --frozen-016-sha256 PARENT_CONFIRMED_016_SHA256 to explicitly unlock 001-016.
+An absent option excludes 016 even when it is present. A malformed or
+mismatched supplied hash stops before output preparation or compiler calls;
+the command-line hash is not itself authorization to run WIP.
 
 ## Exact Inputs And Source Contract
 
 The current package recipe must pin
 `d8f802f08fd8ff31057ba58edb20bbe448e7b505`. One new Git archive supplies two
-full package trees: `before15` replays current 001-014 and `after15` replays
-current 001-015. Later patches are explicitly excluded and recorded by name;
+full package trees: `before15` replays current 001-014 and `after` replays
+current 001-015 or the separately unlocked 001-016. The result records
+qualified_through and both confirmed hashes. Later patches are explicitly excluded and recorded by name;
 this runner does not certify a later complete candidate. Every full selected
 patch is first checked at its declared old AND new coordinates with all
 context/counts, then its actual output must equal the independently calculated
@@ -41,12 +47,12 @@ Raw archive/all-file hashes, each saved patch, replay logs, recipe, runner,
 imported repository TX helper and fixture identities are retained. Inputs
 are rehashed during replay and after execution so another owner's edit
 cannot silently produce a PASS. Final validation also rechecks the complete
-selected 001-015 inventory, both prepared trees, saved patch data and raw Git
+selected inventory, both prepared trees, saved patch data and raw Git
 archive. No archived program or sealed fixture is
 imported/executed; only current source-repository TX and context helpers are imported.
 The 014 patch/helper/fixture must also match their accepted Git objects at
 `914fa57048d6e543d7aef46c1b0de5d4eb4669dd`; this does not move HEAD. The
-package recipe is captured, not edited. Final015 OF
+package recipe is captured, not edited. The separate OF016
 node/device-reference work is not inferred from the TX result; new header
 fields outside the explicit allowance stop for review.
 
@@ -84,10 +90,10 @@ identity. Old results must not be cited as having exercised this new gate.
 
 ## Host Qualification
 
-For GCC and Clang ASan/UBSan, compile both before15 and after15 fixtures
+For GCC and Clang ASan/UBSan, compile both before15 and final after fixtures
 diagnostic-free and require identical successful map/publish/unmap traces.
 Run the complete existing TX suite and its 16 semantic mutants against the
-after15 source/headers. Also compare successful traces across compilers.
+final selected source/headers. Also compare successful traces across compilers.
 The fixture's existing full tuple/lock/map/owner/length/zero-DMA/cleanup and
 deterministic race coverage is retained, with its existing hooks and stubs.
 
@@ -103,8 +109,10 @@ Positive runtime stderr must be empty. Raw compiler/runtime stdout/stderr,
 commands, versions, executable/generated-source hashes and manifests are
 bound into final evidence, including failed attempts.
 
-Passing only qualifies 014 TX tuple behavior under the combined 001-015
-source/header layout. The unchanged TX setup fixture assumes PRE-LIVE owner
+Passing only qualifies 014 TX tuple behavior under the recorded selected
+001-015 or 001-016 source/header layout. This does not execute the global
+OF init/final functions or borrow their separate lifecycle acceptance.
+The unchanged TX setup fixture assumes PRE-LIVE owner
 setup and modeled retirement before cleanup. RX/poll behavior, NAPI/IRQ CPU
 lifetime, real RCU, callback drain, FW idle/epoch, DMA stop, hardware/target
 ABI, throughput and device behavior remain separate acceptance boundaries.
