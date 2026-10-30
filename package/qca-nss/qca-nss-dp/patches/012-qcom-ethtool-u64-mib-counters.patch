@@ -14,7 +14,7 @@ Base: NSS dataplane d8f802f08fd8ff31057ba58edb20bbe448e7b505 with local 011
 
 --- a/hal/gmac_ops/qcom/qcom_if.c
 +++ b/hal/gmac_ops/qcom/qcom_if.c
-@@ -336,7 +336,7 @@ static int32_t qcom_get_eth_stats(struct nss_gmac_hal_dev *nghd, uint64_t *data, struc
+@@ -333,7 +333,7 @@ static int32_t qcom_get_eth_stats(struct nss_gmac_hal_dev *nghd, uint64_t *data, struc
  		p = (uint8_t *)mib_stats
  			+ qcom_gstrings_mib_stats[i_mib].stat_offset;
  		i = QCOM_STATS_LEN + i_mib;

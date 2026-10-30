@@ -204,6 +204,55 @@ OPEN. A newly rechecked outer nss_dp_init registration-error path has no
 complete driver/HAL unwind; it requires its own validated repair, not a claim
 that 015 covers it. The build lock is unchanged and does not contain this batch.
 
+## Adjacent owner dependencies and remaining phase-2 order
+
+Replay qualification correction: log-only Apple patch runs did not prove zero
+offset. Independent integration review found silent -3 displacement in 012;
+parent's declared-line gate also found an inconsistent new coordinate in 008
+and two stale MCS009 positions. Maintain only these four @@ headers; actual
+prepared DP80/MCS20 source files remain byte-equal to the accepted sources.
+Old source/host behavior evidence is retained, but its zero-offset assertion
+is withdrawn. New edma_patch_context.py checks complete old/new coordinates,
+counts, bounds and output bytes without searching for a new position. Twenty
+pure controls and fresh full package replays are separate from driver cases.
+MCS's extra historical .orig is explicitly named and matched to a known
+prepatch hash, not blindly ignored. Other packages' log-only claims are not
+upgraded by this check. New host CPU/TX runs bind the helper; both runners
+qualify only selected 001-015, not the independently evolving 016 candidate.
+
+Read-only SSDK review binds exact d9a1964 plus the unchanged 16 local patches.
+It confirms conditional source risks, not active AX6 failures: raw PHY/switch
+netdev caches publish at REGISTER but have no UNREGISTER retirement; DSA child
+objects are not pinned by a conduit netdev reference; started FDB polling can
+rearm without a matching module-stop drain. Parent re-read the relevant
+writers/notifier/name readers, polling start/stop and module exit. Full other
+SSDK/PHY/MDIO, actual DSA callbacks and runtime reachability are not certified.
+
+A safe follow-up must jointly convert cache publications, copied-name readers,
+sysfs and conditional DSA users. Owned cache refs must be returned during
+UNREGISTER before the kernel reference wait, not after unregister_netdev
+returns. Cleanup must scan object identity even after rename/PHY change and
+before fallible hardware checks. No sleeping RTNL acquisition under FDB/HSL
+BH locks, no raw attached_dev fallback under an unrelated SSDK lock, and no
+NULL-only change leaving dereferencing readers behind. Legacy PHY-only naming,
+DSA callback lock order and worker/private/module lifetime remain explicit
+design gates. Validate this dependency before accepting a later outer DP
+module-init rollback as a complete CPU lifetime repair; do not omit a required
+rollback merely to conceal the stale cache. Independent findings and proposed
+T01-T13 are evidence/plans, not executed tests or implemented SSDK fixes.
+
+The human selected MU-EDCA offline validation with wire numbering blocked.
+Do not change command/attribute numbers, borrow a QCA vendor assignment or alias
+an existing standard event as MU. Test original global/BSS/reply-queue routing
+with genuine standard events separately from a typed, off-wire strict IE
+validator and canonical-iface consumer prototype. Composition through an
+explicit test adapter is not kernel-to-userspace protocol interoperability.
+Use actual pinned libnl-tiny parsing/extent semantics, retain actual headers,
+callers and type layout where feasible, and declare every host substitution.
+Any proposed per-iface/per-BSS counter rule is only an offline oracle, not
+authorization to deploy a new policy. BE/MLO, wire assignment, FW enablement,
+on-air beacons and performance remain blocked or unverified.
+
 ## Item 1: MATCH bounded command repair
 
 Local patch 024 repairs the set/reset handlers together. The exact upstream

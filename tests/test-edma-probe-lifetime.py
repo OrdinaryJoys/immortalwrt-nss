@@ -12,6 +12,9 @@ import subprocess
 import sys
 import tarfile
 
+sys.dont_write_bytecode = True
+from edma_patch_context import inspect_patch, verify_applied
+
 SOURCE = Path(__file__).resolve().parents[1]
 REL = Path('hal/dp_ops/edma_dp/edma_v1')
 PIN = 'd8f802f08fd8ff31057ba58edb20bbe448e7b505'
@@ -66,10 +69,12 @@ def prepare(cache, output):
         if p.name == PATCH:
             before = {str(f.relative_to(root)):f.read_bytes() for f in root.rglob('*') if f.is_file()}
         data=p.read_bytes(); saved=output / p.name; saved.write_bytes(data)
+        expected, context = inspect_patch(root,data)
         result=subprocess.run(['/usr/bin/patch','-p1','--fuzz=0','--batch','-i',str(saved)],cwd=root,capture_output=True,text=True)
         (output/(p.name+'.log')).write_text(result.stdout+result.stderr)
         require(result.returncode==0 and not re.search(r'fuzz|offset|FAILED|Reversed',result.stdout+result.stderr,re.I),'exact patch '+p.name)
-        manifest['patches'].append({'path':str(p),'sha256':sha(data)})
+        verify_applied(root,expected)
+        manifest['patches'].append({'path':str(p),'sha256':sha(data),'declared_context':context})
     changed=[p for p,b in before.items() if (root/p).read_bytes()!=b]
     require(set(changed)=={'nss_dp_main.c','nss_dp_attach.c','hal/soc_ops/ipq807x/nss_ipq807x.h',str(REL/'edma_data_plane.h'),str(REL/'edma_data_plane.c'),str(REL/'edma_tx_rx.c')},'015 six-file scope')
     require((root/REL/'edma_cfg.c').read_bytes()==before[str(REL/'edma_cfg.c')],'014 allocation/TX cleanup changed')
@@ -134,15 +139,68 @@ def mutants(funcs):
     return result
 
 
+EXPECTED_SUITE = ('cases=55 checks=11401 irq_frees=371 adds=78 dels=78 '
+                  'enables=14 disables=14\n')
+
+
+def positive_result(result):
+    return (type(result['returncode']) is int and result['returncode'] == 0
+            and result['stdout'] == EXPECTED_SUITE and result['stderr'] == '')
+
+
+def semantic_rejection(result, marker):
+    return (type(result['returncode']) is int and result['returncode'] == 86
+            and result['stdout'] == ''
+            and result['stderr'] == 'EDMA_LIFETIME ' + marker + '\n')
+
+
+def check_oracles():
+    marker = 'oracle-control'
+    good = {'returncode':86,'stdout':'','stderr':'EDMA_LIFETIME '+marker+'\n'}
+    require(semantic_rejection(good,marker),'valid negative oracle control')
+    positive = {'returncode':0,'stdout':EXPECTED_SUITE,'stderr':''}
+    require(positive_result(positive),'valid positive oracle control')
+    controls = {}
+    for name,field,value in [
+        ('extra-diagnostic','stderr',good['stderr']+'unrelated diagnostic\n'),
+        ('sanitizer-diagnostic','stderr',good['stderr']+'AddressSanitizer: error\n'),
+        ('wrong-marker','stderr','EDMA_LIFETIME unrelated\n'),
+        ('missing-marker','stderr',''),
+        ('stdout-noise','stdout','unexpected output\n'),
+        ('signal','returncode',-11),
+        ('sanitizer-exit','returncode',97),
+        ('compile-failure','returncode',1),
+        ('timeout','returncode','timeout'),
+    ]:
+        poisoned = dict(good); poisoned[field] = value
+        require(not semantic_rejection(poisoned,marker),'reject oracle pollution '+name)
+        controls[name] = 'REJECTED'
+    for name,field,value in [
+        ('empty-suite','stdout',''),
+        ('partial-suite','stdout','cases=55 checks=11401\n'),
+        ('different-case-count','stdout',EXPECTED_SUITE.replace('cases=55','cases=0')),
+        ('unbalanced-napi','stdout',EXPECTED_SUITE.replace('dels=78','dels=77')),
+        ('positive-stderr','stderr','runtime error: unrelated\n'),
+        ('positive-exit','returncode',86),
+        ('boolean-exit','returncode',False),
+    ]:
+        poisoned = dict(positive); poisoned[field] = value
+        require(not positive_result(poisoned),'reject positive oracle pollution '+name)
+        controls[name] = 'REJECTED'
+    return {'valid_controls':2,'pollution_controls':controls,
+            'scope':'result-gate controls, not additional driver scenarios'}
+
+
 def main():
     p=argparse.ArgumentParser(description=__doc__);p.add_argument('--upstream-cache',type=Path,required=True);p.add_argument('--output',type=Path,required=True);p.add_argument('--compiler',required=True);p.add_argument('--sanitize',action='store_true');a=p.parse_args()
     out=a.output.resolve();require(out.name.startswith('EDMA-LIFETIME-'),'evidence prefix');out.mkdir(parents=True,exist_ok=False)
     env=dict(os.environ,ASAN_OPTIONS='detect_leaks=0:halt_on_error=1',UBSAN_OPTIONS='halt_on_error=1:print_stacktrace=1')
     result={'status':'INCOMPLETE','compiler':a.compiler,'sanitize':a.sanitize,'runs':{},'mutants':{}}
     try:
+        result['oracle_controls']=check_oracles()
         result['compiler_version']=subprocess.run([a.compiler,'--version'],capture_output=True,text=True,check=True).stdout
         root,inputs=prepare(a.upstream_cache.resolve(),out);headers,funcs=extract(root,out)
-        result['inputs_sha256']=sha((out/'INPUTS.json').read_bytes());result['test_inputs']={str(f):sha(f.read_bytes()) for f in [Path(__file__),TEMPLATE,TX_RUNNER]}
+        result['inputs_sha256']=sha((out/'INPUTS.json').read_bytes());result['test_inputs']={str(f):sha(f.read_bytes()) for f in [Path(__file__),TEMPLATE,TX_RUNNER,SOURCE/'tests/edma_patch_context.py']}
         flags=['-std=gnu11','-O1','-g','-pthread','-Wall','-Wextra','-Werror','-Wno-unused-parameter','-Wno-unused-variable','-Wno-unused-function','-Wno-sign-compare','-Wno-pointer-sign']
         if a.sanitize:flags+=['-fsanitize=address,undefined','-fno-sanitize-recover=all','-fno-omit-frame-pointer']
         def build(name,text,extra=()):
@@ -150,10 +208,10 @@ def main():
             r=run([a.compiler,*flags,*extra,src,'-o',binary],out,name+'.compile')
             require(r['returncode']==0 and not r['stdout'] and not r['stderr'],'clean compile '+name);return binary
         binary=build('lifetime-fixture',fixture(headers,funcs));r=run([binary,'suite'],out,'lifetime.suite',env)
-        require(r['returncode']==0 and not r['stderr'],'positive lifetime suite');result['runs']['lifetime']=r
+        require(positive_result(r),'exact positive lifetime suite');result['runs']['lifetime']=r
         for name,(changed,marker) in mutants(funcs).items():
             b=build('mutant-'+name,fixture(headers,changed));r=run([b,'suite'],out,'mutant-'+name,env)
-            require(r['returncode']==86 and 'EDMA_LIFETIME '+marker in r['stderr'],'semantic mutant gate '+name);result['mutants'][name]=r
+            require(semantic_rejection(r,marker),'exact semantic mutant gate '+name);result['mutants'][name]=r
         result['tx_combination']='DELEGATED_BY_PARENT_TO_INDEPENDENT_INTEGRATION_AUTHOR_NOT_RUN_BY_THIS_SUITE'
         if a.sanitize:
             result['sanitizer_canaries']={}

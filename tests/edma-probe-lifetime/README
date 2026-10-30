@@ -7,7 +7,12 @@ Run from the source checkout, with a new evidence directory each time:
 /usr/bin/python3 tests/test-edma-probe-lifetime.py --upstream-cache /Volumes/FX-MD87/Review-AX6/upstreams/nss/qca-nss-dp --output /Volumes/FX-MD87/Review-AX6/audits/20261030/core-risk-phase2/EDMA-LIFETIME-clang-final --compiler /usr/bin/clang --sanitize
 
 The runner freshly reads exact Git pin d8f802f08fd8ff31057ba58edb20bbe448e7b505
-and applies 001-015 with zero fuzz/offset. It rejects any 015 changed path
+and applies 001-015 after an independent declared-coordinate/full-context
+check, then verifies the exact expected output bytes after each patch. Later
+patches are excluded; this is not a complete later-candidate qualification.
+Old r5 used only tool logs and did not detect a silent offset in 012; the
+follow-up gate and header-only maintenance of 008/012 are separately bound.
+It rejects any 015 changed path
 outside the six authorized source/header files. edma_cfg.c and the actual
 014 take/producer/clean functions must remain unchanged. No archived audit
 program is executed; current, read-only TX test utilities supply shared C
@@ -42,7 +47,14 @@ and hold the full poll tail after NAPI ownership has been released. Retirement
 must wait for the corresponding modeled drain; the final interrupt mask must
 win over the old poll tail. napi_complete=false does not rearm; true does.
 Source mutants must compile cleanly and fail their intended semantic stderr
-gate, never merely time out. Positive compile stdout/stderr and candidate
+gate, never merely time out. The follow-up gate requires exactly exit 86,
+empty stdout and one complete expected diagnostic line, rejecting any extra
+diagnostic. The positive suite must match the complete fixed summary, including
+case/check counts and NAPI/IRQ ledgers. Two valid and sixteen result-pollution
+controls exercise these gates; they are not extra driver scenarios or proof
+that the semantic fixture itself is complete. Frozen r5 used the older
+contains-marker gate and cannot be cited as exercising this follow-up.
+Positive compile stdout/stderr and candidate
 stderr must be empty. ASan/UBSan canaries require positive diagnostics, with
 halt_on_error=1. LSan is disabled for host capability; explicit ledgers track
 the resource classes modeled by this fixture.
