@@ -1,0 +1,822 @@
+--- a/include/hsl/hppe/hppe_init.h
++++ b/include/hsl/hppe/hppe_init.h
+@@ -106,16 +106,20 @@
+ #define MALIBU_PHY_QSGMII                                  0x8504
+ #define MALIBU_PHY_MODE_REG                                0x1f
+ #define MALIBU_PSGMII_PHY_ADDR                             0x5
+ #define MALIBU_MODE_CHANAGE_RESET                          0x0
+ #define MALIBU_MODE_RESET_DEFAULT_VALUE                    0x5f
+ #define MALIBU_MODE_RESET_REG                              0x0
+ 
+ sw_error_t hppe_init(a_uint32_t dev_id, ssdk_init_cfg *cfg);
++sw_error_t hppe_init_state_check(a_uint32_t dev_id);
++sw_error_t hppe_init_owned(a_uint32_t dev_id, ssdk_init_cfg *cfg,
++    a_uint64_t *owner);
++sw_error_t hppe_cleanup_owned(a_uint32_t dev_id, a_uint64_t owner);
+ a_bool_t hppe_xgmac_port_check(a_uint32_t dev_id, fal_port_t port_id);
+ sw_error_t hppe_cleanup(a_uint32_t dev_id);
+ 
+ #ifdef __cplusplus
+ }
+ #endif /* __cplusplus */
+ 
+ #endif /* _HPPE_INIT_H_ */
+--- a/src/hsl/hppe/hppe_init.c
++++ b/src/hsl/hppe/hppe_init.c
+@@ -24,20 +24,32 @@
+ #include "hsl_dev.h"
+ #include "hsl_port_prop.h"
+ #include "sd.h"
+ #include "hsl_phy.h"
+ 
+ 
+ static ssdk_init_cfg * hppe_cfg[SW_MAX_NR_DEV] = { 0 };
+ static hsl_port_prop_owner_t *hppe_port_owner[SW_MAX_NR_DEV] = { 0 };
++/* Never reused within this serialized module lifetime, including C address reuse. */
++static a_uint64_t hppe_owner_epoch[SW_MAX_NR_DEV] = { 0 };
+ /* Constructor/retirement callers serialize the device and quiesce readers.
+  * This flag rejects synchronous reentry; it is not a concurrent-init lock.
+  */
+ static a_bool_t hppe_initializing[SW_MAX_NR_DEV] = { 0 };
++
++sw_error_t hppe_init_state_check(a_uint32_t dev_id)
++{
++    HSL_DEV_ID_CHECK(dev_id);
++    if (hppe_initializing[dev_id])
++        return SW_BUSY;
++    if (hppe_cfg[dev_id] || hppe_port_owner[dev_id])
++        return SW_ALREADY_EXIST;
++    return SW_OK;
++}
+ 
+ a_bool_t hppe_xgmac_port_check(a_uint32_t dev_id, fal_port_t port_id)
+ {
+ 	if(qca_hppe_port_mac_type_get(dev_id, port_id) == PORT_XGMAC_TYPE)
+ 	{
+ 		return A_TRUE;
+ 	}
+ 
+@@ -210,16 +222,18 @@
+ 
+     HSL_DEV_ID_CHECK(dev_id);
+     if (!cfg)
+         return SW_BAD_PTR;
+     if (hppe_initializing[dev_id])
+         return SW_BUSY;
+     if (hppe_cfg[dev_id] || hppe_port_owner[dev_id])
+         return SW_ALREADY_EXIST;
++    if (hppe_owner_epoch[dev_id] == (a_uint64_t)-1)
++        return SW_BAD_STATE;
+     hppe_initializing[dev_id] = A_TRUE;
+ 
+ #if !(defined(KERNEL_MODULE) && defined(USER_MODE))
+ 
+     rv = hsl_port_prop_slot_available(dev_id);
+     if (rv != SW_OK)
+         goto out;
+     p_api = hsl_api_ptr_get(dev_id);
+@@ -259,16 +273,17 @@
+     published_owner = owner;
+     rv = hsl_port_prop_build_publish(dev_id, &owner);
+     if (rv != SW_OK)
+         goto abort;
+     hppe_port_owner[dev_id] = published_owner;
+ #endif
+     /* No fallible work follows publication of this fresh owned group. */
+     hppe_cfg[dev_id] = new_cfg;
++    hppe_owner_epoch[dev_id]++;
+ #if !(defined(KERNEL_MODULE) && defined(USER_MODE))
+ 		p_api->dev_clean   = hppe_cleanup;
+ 		p_api->reg_get = sd_reg_hdr_get;
+ 		p_api->reg_set = sd_reg_hdr_set;
+ 		p_api->mii_reg_get = sd_reg_mii_mdio_get;
+ 		p_api->mii_reg_set = sd_reg_mii_mdio_set;
+ 		p_api->phy_get = sd_reg_mdio_get;
+ 		p_api->phy_set = sd_reg_mdio_set;
+@@ -286,12 +301,38 @@
+ #endif
+     *pdev = saved_dev;
+     aos_mem_free(new_cfg);
+ out:
+     hppe_initializing[dev_id] = A_FALSE;
+     return rv;
+ }
+ 
++sw_error_t hppe_init_owned(a_uint32_t dev_id, ssdk_init_cfg *cfg,
++    a_uint64_t *owner)
++{
++    sw_error_t rv;
++
++    HSL_DEV_ID_CHECK(dev_id);
++    if (!owner)
++        return SW_BAD_PTR;
++    if (*owner)
++        return SW_BAD_STATE;
++    rv = hppe_init(dev_id, cfg);
++    SW_RTN_ON_ERROR(rv);
++    *owner = hppe_owner_epoch[dev_id];
++    return SW_OK;
++}
++
++sw_error_t hppe_cleanup_owned(a_uint32_t dev_id, a_uint64_t owner)
++{
++    HSL_DEV_ID_CHECK(dev_id);
++    if (hppe_initializing[dev_id])
++        return SW_BUSY;
++    if (!owner || !hppe_cfg[dev_id] || hppe_owner_epoch[dev_id] != owner)
++        return SW_BAD_STATE;
++    return hppe_cleanup(dev_id);
++}
++
+ /**
+  * @}
+  */
+ 
+--- a/include/hsl/hsl_dev.h
++++ b/include/hsl/hsl_dev.h
+@@ -55,16 +55,28 @@
+ ssdk_chip_type hsl_get_current_chip_type(a_uint32_t dev_id);
+ 
+ sw_error_t
+ hsl_dev_init(a_uint32_t dev_id, ssdk_init_cfg * cfg);
+ 
+ sw_error_t
+ hsl_dev_cleanup(a_uint32_t dev_id);
+ 
++/* Internal serialized FAL/HSL continuation; not a concurrent lifetime lock. */
++typedef struct hsl_dev_lifecycle_guard hsl_dev_lifecycle_guard_t;
++sw_error_t hsl_dev_init_begin(a_uint32_t dev_id, ssdk_init_cfg *cfg,
++    hsl_dev_lifecycle_guard_t **guard);
++sw_error_t hsl_dev_cleanup_begin(a_uint32_t dev_id,
++    hsl_dev_lifecycle_guard_t **guard);
++sw_error_t hsl_dev_api_init_check(a_uint32_t dev_id);
++sw_error_t hsl_dev_api_init_guarded(hsl_dev_lifecycle_guard_t *guard);
++sw_error_t hsl_dev_init_guarded(hsl_dev_lifecycle_guard_t *guard);
++sw_error_t hsl_dev_cleanup_guarded(hsl_dev_lifecycle_guard_t *guard);
++sw_error_t hsl_dev_guard_end(hsl_dev_lifecycle_guard_t **guard);
++
+ /*qca808x_end*/
+ sw_error_t
+ hsl_ssdk_cfg(a_uint32_t dev_id, ssdk_cfg_t *ssdk_cfg);
+ 
+ sw_error_t
+ hsl_access_mode_set(a_uint32_t dev_id, hsl_access_mode reg_mode);
+ 
+ a_uint32_t hsl_dev_inner_ports_get(a_uint32_t dev_id);
+--- a/src/hsl/hsl_dev.c
++++ b/src/hsl/hsl_dev.c
+@@ -16,16 +16,21 @@
+ 
+ 
+ /*qca808x_start*/
+ #include "sw.h"
+ #include "hsl.h"
+ #include "hsl_dev.h"
+ #include "hsl_lock.h"
+ #include "sd.h"
++#include "hsl_port_prop.h"
++#include "adpt.h"
++#ifdef IN_VLAN
++#include "fal_vlan.h"
++#endif
+ /*qca808x_end*/
+ #if defined ISIS
+ #include "isis_init.h"
+ #endif
+ #if defined ISISC
+ #include "isisc_init.h"
+ #endif
+ #if defined DESS
+@@ -54,16 +59,228 @@
+ #endif
+ #include "ssdk_plat.h"
+ #ifdef MP
+ #include "hsl_phy.h"
+ #endif
+ /*qca808x_start*/
+ static hsl_dev_t dev_table[SW_MAX_NR_DEV];
+ static ssdk_init_cfg *dev_ssdk_cfg[SW_MAX_NR_DEV] = { 0 };
++#ifdef HPPE
++static a_bool_t hsl_hppe_owned[SW_MAX_NR_DEV] = { 0 };
++static a_uint64_t hsl_hppe_owner_epoch[SW_MAX_NR_DEV] = { 0 };
++#endif
++
++enum hsl_dev_phase {
++    HSL_DEV_IDLE, HSL_DEV_INIT_RESERVED, HSL_DEV_API_READY,
++    HSL_DEV_INIT_RUNNING, HSL_DEV_INIT_POST,
++    HSL_DEV_CLEAN_RESERVED, HSL_DEV_CLEAN_RUNNING, HSL_DEV_CLEAN_POST
++};
++
++struct hsl_dev_lifecycle_guard {
++    ssdk_init_cfg *cfg;
++    enum hsl_dev_phase phase;
++};
++
++/* Callers serialize the device and quiesce readers. Reject synchronous
++ * public reentry without granting it an ambient FAL-active bypass.
++ */
++static hsl_dev_lifecycle_guard_t hsl_dev_guards[SW_MAX_NR_DEV];
++
++static int hsl_dev_guard_id(hsl_dev_lifecycle_guard_t *guard)
++{
++    a_uint32_t dev_id;
++
++    for (dev_id = 0; dev_id < SW_MAX_NR_DEV; dev_id++)
++        if (guard == &hsl_dev_guards[dev_id])
++            return dev_id;
++    return -1;
++}
++
++#if defined(HPPE) || (defined(KERNEL_MODULE) && defined(USER_MODE))
++static a_bool_t hsl_dev_hppe_request(ssdk_init_cfg *cfg)
++{
++    return cfg && (cfg->chip_type == CHIP_HPPE ||
++        cfg->chip_type == CHIP_APPE || cfg->chip_type == CHIP_MRPPE);
++}
++#endif
++
++/* Match the actual dispatcher, not the current-chip metadata fallback. */
++static sw_error_t hsl_dev_dispatch_check(ssdk_chip_type chip_type)
++{
++    switch (chip_type) {
++    case CHIP_ISIS:
++#ifdef ISIS
++        return SW_OK;
++#endif
++        break;
++    case CHIP_ISISC:
++#ifdef ISISC
++        return SW_OK;
++#endif
++        break;
++    case CHIP_MHT:
++#ifdef MHT
++        return SW_OK;
++#endif
++        break;
++    case CHIP_DESS:
++#ifdef DESS
++        return SW_OK;
++#endif
++        break;
++    case CHIP_HPPE:
++    case CHIP_APPE:
++    case CHIP_MRPPE:
++#ifdef HPPE
++        return SW_OK;
++#endif
++        break;
++    case CHIP_SCOMPHY:
++#ifdef SCOMPHY
++        return SW_OK;
++#endif
++        break;
++    case CHIP_UNSPECIFIED:
++#if defined(ISIS) || defined(ISISC)
++        return SW_OK;
++#endif
++        break;
++    default:
++        return SW_BAD_PARAM;
++    }
++    return SW_INIT_ERROR;
++}
++
++static sw_error_t hsl_dev_init_available(a_uint32_t dev_id, ssdk_init_cfg *cfg)
++{
++    sw_error_t rv;
++    hsl_api_t *api;
++
++    (void)cfg; /* Used only by HPPE or combined-mode admission below. */
++    HSL_DEV_ID_CHECK(dev_id);
++    if (hsl_dev_guards[dev_id].phase != HSL_DEV_IDLE)
++        return SW_BUSY;
++    if (dev_ssdk_cfg[dev_id])
++        return SW_ALREADY_EXIST;
++#ifdef HPPE
++    if (hsl_hppe_owned[dev_id] || hsl_hppe_owner_epoch[dev_id])
++        return SW_ALREADY_EXIST;
++    rv = hppe_init_state_check(dev_id);
++    SW_RTN_ON_ERROR(rv);
++#endif
++    api = hsl_api_ptr_get(dev_id);
++    if (!api)
++        return SW_BAD_PTR;
++    if (api->dev_clean) {
++#ifdef HPPE
++        if (api->dev_clean != hppe_cleanup ||
++            (cfg && !hsl_dev_hppe_request(cfg)))
++#endif
++            return SW_ALREADY_EXIST;
++    }
++    /* Combined HPPE owns no port table; never claim a foreign P slot. */
++#if defined(KERNEL_MODULE) && defined(USER_MODE)
++    if (!hsl_dev_hppe_request(cfg))
++#endif
++    {
++        rv = hsl_port_prop_slot_available(dev_id);
++        SW_RTN_ON_ERROR(rv);
++    }
++    if (adpt_api_ptr_get(dev_id))
++        return SW_ALREADY_EXIST;
++#ifdef IN_VLAN
++    rv = fal_vlan_init_available(dev_id);
++    SW_RTN_ON_ERROR(rv);
++#endif
++    return SW_OK;
++}
++
++sw_error_t hsl_dev_api_init_check(a_uint32_t dev_id)
++{
++    return hsl_dev_init_available(dev_id, NULL);
++}
++
++sw_error_t hsl_dev_init_begin(a_uint32_t dev_id, ssdk_init_cfg *cfg,
++    hsl_dev_lifecycle_guard_t **guard)
++{
++    sw_error_t rv;
++
++    HSL_DEV_ID_CHECK(dev_id);
++    if (!cfg || !guard)
++        return SW_BAD_PTR;
++    if (*guard)
++        return SW_BAD_STATE;
++    rv = hsl_dev_init_available(dev_id, cfg);
++    SW_RTN_ON_ERROR(rv);
++    rv = hsl_dev_dispatch_check(cfg->chip_type);
++    SW_RTN_ON_ERROR(rv);
++    hsl_dev_guards[dev_id].cfg = cfg;
++    hsl_dev_guards[dev_id].phase = HSL_DEV_INIT_RESERVED;
++    *guard = &hsl_dev_guards[dev_id];
++    return SW_OK;
++}
++
++sw_error_t hsl_dev_cleanup_begin(a_uint32_t dev_id,
++    hsl_dev_lifecycle_guard_t **guard)
++{
++    HSL_DEV_ID_CHECK(dev_id);
++    if (!guard)
++        return SW_BAD_PTR;
++    if (*guard)
++        return SW_BAD_STATE;
++    if (hsl_dev_guards[dev_id].phase != HSL_DEV_IDLE)
++        return SW_BUSY;
++    hsl_dev_guards[dev_id].phase = HSL_DEV_CLEAN_RESERVED;
++    *guard = &hsl_dev_guards[dev_id];
++    return SW_OK;
++}
++
++sw_error_t hsl_dev_api_init_guarded(hsl_dev_lifecycle_guard_t *guard)
++{
++    int dev_id = hsl_dev_guard_id(guard);
++    hsl_api_t *api;
++
++    if (dev_id < 0)
++        return SW_BAD_PTR;
++    if (guard->phase != HSL_DEV_INIT_RESERVED)
++        return SW_BAD_STATE;
++    api = hsl_api_ptr_get(dev_id);
++    if (!api)
++        return SW_BAD_PTR;
++    /* Same table reset as hsl_api_init, authorized by this continuation. */
++    guard->phase = HSL_DEV_API_READY;
++    aos_mem_set(api, 0, sizeof(*api));
++    return SW_OK;
++}
++
++sw_error_t hsl_dev_guard_end(hsl_dev_lifecycle_guard_t **guard)
++{
++    int dev_id;
++
++    if (!guard)
++        return SW_BAD_PTR;
++    dev_id = hsl_dev_guard_id(*guard);
++    if (dev_id < 0)
++        return SW_BAD_PTR;
++    switch ((*guard)->phase) {
++    case HSL_DEV_INIT_RESERVED:
++    case HSL_DEV_API_READY:
++    case HSL_DEV_INIT_POST:
++    case HSL_DEV_CLEAN_RESERVED:
++    case HSL_DEV_CLEAN_POST:
++        (*guard)->cfg = NULL;
++        (*guard)->phase = HSL_DEV_IDLE;
++        *guard = NULL;
++        return SW_OK;
++    default:
++        return SW_BAD_STATE;
++    }
++}
++
+ ssdk_chip_type SSDK_CURRENT_CHIP_TYPE[SW_MAX_NR_DEV] = {CHIP_UNSPECIFIED};
+ 
+ ssdk_chip_type hsl_get_current_chip_type(a_uint32_t dev_id)
+ {
+ 	ssdk_chip_type chip_type;
+ 
+ 	if (dev_id >= SW_MAX_NR_DEV)
+ 		chip_type = CHIP_UNSPECIFIED;
+@@ -124,38 +341,41 @@
+ {
+ 	if(dev_ssdk_cfg[dev_id]) {
+ 		return dev_ssdk_cfg[dev_id]->port_cfg.inner_bmp;
+ 	}
+ 	return 0;
+ }
+ 
+ /*qca808x_start*/
+-sw_error_t
+-hsl_dev_init(a_uint32_t dev_id, ssdk_init_cfg *cfg)
++static sw_error_t
++hsl_dev_init_core(a_uint32_t dev_id, ssdk_init_cfg *cfg)
+ {
+     sw_error_t rv = SW_OK;
+     static int dev_init = 0;
+ 
+     if (SW_MAX_NR_DEV <= dev_id)
+     {
+         return SW_BAD_PARAM;
+     }
+ 
+     aos_mem_set(&dev_table[dev_id], 0, sizeof (hsl_dev_t));
+ 
+     if (!dev_init) {
+-        SW_RTN_ON_ERROR(sd_init(dev_id,cfg));
++        rv = sd_init(dev_id,cfg);
++        SW_RTN_ON_ERROR(rv);
+ 
+ #ifdef UK_IF
+-        SW_RTN_ON_ERROR(sw_uk_init(cfg->nl_prot));
++        rv = sw_uk_init(cfg->nl_prot);
++        SW_RTN_ON_ERROR(rv);
+ #endif
+ 
+ #if defined API_LOCK
+-        SW_RTN_ON_ERROR(hsl_api_lock_init());
++        rv = hsl_api_lock_init();
++        SW_RTN_ON_ERROR(rv);
+ #endif
+         dev_init = 1;
+     }
+     rv = hsl_set_current_chip_type(dev_id, cfg->chip_type);
+     SW_RTN_ON_ERROR(rv);
+ 
+     if (NULL == dev_ssdk_cfg[dev_id])
+     {
+@@ -195,17 +415,19 @@
+ #if defined DESS
+             rv = dess_init(dev_id, cfg);
+ #endif
+             break;
+         case CHIP_MRPPE:
+         case CHIP_APPE:
+         case CHIP_HPPE:
+ #if defined HPPE
+-            rv = hppe_init(dev_id, cfg);
++            rv = hppe_init_owned(dev_id, cfg, &hsl_hppe_owner_epoch[dev_id]);
++            if (rv == SW_OK)
++                hsl_hppe_owned[dev_id] = A_TRUE;
+ #endif
+             break;
+ /*qca808x_start*/
+ 	case CHIP_SCOMPHY:
+ /*qca808x_end*/
+ #if defined SCOMPHY
+ /*qca808x_start*/
+ 	    rv = scomphy_init(dev_id, cfg);
+@@ -224,16 +446,46 @@
+ /*qca808x_start*/
+         default:
+             return SW_BAD_PARAM;
+     }
+ 
+     return rv;
+ }
+ /*qca808x_end*/
++sw_error_t hsl_dev_init_guarded(hsl_dev_lifecycle_guard_t *guard)
++{
++    int dev_id = hsl_dev_guard_id(guard);
++    sw_error_t rv;
++
++    if (dev_id < 0)
++        return SW_BAD_PTR;
++    if (guard->phase != HSL_DEV_INIT_RESERVED &&
++        guard->phase != HSL_DEV_API_READY)
++        return SW_BAD_STATE;
++    guard->phase = HSL_DEV_INIT_RUNNING;
++    rv = hsl_dev_init_core(dev_id, guard->cfg);
++    guard->phase = HSL_DEV_INIT_POST;
++    return rv;
++}
++
++sw_error_t hsl_dev_init(a_uint32_t dev_id, ssdk_init_cfg *cfg)
++{
++    hsl_dev_lifecycle_guard_t *guard = NULL;
++    sw_error_t rv, end_rv;
++
++    if (dev_id >= SW_MAX_NR_DEV)
++        return SW_BAD_PARAM;
++    rv = hsl_dev_init_begin(dev_id, cfg, &guard);
++    SW_RTN_ON_ERROR(rv);
++    rv = hsl_dev_init_guarded(guard);
++    end_rv = hsl_dev_guard_end(&guard);
++    return rv != SW_OK ? rv : end_rv;
++}
++
+ sw_error_t
+ hsl_ssdk_cfg(a_uint32_t dev_id, ssdk_cfg_t *ssdk_cfg)
+ {
+     if(!dev_ssdk_cfg[dev_id])
+     {
+         SSDK_ERROR("the dev%d wasn't initialized\n", dev_id);
+         return SW_BAD_VALUE;
+     }
+@@ -407,43 +659,102 @@
+ #endif
+ #ifdef IN_INTERFACECONTROL
+     ssdk_cfg->features.in_interfacectrl= A_TRUE;
+ #endif
+ 
+     return SW_OK;
+ }
+ /*qca808x_start*/
+-sw_error_t
+-hsl_dev_cleanup(a_uint32_t dev_id)
++static sw_error_t
++hsl_dev_cleanup_core(a_uint32_t dev_id)
+ {
+     sw_error_t rv = SW_OK;
+ 
++#ifdef HPPE
++    if (hsl_hppe_owned[dev_id] &&
++        (!dev_ssdk_cfg[dev_id] || !hsl_hppe_owner_epoch[dev_id]))
++        return SW_BAD_STATE;
++    if (!hsl_hppe_owned[dev_id]) {
++        if (hsl_hppe_owner_epoch[dev_id])
++            return SW_BAD_STATE;
++        /* Detecting a direct child does not transfer its retirement right. */
++        rv = hppe_init_state_check(dev_id);
++        SW_RTN_ON_ERROR(rv);
++    }
++#endif
+     if (dev_ssdk_cfg[dev_id])
+     {
+ 	    hsl_api_t *p_api;
+ 
+ 	    SW_RTN_ON_NULL(p_api = hsl_api_ptr_get(dev_id));
++#ifdef HPPE
++            if (hsl_hppe_owned[dev_id])
++            {
++                if (p_api->dev_clean && p_api->dev_clean != hppe_cleanup)
++                    return SW_BAD_STATE;
++                /* Combined has no hook, but this HSL still acquired C. */
++                rv = hppe_cleanup_owned(dev_id, hsl_hppe_owner_epoch[dev_id]);
++                SW_RTN_ON_ERROR(rv);
++                hsl_hppe_owned[dev_id] = A_FALSE;
++                hsl_hppe_owner_epoch[dev_id] = 0;
++                if (p_api->dev_clean == hppe_cleanup)
++                    p_api->dev_clean = NULL;
++            }
++            else
++#endif
+ 	    if (p_api->dev_clean)
+ 	    {
+-		    rv = p_api->dev_clean(dev_id);
++                    sw_error_t (*dev_clean)(a_uint32_t) = p_api->dev_clean;
++                    rv = dev_clean(dev_id);
+ 		    SW_RTN_ON_ERROR(rv);
++                    if (p_api->dev_clean == dev_clean)
++                        p_api->dev_clean = NULL;
+ 	    }
+ 
+ 	    aos_mem_free(dev_ssdk_cfg[dev_id]);
+ 	    dev_ssdk_cfg[dev_id] = NULL;
+     }
+ 
+ #ifdef UK_IF
+-    SW_RTN_ON_ERROR(sw_uk_cleanup());
++    rv = sw_uk_cleanup();
++    SW_RTN_ON_ERROR(rv);
+ #endif
+ 
+     return SW_OK;
+ }
+ /*qca808x_end*/
++sw_error_t hsl_dev_cleanup_guarded(hsl_dev_lifecycle_guard_t *guard)
++{
++    int dev_id = hsl_dev_guard_id(guard);
++    sw_error_t rv;
++
++    if (dev_id < 0)
++        return SW_BAD_PTR;
++    if (guard->phase != HSL_DEV_CLEAN_RESERVED)
++        return SW_BAD_STATE;
++    guard->phase = HSL_DEV_CLEAN_RUNNING;
++    rv = hsl_dev_cleanup_core(dev_id);
++    guard->phase = HSL_DEV_CLEAN_POST;
++    return rv;
++}
++
++sw_error_t hsl_dev_cleanup(a_uint32_t dev_id)
++{
++    hsl_dev_lifecycle_guard_t *guard = NULL;
++    sw_error_t rv, end_rv;
++
++    HSL_DEV_ID_CHECK(dev_id);
++    rv = hsl_dev_cleanup_begin(dev_id, &guard);
++    SW_RTN_ON_ERROR(rv);
++    rv = hsl_dev_cleanup_guarded(guard);
++    end_rv = hsl_dev_guard_end(&guard);
++    return rv != SW_OK ? rv : end_rv;
++}
++
+ sw_error_t
+ hsl_access_mode_set(a_uint32_t dev_id, hsl_access_mode reg_mode)
+ {
+     sw_error_t rv;
+     hsl_api_t *p_api;
+ 
+     SW_RTN_ON_NULL(p_api = hsl_api_ptr_get(dev_id));
+     if (p_api->dev_access_set)
+--- a/src/hsl/hsl_api.c
++++ b/src/hsl/hsl_api.c
+@@ -11,32 +11,38 @@
+  * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT
+  * OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+  */
+ 
+ 
+ 
+ #include "sw.h"
+ #include "hsl_api.h"
++#include "hsl_dev.h"
+ 
+ static hsl_api_t hsl_api_table[SW_MAX_NR_DEV];
+ 
+ hsl_api_t *
+ hsl_api_ptr_get(a_uint32_t dev_id)
+ {
+     if (dev_id >= SW_MAX_NR_DEV)
+         return NULL;
+ 
+     return &(hsl_api_table[dev_id]);
+ }
+ 
+ sw_error_t
+ hsl_api_init(a_uint32_t dev_id)
+ {
++    sw_error_t rv;
++
+     if (SW_MAX_NR_DEV <= dev_id)
+     {
+         return SW_BAD_PARAM;
+     }
+ 
++    rv = hsl_dev_api_init_check(dev_id);
++    SW_RTN_ON_ERROR(rv);
++
+     aos_mem_set(&hsl_api_table[dev_id], 0, sizeof (hsl_api_t));
+     return SW_OK;
+ }
+ 
+--- a/src/fal/fal_init.c
++++ b/src/fal/fal_init.c
+@@ -34,35 +34,41 @@
+  *   This operation will init fal layer and hsl layer
+  * @param[in] dev_id device id
+  * @param[in] cfg configuration for initialization
+  * @return SW_OK or error code
+  */
+ sw_error_t
+ fal_init(a_uint32_t dev_id, ssdk_init_cfg *cfg)
+ {
+-    sw_error_t rv;
++    hsl_dev_lifecycle_guard_t *guard = NULL;
++    sw_error_t rv, end_rv;
+     HSL_DEV_ID_CHECK(dev_id);
+ 
+-    rv = hsl_api_init(dev_id);
++    rv = hsl_dev_init_begin(dev_id, cfg, &guard);
+     SW_RTN_ON_ERROR(rv);
+ 
+-    rv = hsl_dev_init(dev_id, cfg);
+-    SW_RTN_ON_ERROR(rv);
++    rv = hsl_dev_api_init_guarded(guard);
++    if (rv != SW_OK)
++        goto out;
++    rv = hsl_dev_init_guarded(guard);
++    if (rv != SW_OK)
++        goto out;
+ /*qca808x_end*/
+ #ifdef IN_VLAN
+     rv = fal_vlan_init(dev_id);
+-    SW_RTN_ON_ERROR(rv);
++    if (rv != SW_OK)
++        goto out;
+ #endif
+ 
+     rv = adpt_init(dev_id, cfg);
+-    SW_RTN_ON_ERROR(rv);
+ /*qca808x_start*/
+-
+-    return rv;
++out:
++    end_rv = hsl_dev_guard_end(&guard);
++    return rv != SW_OK ? rv : end_rv;
+ }
+ /*qca808x_end*/
+ 
+ static sw_error_t
+ _fal_reset(a_uint32_t dev_id)
+ {
+     sw_error_t rv;
+     hsl_api_t *p_api;
+@@ -97,27 +103,33 @@
+ {
+     return adpt_ppe_capacity_get(dev_id, ppe_capacity);
+ }
+ 
+ /*qca808x_start*/
+ sw_error_t
+ fal_cleanup(a_uint32_t dev_id)
+ {
+-    sw_error_t rv;
++    hsl_dev_lifecycle_guard_t *guard = NULL;
++    sw_error_t rv, end_rv;
+ 
+-    rv = hsl_dev_cleanup(dev_id);
++    HSL_DEV_ID_CHECK(dev_id);
++    rv = hsl_dev_cleanup_begin(dev_id, &guard);
+     SW_RTN_ON_ERROR(rv);
++    rv = hsl_dev_cleanup_guarded(guard);
++    if (rv != SW_OK)
++        goto out;
+ /*qca808x_end*/
+ #ifdef IN_VLAN
+     rv = fal_vlan_cleanup(dev_id);
+-    SW_RTN_ON_ERROR(rv);
+ #endif
+ /*qca808x_start*/
+-    return SW_OK;
++out:
++    end_rv = hsl_dev_guard_end(&guard);
++    return rv != SW_OK ? rv : end_rv;
+ }
+ /*qca808x_end*/
+ /**
+  * @brief Reset fal layer.
+  * @details Comments:
+  *   This operation will reset fal layer and hsl layer
+  * @param[in] dev_id device id
+  * @return SW_OK or error code
+--- a/include/fal/fal_vlan.h
++++ b/include/fal/fal_vlan.h
+@@ -82,17 +82,20 @@
+ 
+     sw_error_t
+     fal_vlan_flush(a_uint32_t dev_id);
+ 
+ 
+     sw_error_t
+     fal_vlan_init(a_uint32_t dev_id);
+ 
++    sw_error_t
++    fal_vlan_init_available(a_uint32_t dev_id);
+ 
++
+     sw_error_t
+     fal_vlan_cleanup(a_uint32_t dev_id);
+ 
+ 
+     sw_error_t
+     fal_vlan_fid_set(a_uint32_t dev_id, a_uint32_t vlan_id, a_uint32_t fid);
+ 
+ 
+--- a/src/fal/fal_vlan.c
++++ b/src/fal/fal_vlan.c
+@@ -611,16 +611,25 @@
+ 
+ 
+ /**
+  * @brief Init fal vlan module on a paticular device.
+  * @param[in] dev_id device id
+  * @return SW_OK or error code
+  */
+ sw_error_t
++fal_vlan_init_available(a_uint32_t dev_id)
++{
++    HSL_DEV_ID_CHECK(dev_id);
++    if (vlan_pool[dev_id] || vlan_db[dev_id] || vlan_list[dev_id])
++        return SW_ALREADY_EXIST;
++    return SW_OK;
++}
++
++sw_error_t
+ fal_vlan_init(a_uint32_t dev_id)
+ {
+     a_uint32_t entry_nr;
+     hsl_dev_t *p_dev = NULL;
+     sid_pool_t *pool;
+     v_array_t *db;
+     sll_head_t *list;
+ 
