@@ -1,0 +1,347 @@
+--- a/include/hsl/hsl_port_prop.h
++++ b/include/hsl/hsl_port_prop.h
+@@ -32,6 +32,25 @@
+     }
+     hsl_port_prop_t;
+ 
++    typedef struct hsl_port_prop_info hsl_port_prop_owner_t;
++
++    /* Serialized, quiescent construction only. Legacy slot APIs stay unchanged.
++     * Build handles own unpublished storage; publish/abort consume the handle.
++     * The publisher retains the identity token for paired owned cleanup.
++     */
++    sw_error_t hsl_port_prop_slot_available(a_uint32_t dev_id);
++    sw_error_t hsl_port_prop_build_alloc(a_uint32_t dev_id,
++                                        hsl_port_prop_owner_t **owner);
++    sw_error_t hsl_port_prop_build_portmap_set(hsl_port_prop_owner_t *owner,
++                                              fal_port_t port_id);
++    sw_error_t hsl_port_prop_build_set(hsl_port_prop_owner_t *owner,
++                                      fal_port_t port_id, hsl_port_prop_t p_type);
++    sw_error_t hsl_port_prop_build_publish(a_uint32_t dev_id,
++                                          hsl_port_prop_owner_t **owner);
++    void hsl_port_prop_build_abort(hsl_port_prop_owner_t **owner);
++    sw_error_t hsl_port_prop_cleanup_owned(a_uint32_t dev_id,
++                                          hsl_port_prop_owner_t *owner);
++
+     a_bool_t
+     hsl_port_prop_check(a_uint32_t dev_id, fal_port_t port_id,
+                         hsl_port_prop_t p_type);
+--- a/src/hsl/hsl_port_prop.c
++++ b/src/hsl/hsl_port_prop.c
+@@ -25,7 +25,7 @@
+ #include "hsl_port_prop.h"
+ #include "hsl_phy.h"
+ 
+-typedef struct
++typedef struct hsl_port_prop_info
+ {
+     a_uint32_t phy_id[SW_MAX_NR_PORT];
+     fal_pbmp_t dev_portmap;
+@@ -34,6 +34,95 @@
+ 
+ static port_info_t *p_port_info[SW_MAX_NR_DEV] = { 0 };
+ 
++sw_error_t
++hsl_port_prop_slot_available(a_uint32_t dev_id)
++{
++    HSL_DEV_ID_CHECK(dev_id);
++    return p_port_info[dev_id] ? SW_ALREADY_EXIST : SW_OK;
++}
++
++sw_error_t
++hsl_port_prop_build_alloc(a_uint32_t dev_id, hsl_port_prop_owner_t **owner)
++{
++    sw_error_t rv;
++    port_info_t *p_mem;
++
++    if (!owner)
++        return SW_BAD_PTR;
++    if (*owner)
++        return SW_BAD_STATE;
++    rv = hsl_port_prop_slot_available(dev_id);
++    SW_RTN_ON_ERROR(rv);
++
++    p_mem = aos_mem_alloc(sizeof(*p_mem));
++    if (!p_mem)
++        return SW_OUT_OF_MEM;
++    aos_mem_zero(p_mem, sizeof(*p_mem));
++    *owner = p_mem;
++    return SW_OK;
++}
++
++sw_error_t
++hsl_port_prop_build_portmap_set(hsl_port_prop_owner_t *owner, fal_port_t port_id)
++{
++    if (!owner)
++        return SW_BAD_PTR;
++    if (port_id >= SW_MAX_NR_PORT)
++        return SW_OUT_OF_RANGE;
++    SW_PBMP_ADD_PORT(owner->dev_portmap, port_id);
++    return SW_OK;
++}
++
++sw_error_t
++hsl_port_prop_build_set(hsl_port_prop_owner_t *owner, fal_port_t port_id,
++                        hsl_port_prop_t p_type)
++{
++    if (!owner)
++        return SW_BAD_PTR;
++    if (port_id >= SW_MAX_NR_PORT)
++        return SW_OUT_OF_RANGE;
++    if ((a_uint32_t)p_type >= HSL_PP_BUTT)
++        return SW_BAD_PARAM;
++    if (!SW_IS_PBMP_MEMBER(owner->dev_portmap, port_id))
++        return SW_OUT_OF_RANGE;
++    SW_PBMP_ADD_PORT(owner->property[p_type], port_id);
++    return SW_OK;
++}
++
++sw_error_t
++hsl_port_prop_build_publish(a_uint32_t dev_id, hsl_port_prop_owner_t **owner)
++{
++    sw_error_t rv;
++
++    if (!owner || !*owner)
++        return SW_BAD_PTR;
++    rv = hsl_port_prop_slot_available(dev_id);
++    SW_RTN_ON_ERROR(rv);
++    p_port_info[dev_id] = *owner;
++    *owner = NULL;
++    return SW_OK;
++}
++
++void
++hsl_port_prop_build_abort(hsl_port_prop_owner_t **owner)
++{
++    if (owner && *owner) {
++        aos_mem_free(*owner);
++        *owner = NULL;
++    }
++}
++
++sw_error_t
++hsl_port_prop_cleanup_owned(a_uint32_t dev_id, hsl_port_prop_owner_t *owner)
++{
++    HSL_DEV_ID_CHECK(dev_id);
++    if (!owner || p_port_info[dev_id] != owner)
++        return SW_BAD_STATE;
++    aos_mem_free(p_port_info[dev_id]);
++    p_port_info[dev_id] = NULL;
++    return SW_OK;
++}
++
+ a_bool_t
+ hsl_port_prop_check(a_uint32_t dev_id, fal_port_t port_id,
+                     hsl_port_prop_t p_type)
+--- a/src/hsl/hppe/hppe_init.c
++++ b/src/hsl/hppe/hppe_init.c
+@@ -28,6 +28,11 @@
+ 
+ 
+ static ssdk_init_cfg * hppe_cfg[SW_MAX_NR_DEV] = { 0 };
++static hsl_port_prop_owner_t *hppe_port_owner[SW_MAX_NR_DEV] = { 0 };
++/* Constructor/retirement callers serialize the device and quiesce readers.
++ * This flag rejects synchronous reentry; it is not a concurrent-init lock.
++ */
++static a_bool_t hppe_initializing[SW_MAX_NR_DEV] = { 0 };
+ 
+ a_bool_t hppe_xgmac_port_check(a_uint32_t dev_id, fal_port_t port_id)
+ {
+@@ -40,7 +45,7 @@
+ }
+ 
+ static sw_error_t
+-hppe_portproperty_init(a_uint32_t dev_id)
++hppe_portproperty_init(a_uint32_t dev_id, hsl_port_prop_owner_t *owner)
+ {
+ 	hsl_port_prop_t p_type;
+ 	sw_error_t rv;
+@@ -63,7 +68,8 @@
+ 			(bitmap & (0x1 << port_id)) ||
+ 			(inner_pbmp & (0x1 << port_id)))
+ 		{
+-			hsl_port_prop_portmap_set(dev_id, port_id);
++			rv = hsl_port_prop_build_portmap_set(owner, port_id);
++			SW_RTN_ON_ERROR(rv);
+ 
+ 			for (p_type = HSL_PP_PHY; p_type < HSL_PP_BUTT; p_type++)
+ 			{
+@@ -72,7 +78,7 @@
+ 					case HSL_PP_PHY:/*front ports*/
+ 						if (SW_IS_PBMP_MEMBER(bitmap, port_id))
+ 						{
+-							rv = hsl_port_prop_set(dev_id, port_id,p_type);
++							rv = hsl_port_prop_build_set(owner, port_id,p_type);
+ 							SW_RTN_ON_ERROR(rv);
+ 						}
+ 						break;
+@@ -80,14 +86,14 @@
+ 					case HSL_PP_INNER:/*inner ports*/
+ 						if (SW_IS_PBMP_MEMBER(inner_pbmp, port_id))
+ 						{
+-							rv = hsl_port_prop_set(dev_id, port_id,p_type);
++							rv = hsl_port_prop_build_set(owner, port_id,p_type);
+ 							SW_RTN_ON_ERROR(rv);
+ 						}
+ 						break;
+ 
+ 					case HSL_PP_INCL_CPU:
+ 						/*the ports include cpu port*/
+-						rv = hsl_port_prop_set(dev_id, port_id, p_type);
++						rv = hsl_port_prop_build_set(owner, port_id, p_type);
+ 						SW_RTN_ON_ERROR(rv);
+ 						break;
+ 
+@@ -95,7 +101,7 @@
+ 						/*the ports exclude cpu port*/
+ 						if (port_id != pdev->cpu_port_nr)
+ 						{
+-							rv = hsl_port_prop_set(dev_id, port_id,p_type);
++							rv = hsl_port_prop_build_set(owner, port_id,p_type);
+ 							SW_RTN_ON_ERROR(rv);
+ 						}
+ 						break;
+@@ -103,7 +109,7 @@
+ 					case HSL_PP_CPU:/*cpu port*/
+ 						if (port_id == pdev->cpu_port_nr)
+ 						{
+-							rv = hsl_port_prop_set(dev_id, port_id,p_type);
++							rv = hsl_port_prop_build_set(owner, port_id,p_type);
+ 							SW_RTN_ON_ERROR(rv);
+ 						}
+ 						break;
+@@ -165,10 +171,17 @@
+ {
+     sw_error_t rv;
+ 
++    HSL_DEV_ID_CHECK(dev_id);
++    if (hppe_initializing[dev_id])
++        return SW_BUSY;
++
+     if (hppe_cfg[dev_id])
+     {
+-        rv = hsl_port_prop_cleanup_by_dev(dev_id);
+-        SW_RTN_ON_ERROR(rv);
++        if (hppe_port_owner[dev_id]) {
++            rv = hsl_port_prop_cleanup_owned(dev_id, hppe_port_owner[dev_id]);
++            SW_RTN_ON_ERROR(rv);
++            hppe_port_owner[dev_id] = NULL;
++        }
+ 
+         aos_mem_free(hppe_cfg[dev_id]);
+         hppe_cfg[dev_id] = NULL;
+@@ -188,36 +201,70 @@
+ sw_error_t hppe_init(a_uint32_t dev_id, ssdk_init_cfg *cfg)
+ {
+     sw_error_t rv;
++    ssdk_init_cfg *new_cfg;
++    hsl_dev_t *pdev, saved_dev;
++#if !(defined(KERNEL_MODULE) && defined(USER_MODE))
++    hsl_api_t *p_api;
++    hsl_port_prop_owner_t *owner = NULL, *published_owner;
++#endif
+ 
+     HSL_DEV_ID_CHECK(dev_id);
++    if (!cfg)
++        return SW_BAD_PTR;
++    if (hppe_initializing[dev_id])
++        return SW_BUSY;
++    if (hppe_cfg[dev_id] || hppe_port_owner[dev_id])
++        return SW_ALREADY_EXIST;
++    hppe_initializing[dev_id] = A_TRUE;
+ 
+-    if (NULL == hppe_cfg[dev_id])
+-    {
+-        hppe_cfg[dev_id] = aos_mem_alloc(sizeof (ssdk_init_cfg));
+-    }
++#if !(defined(KERNEL_MODULE) && defined(USER_MODE))
+ 
+-    if (NULL == hppe_cfg[dev_id])
+-    {
+-        return SW_OUT_OF_MEM;
++    rv = hsl_port_prop_slot_available(dev_id);
++    if (rv != SW_OK)
++        goto out;
++    p_api = hsl_api_ptr_get(dev_id);
++    if (!p_api) {
++        rv = SW_NOT_INITIALIZED;
++        goto out;
+     }
+-
+-    aos_mem_copy(hppe_cfg[dev_id], cfg, sizeof (ssdk_init_cfg));
++    if (p_api->dev_clean && p_api->dev_clean != hppe_cleanup) {
++        rv = SW_ALREADY_EXIST;
++        goto out;
++    }
++#endif
+ 
++    pdev = hsl_dev_ptr_get(dev_id);
++    if (!pdev) {
++        rv = SW_NOT_INITIALIZED;
++        goto out;
++    }
++    saved_dev = *pdev;
++    new_cfg = aos_mem_alloc(sizeof(*new_cfg));
++    if (!new_cfg) {
++        rv = SW_OUT_OF_MEM;
++        goto out;
++    }
++    aos_mem_copy(new_cfg, cfg, sizeof(*new_cfg));
+     rv = hppe_dev_init(dev_id, cfg);
+-    SW_RTN_ON_ERROR(rv);
++    if (rv != SW_OK)
++        goto abort;
+ 
+ #if !(defined(KERNEL_MODULE) && defined(USER_MODE))
+-	{
+-		hsl_api_t *p_api;
+-
+-		rv = hsl_port_prop_init(dev_id);
+-		SW_RTN_ON_ERROR(rv);
+-		rv = hsl_port_prop_init_by_dev(dev_id);
+-		SW_RTN_ON_ERROR(rv);
+-		rv = hppe_portproperty_init(dev_id);
+-		SW_RTN_ON_ERROR(rv);
+-
+-		SW_RTN_ON_NULL(p_api = hsl_api_ptr_get(dev_id));
++    rv = hsl_port_prop_build_alloc(dev_id, &owner);
++    if (rv != SW_OK)
++        goto abort;
++    rv = hppe_portproperty_init(dev_id, owner);
++    if (rv != SW_OK)
++        goto abort;
++    published_owner = owner;
++    rv = hsl_port_prop_build_publish(dev_id, &owner);
++    if (rv != SW_OK)
++        goto abort;
++    hppe_port_owner[dev_id] = published_owner;
++#endif
++    /* No fallible work follows publication of this fresh owned group. */
++    hppe_cfg[dev_id] = new_cfg;
++#if !(defined(KERNEL_MODULE) && defined(USER_MODE))
+ 		p_api->dev_clean   = hppe_cleanup;
+ 		p_api->reg_get = sd_reg_hdr_get;
+ 		p_api->reg_set = sd_reg_hdr_set;
+@@ -229,11 +276,19 @@
+ 		p_api->phy_i2c_set = sd_reg_i2c_set;
+ 		p_api->uniphy_reg_get = sd_reg_uniphy_get;
+ 		p_api->uniphy_reg_set = sd_reg_uniphy_set;
+-
+-	}
+ #endif
+-
++    hppe_initializing[dev_id] = A_FALSE;
+     return SW_OK;
++
++abort:
++#if !(defined(KERNEL_MODULE) && defined(USER_MODE))
++    hsl_port_prop_build_abort(&owner);
++#endif
++    *pdev = saved_dev;
++    aos_mem_free(new_cfg);
++out:
++    hppe_initializing[dev_id] = A_FALSE;
++    return rv;
+ }
+ 
+ /**
