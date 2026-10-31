@@ -1,0 +1,35 @@
+--- a/src/hsl/hsl_lock.c
++++ b/src/hsl/hsl_lock.c
+@@ -16,11 +16,20 @@
+ 
+ #include "sw.h"
+ 
++#if defined(KERNEL_MODULE) && defined(KVER32) && \
++    !defined(USER_MODE) && !defined(HSL_STANDALONG)
++/* Native Linux readers may arrive before, or outlive, a bootstrap retry. */
++DEFINE_MUTEX(sw_hsl_api_lock);
++#else
+ aos_mutex_lock_t sw_hsl_api_lock;
++#endif
+ 
+ sw_error_t
+ hsl_api_lock_init(void)
+ {
++#if !(defined(KERNEL_MODULE) && defined(KVER32) && \
++    !defined(USER_MODE) && !defined(HSL_STANDALONG))
+     aos_mutex_lock_init(&sw_hsl_api_lock);
++#endif
+     return SW_OK;
+ }
+--- a/mk/obj.mk
++++ b/mk/obj.mk
+@@ -443,6 +443,9 @@
+                src/hsl/hsl_port_prop.o src/util/util.o src/sal/sd/sd.o \
+                src/sal/sd/linux/uk_interface/sw_api_ks_ioctl.o \
+                src/api/api_access.o
++ifeq (TRUE, $(API_LOCK))
++OBJ-COMMON += src/hsl/hsl_lock.o
++endif
+ OBJ-ISISC   += src/hsl/isisc/isisc_reg_access.o
+ OBJ-HPPE    += src/hsl/hppe/hppe_global.o src/hsl/hppe/hppe_reg_access.o
+ OBJ-APPE    += src/hsl/appe/appe_counter.o src/hsl/appe/appe_global.o \

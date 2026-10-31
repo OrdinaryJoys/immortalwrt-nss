@@ -1,0 +1,23 @@
+--- a/src/init/ssdk_init.c
++++ b/src/init/ssdk_init.c
+@@ -2298,15 +2298,20 @@
+ 	ssdk_fdb_retire_controls();
+ 
+ 	dev_num = ssdk_switch_device_num_get();
++	/* Stop the listed producers across devices before PHY/SDK retirement. */
+ 	for (dev_id = 0; dev_id < dev_num; dev_id++) {
+ 		ssdk_driver_unregister(dev_id);
+ #if defined(DESS) || defined(HPPE) || defined(ISISC) || defined(ISIS) || defined(MP)
+ 		if (qca_phy_priv_global[dev_id]->qca_ssdk_sw_dev_registered == A_TRUE)
+ 			ssdk_switch_unregister(dev_id);
+ #endif
++	}
+ #ifdef IN_SFP_PHY
++	for (dev_id = 0; dev_id < dev_num; dev_id++) {
+ 		sfp_phy_exit(dev_id);
++	}
+ #endif
++	for (dev_id = 0; dev_id < dev_num; dev_id++) {
+ 		cleanup_rv = ssdk_cleanup(dev_id);
+ 		if (cleanup_rv != SW_OK) {
+ 			SSDK_ERROR("qca-%s device %u cleanup failed! (code: %d)\n",
