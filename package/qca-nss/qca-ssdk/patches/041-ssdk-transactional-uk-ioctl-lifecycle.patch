@@ -1,0 +1,213 @@
+--- a/src/sal/sd/linux/uk_interface/sw_api_ks_ioctl.c
++++ b/src/sal/sd/linux/uk_interface/sw_api_ks_ioctl.c
+@@ -69,7 +69,17 @@
+ 
+ static unsigned long *cmd_buf = NULL;
+ 
+-static struct mutex api_ioctl_lock;
++static DEFINE_MUTEX(api_ioctl_lock);
++static DEFINE_MUTEX(uk_lifecycle_lock);
++
++enum uk_state { UK_OFF, UK_STARTING, UK_READY, UK_STOPPING };
++static enum uk_state uk_state;
++static a_uint32_t uk_protocol;
++static a_uint64_t uk_epoch;
++
++struct uk_file_context {
++    a_uint64_t epoch;
++};
+ 
+ static struct file_operations switch_device_fops =
+ {
+@@ -260,13 +270,40 @@
+ static int
+ switch_open(struct inode * inode,struct file * file)
+ {
++    struct uk_file_context *context;
++
++    /* misc_open holds misc_mtx here. Never take it while holding this lock. */
++    mutex_lock(&api_ioctl_lock);
++    if (uk_state != UK_READY) {
++        mutex_unlock(&api_ioctl_lock);
++        return -ENODEV;
++    }
++    context = aos_mem_alloc(sizeof(*context));
++    if (!context) {
++        mutex_unlock(&api_ioctl_lock);
++        return -ENOMEM;
++    }
++    context->epoch = uk_epoch;
++    file->private_data = context;
++    mutex_unlock(&api_ioctl_lock);
+     return SW_OK;
+ }
+ 
+ static int
+ switch_close(struct inode * inode, struct file * file)
+ {
++    aos_mem_free(file->private_data);
++    file->private_data = NULL;
+     return SW_OK;
++}
++
++/* Called with api_ioctl_lock held through command dispatch and copy-out. */
++static a_bool_t uk_file_ready(struct file *file)
++{
++    struct uk_file_context *context = file->private_data;
++
++    return uk_state == UK_READY && cmd_buf && context &&
++        context->epoch == uk_epoch;
+ }
+ 
+ #ifdef KVER32
+@@ -289,6 +326,10 @@
+     }
+ 
+     mutex_lock(&api_ioctl_lock);
++    if (!uk_file_ready(file)) {
++        mutex_unlock(&api_ioctl_lock);
++        return -ENODEV;
++    }
+     rv = sw_api_cmd(args, NULL);
+     mutex_unlock(&api_ioctl_lock);
+ 
+@@ -319,6 +360,10 @@
+ 	}
+ 
+ 	mutex_lock(&api_ioctl_lock);
++	if (!uk_file_ready(file)) {
++		mutex_unlock(&api_ioctl_lock);
++		return -ENODEV;
++	}
+ 	rv = sw_api_cmd(NULL, args);
+ 	mutex_unlock(&api_ioctl_lock);
+ 
+@@ -338,42 +383,96 @@
+ sw_error_t
+ sw_uk_init(a_uint32_t nl_prot)
+ {
+-    if (!cmd_buf)
+-    {
+-        if((cmd_buf = (unsigned long *) aos_mem_alloc(SW_MAX_API_BUF)) == NULL)
+-        {
+-            return SW_OUT_OF_MEM;
+-        }
+-
++    unsigned long *buffer;
++    sw_error_t rv;
+ #if defined UK_MINOR_DEV
+-        switch_device.minor = UK_MINOR_DEV;
++    a_uint32_t protocol = UK_MINOR_DEV;
++    (void)nl_prot;
+ #else
+-        switch_device.minor = nl_prot;
+-#endif
+-
+-        if (misc_register(&switch_device))
+-        {
+-            return SW_INIT_ERROR;
+-        }
+-
+-        mutex_init(&api_ioctl_lock);
+-    }
+-
+-    return SW_OK;
++    a_uint32_t protocol = nl_prot;
++#endif
++
++    /* Refuse reentry or an executing command; do not wait for our own caller. */
++    if (!mutex_trylock(&uk_lifecycle_lock))
++        return SW_BUSY;
++    if (!mutex_trylock(&api_ioctl_lock)) {
++        mutex_unlock(&uk_lifecycle_lock);
++        return SW_BUSY;
++    }
++    if (uk_state == UK_READY) {
++        rv = protocol == uk_protocol ? SW_OK : SW_BAD_PARAM;
++        goto unlock;
++    }
++    if (uk_state != UK_OFF || cmd_buf) {
++        rv = SW_BAD_STATE;
++        goto unlock;
++    }
++    if (uk_epoch == (a_uint64_t)-1) {
++        rv = SW_NO_RESOURCE;
++        goto unlock;
++    }
++    buffer = aos_mem_alloc(SW_MAX_API_BUF);
++    if (!buffer) {
++        rv = SW_OUT_OF_MEM;
++        goto unlock;
++    }
++    uk_state = UK_STARTING;
++    switch_device.minor = protocol;
++    mutex_unlock(&api_ioctl_lock);
++
++    /* misc_register/deregister take misc_mtx, as does open before our lock. */
++    if (misc_register(&switch_device)) {
++        aos_mem_free(buffer);
++        mutex_lock(&api_ioctl_lock);
++        uk_state = UK_OFF;
++        rv = SW_INIT_ERROR;
++        goto unlock;
++    }
++
++    mutex_lock(&api_ioctl_lock);
++    cmd_buf = buffer;
++    uk_protocol = protocol;
++    ++uk_epoch;
++    uk_state = UK_READY;
++    rv = SW_OK;
++unlock:
++    mutex_unlock(&api_ioctl_lock);
++    mutex_unlock(&uk_lifecycle_lock);
++    return rv;
+ }
+ 
+ sw_error_t
+ sw_uk_cleanup(void)
+ {
+-    if (cmd_buf)
+-    {
+-        aos_mem_free(cmd_buf);
+-        cmd_buf = NULL;
+-
+-        mutex_destroy(&api_ioctl_lock);
+-        misc_deregister(&switch_device);
+-    }
+-
+-    return SW_OK;
+-}
+-
++    unsigned long *buffer;
++    sw_error_t rv = SW_OK;
++
++    if (!mutex_trylock(&uk_lifecycle_lock))
++        return SW_BUSY;
++    if (!mutex_trylock(&api_ioctl_lock)) {
++        mutex_unlock(&uk_lifecycle_lock);
++        return SW_BUSY;
++    }
++    if (uk_state == UK_OFF && !cmd_buf)
++        goto unlock;
++    if (uk_state != UK_READY || !cmd_buf) {
++        rv = SW_BAD_STATE;
++        goto unlock;
++    }
++    /* No command is executing. Reject both old descriptors and new opens. */
++    uk_state = UK_STOPPING;
++    buffer = cmd_buf;
++    cmd_buf = NULL;
++    mutex_unlock(&api_ioctl_lock);
++
++    misc_deregister(&switch_device);
++    aos_mem_free(buffer);
++
++    mutex_lock(&api_ioctl_lock);
++    uk_state = UK_OFF;
++unlock:
++    mutex_unlock(&api_ioctl_lock);
++    mutex_unlock(&uk_lifecycle_lock);
++    return rv;
++}
++
