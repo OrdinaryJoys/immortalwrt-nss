@@ -1,0 +1,59 @@
+--- a/src/fal/fal_vlan.c
++++ b/src/fal/fal_vlan.c
+@@ -620,6 +620,9 @@
+ {
+     a_uint32_t entry_nr;
+     hsl_dev_t *p_dev = NULL;
++    sid_pool_t *pool;
++    v_array_t *db;
++    sll_head_t *list;
+ 
+     p_dev = hsl_dev_ptr_get(dev_id);
+     SW_RTN_ON_NULL(p_dev);
+@@ -635,27 +638,39 @@
+         return SW_FAIL;
+     }
+ 
+-    vlan_pool[dev_id] = sid_pool_creat(entry_nr, 0);
+-    if (NULL == vlan_pool[dev_id])
++    if (vlan_pool[dev_id] || vlan_db[dev_id] || vlan_list[dev_id])
+     {
++        return SW_ALREADY_EXIST;
++    }
++
++    pool = sid_pool_creat(entry_nr, 0);
++    if (NULL == pool)
++    {
+         return SW_FAIL;
+     }
+ 
+     /* allocate memory for vlan entry */
+-    vlan_db[dev_id] = aos_mem_alloc(entry_nr * (sizeof (v_array_t)));
+-    if (NULL == vlan_db[dev_id])
++    db = aos_mem_alloc(entry_nr * (sizeof (v_array_t)));
++    if (NULL == db)
+     {
++        sid_pool_destroy(pool);
+         return SW_OUT_OF_MEM;
+     }
+-    aos_mem_zero(vlan_db[dev_id], entry_nr * (sizeof (v_array_t)));
++    aos_mem_zero(db, entry_nr * (sizeof (v_array_t)));
+ 
+-    vlan_list[dev_id] = sll_creat(_fal_vlan_entry_cmp, _fal_vlan_entry_dump,
++    list = sll_creat(_fal_vlan_entry_cmp, _fal_vlan_entry_dump,
+                                   LL_FIX_NDNR | LL_IN_ORDER, entry_nr);
+ 
+-    if (NULL == vlan_list[dev_id])
++    if (NULL == list)
+     {
++        aos_mem_free(db);
++        sid_pool_destroy(pool);
+         return SW_FAIL;
+     }
++
++    vlan_pool[dev_id] = pool;
++    vlan_db[dev_id] = db;
++    vlan_list[dev_id] = list;
+ 
+     return SW_OK;
+ }
