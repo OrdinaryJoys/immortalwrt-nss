@@ -1,0 +1,159 @@
+--- a/src/init/ssdk_dts.c
++++ b/src/init/ssdk_dts.c
+@@ -69,6 +69,12 @@
+ 	a_bool_t enabled;
+ };
+ 
++struct ssdk_dt_port_values {
++	a_uint32_t id;
++	a_bool_t has_dac;
++	phy_dac_t dac;
++};
++
+ static struct ssdk_dt_admitted_node ssdk_dt_admitted[SW_MAX_NR_DEV];
+ #endif
+ #ifdef HPPE
+@@ -766,15 +772,60 @@
+ 	return mdio_i2c;
+ }
+ #endif
++
++static int ssdk_dt_read_port_values(struct device_node *port_node,
++		struct ssdk_dt_port_values *values)
++{
++	a_uint32_t id, dac[2] = {0};
++	a_bool_t has_dac = A_FALSE;
++	int ret;
++
++	ret = of_property_read_u32(port_node, "port_id", &id);
++	if (ret)
++		return ret;
++	if (id >= SW_MAX_NR_PORT)
++		return -EINVAL;
++	if (of_find_property(port_node, "phy_dac", NULL)) {
++		ret = of_property_read_u32_array(port_node, "phy_dac", dac, 2);
++		if (ret)
++			return ret;
++		has_dac = A_TRUE;
++	}
++	values->id = id;
++	values->has_dac = has_dac;
++	values->dac.mdac = dac[0];
++	values->dac.edac = dac[1];
++	return 0;
++}
+ 
++static int ssdk_dt_validate_phy_ports(struct device_node *switch_node)
++{
++	struct device_node *phy_info_node, *port_node;
++	struct ssdk_dt_port_values values;
++	int ret = 0;
++
++	phy_info_node = of_get_child_by_name(switch_node, "qcom,port_phyinfo");
++	if (!phy_info_node)
++		return 0;
++	for_each_available_child_of_node(phy_info_node, port_node) {
++		ret = ssdk_dt_read_port_values(port_node, &values);
++		if (ret) {
++			of_node_put(port_node);
++			break;
++		}
++	}
++	of_node_put(phy_info_node);
++	return ret;
++}
++
+ static sw_error_t ssdk_dt_parse_phy_info(struct device_node *switch_node, a_uint32_t dev_id,
+ 		ssdk_init_cfg *cfg)
+ {
+ 	struct device_node *phy_info_node = NULL, *port_node = NULL;
+ 	a_uint32_t port_id = 0, phy_addr = 0, forced_speed = 0,
+-		forced_duplex = 0, len = 0, miibus_index = 0,  device_id = 0,
++		forced_duplex = 0, miibus_index = 0,  device_id = 0,
+ 		switch_cpu_port = 0, index = 0;
+-	const __be32 *paddr = NULL;
++	struct ssdk_dt_port_values port_values;
+ 	a_bool_t phy_c45 = A_FALSE, phy_combo = A_FALSE;
+ #if defined(IN_PHY_I2C_MODE)
+ 	a_uint32_t phy_i2c_addr = 0;
+@@ -786,7 +837,6 @@
+ 		*netdev_switch_node = NULL;
+ 	int phy_reset_gpio = 0, sfp_rx_los_pin = 0, sfp_tx_dis_pin = 0,
+ 		sfp_mod_present_pin = 0, sfp_medium_pin = 0;
+-	phy_dac_t phy_dac = {0};
+ 	struct qca_phy_priv *priv = ssdk_phy_priv_data_get(dev_id);
+ 	phy_features_t phy_features = 0;
+ 	ssdk_netdev_switch_t *netdev_switch = NULL;
+@@ -801,8 +851,11 @@
+ 	}
+ 
+ 	for_each_available_child_of_node(phy_info_node, port_node) {
+-		if (of_property_read_u32(port_node, "port_id", &port_id))
+-			return SW_BAD_VALUE;
++		if (ssdk_dt_read_port_values(port_node, &port_values)) {
++			rv = SW_BAD_VALUE;
++			goto out;
++		}
++		port_id = port_values.id;
+ 		if (!cfg->port_cfg.wan_bmp) {
+ 			cfg->port_cfg.wan_bmp = BIT(port_id);
+ 		} else {
+@@ -845,7 +898,8 @@
+ 			hsl_port_phy_access_type_set(dev_id, port_id, PHY_I2C_ACCESS);
+ 			if (of_property_read_u32(port_node, "phy_i2c_address",
+ 						&phy_i2c_addr)) {
+-				return SW_BAD_VALUE;
++				rv = SW_BAD_VALUE;
++				goto out;
+ 			}
+ 			/* phy_i2c_address is the i2c slave addr */
+ 			hsl_phy_address_init(dev_id, port_id,
+@@ -872,13 +926,8 @@
+ 				TO_PHY_ADDR_E(phy_addr, miibus_index));
+ 		}
+ 
+-		paddr = of_get_property(port_node, "phy_dac", &len);
+-		if(paddr)
+-		{
+-			phy_dac.mdac = be32_to_cpup(paddr);
+-			phy_dac.edac = be32_to_cpup(paddr+1);
+-			hsl_port_phy_dac_set(dev_id, port_id, phy_dac);
+-		}
++		if (port_values.has_dac)
++			hsl_port_phy_dac_set(dev_id, port_id, port_values.dac);
+ 
+ 		phy_c45 = of_property_read_bool(port_node, "ethernet-phy-ieee802.3-c45");
+ 		hsl_port_phy_c45_capability_set(dev_id, port_id, phy_c45);
+@@ -965,8 +1014,10 @@
+ 		switch_external_node = of_get_child_by_name(port_node, "switch_external");
+ 		if(switch_external_node) {
+ 			index = ssdk_dts_netdev_switch_alloc(&netdev_switch);
+-			if(index == SSDK_NETDEV_SWITCH_NUM)
+-				return SW_NO_RESOURCE;
++			if(index == SSDK_NETDEV_SWITCH_NUM) {
++				rv = SW_NO_RESOURCE;
++				goto out;
++			}
+ 			netdev_switch->switch_netdev_port = port_id;
+ 			netdev_switch->switch_connected = A_TRUE;
+ 			netdev_switch_node = of_parse_phandle(switch_external_node, "switch_handle",
+@@ -982,6 +1033,9 @@
+ 		}
+ 	}
+ 
++out:
++	of_node_put(port_node);
++	of_node_put(phy_info_node);
+ 	return rv;
+ }
+ 
+@@ -1559,6 +1613,9 @@
+ 		seen[prepared[num].id] = A_TRUE;
+ 		ret = ssdk_dt_read_access_mode(prepared[num].node,
+ 				&prepared[num].access);
++		if (ret)
++			return ret;
++		ret = ssdk_dt_validate_phy_ports(prepared[num].node);
+ 		if (ret)
+ 			return ret;
+ 	}
