@@ -1,0 +1,107 @@
+--- a/src/hsl/hppe/hppe_init.c
++++ b/src/hsl/hppe/hppe_init.c
+@@ -43,6 +43,7 @@
+ hppe_portproperty_init(a_uint32_t dev_id)
+ {
+ 	hsl_port_prop_t p_type;
++	sw_error_t rv;
+ 	hsl_dev_t *pdev = NULL;
+ 	fal_port_t port_id;
+ 	a_uint32_t bitmap = 0;
+@@ -71,39 +72,39 @@
+ 					case HSL_PP_PHY:/*front ports*/
+ 						if (SW_IS_PBMP_MEMBER(bitmap, port_id))
+ 						{
+-							SW_RTN_ON_ERROR
+-							(hsl_port_prop_set(dev_id, port_id,p_type));
++							rv = hsl_port_prop_set(dev_id, port_id,p_type);
++							SW_RTN_ON_ERROR(rv);
+ 						}
+ 						break;
+ 
+ 					case HSL_PP_INNER:/*inner ports*/
+ 						if (SW_IS_PBMP_MEMBER(inner_pbmp, port_id))
+ 						{
+-							SW_RTN_ON_ERROR
+-							(hsl_port_prop_set(dev_id, port_id,p_type));
++							rv = hsl_port_prop_set(dev_id, port_id,p_type);
++							SW_RTN_ON_ERROR(rv);
+ 						}
+ 						break;
+ 
+ 					case HSL_PP_INCL_CPU:
+ 						/*the ports include cpu port*/
+-						SW_RTN_ON_ERROR
+-						(hsl_port_prop_set(dev_id, port_id, p_type));
++						rv = hsl_port_prop_set(dev_id, port_id, p_type);
++						SW_RTN_ON_ERROR(rv);
+ 						break;
+ 
+ 					case HSL_PP_EXCL_CPU:
+ 						/*the ports exclude cpu port*/
+ 						if (port_id != pdev->cpu_port_nr)
+ 						{
+-							SW_RTN_ON_ERROR
+-							(hsl_port_prop_set(dev_id, port_id,p_type));
++							rv = hsl_port_prop_set(dev_id, port_id,p_type);
++							SW_RTN_ON_ERROR(rv);
+ 						}
+ 						break;
+ 
+ 					case HSL_PP_CPU:/*cpu port*/
+ 						if (port_id == pdev->cpu_port_nr)
+ 						{
+-							SW_RTN_ON_ERROR
+-							(hsl_port_prop_set(dev_id, port_id,p_type));
++							rv = hsl_port_prop_set(dev_id, port_id,p_type);
++							SW_RTN_ON_ERROR(rv);
+ 						}
+ 						break;
+ 
+@@ -162,10 +163,12 @@
+ sw_error_t
+ hppe_cleanup(a_uint32_t dev_id)
+ {
++    sw_error_t rv;
+ 
+     if (hppe_cfg[dev_id])
+     {
+-        SW_RTN_ON_ERROR(hsl_port_prop_cleanup_by_dev(dev_id));
++        rv = hsl_port_prop_cleanup_by_dev(dev_id);
++        SW_RTN_ON_ERROR(rv);
+ 
+         aos_mem_free(hppe_cfg[dev_id]);
+         hppe_cfg[dev_id] = NULL;
+@@ -184,6 +187,8 @@
+  */
+ sw_error_t hppe_init(a_uint32_t dev_id, ssdk_init_cfg *cfg)
+ {
++    sw_error_t rv;
++
+     HSL_DEV_ID_CHECK(dev_id);
+ 
+     if (NULL == hppe_cfg[dev_id])
+@@ -198,15 +203,19 @@
+ 
+     aos_mem_copy(hppe_cfg[dev_id], cfg, sizeof (ssdk_init_cfg));
+ 
+-    SW_RTN_ON_ERROR(hppe_dev_init(dev_id, cfg));
++    rv = hppe_dev_init(dev_id, cfg);
++    SW_RTN_ON_ERROR(rv);
+ 
+ #if !(defined(KERNEL_MODULE) && defined(USER_MODE))
+ 	{
+ 		hsl_api_t *p_api;
+ 
+-		SW_RTN_ON_ERROR(hsl_port_prop_init(dev_id));
+-		SW_RTN_ON_ERROR(hsl_port_prop_init_by_dev(dev_id));
+-		SW_RTN_ON_ERROR(hppe_portproperty_init(dev_id));
++		rv = hsl_port_prop_init(dev_id);
++		SW_RTN_ON_ERROR(rv);
++		rv = hsl_port_prop_init_by_dev(dev_id);
++		SW_RTN_ON_ERROR(rv);
++		rv = hppe_portproperty_init(dev_id);
++		SW_RTN_ON_ERROR(rv);
+ 
+ 		SW_RTN_ON_NULL(p_api = hsl_api_ptr_get(dev_id));
+ 		p_api->dev_clean   = hppe_cleanup;
