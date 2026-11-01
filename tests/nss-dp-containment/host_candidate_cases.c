@@ -14,6 +14,10 @@ static struct nss_dp_data_plane_ctx old_ctx, new_ctx;
 static struct rps_dev_flow_table flow_table;
 static struct rps_sock_flow_table sock_table;
 static struct netdev_rx_queue rxqueue;
+static void setup(bool up, bool overridden);
+static void detach(void);
+static void isolated(void);
+static void passed(const char *name);
 static void host_writer_waiting(void) {
     assert(pthread_mutex_lock(&rendezvous)==0); writer_waiting=1;
     assert(pthread_cond_broadcast(&rendezvous_cond)==0); assert(pthread_mutex_unlock(&rendezvous)==0);
@@ -31,7 +35,14 @@ static void callback(enum read_kind kind, struct nss_dp_data_plane_ctx *ctx) {
 }
 static int host_init(struct nss_dp_data_plane_ctx *ctx) { assert(ctx==&old_ctx || ctx==&new_ctx); init_calls++; return init_result; }
 static int host_close(struct nss_dp_data_plane_ctx *ctx) { assert(ctx==&old_ctx || ctx==&new_ctx); close_calls++; return close_result; }
-static int host_deinit(struct nss_dp_data_plane_ctx *ctx) { deinit_ctx=ctx; deinit_calls++; return deinit_result; }
+static int host_deinit(struct nss_dp_data_plane_ctx *ctx) {
+    deinit_ctx=ctx; deinit_calls++;
+#ifdef HOST_EDMA_RETIREMENT
+    /* Model the successful old host provider boundary using the real helper. */
+    if (ctx == &old_ctx && !deinit_result) edma_retire_port(ctx->dev, dp.macid);
+#endif
+    return deinit_result;
+}
 static int host_open(struct nss_dp_data_plane_ctx *ctx, uint32_t tx, uint32_t rx, uint32_t mode) { (void)ctx; (void)tx; (void)rx; (void)mode; open_calls++; return open_result; }
 static int host_link(struct nss_dp_data_plane_ctx *ctx, uint32_t state) { (void)state; callback(PHY,ctx); return link_result; }
 static int host_mac(struct nss_dp_data_plane_ctx *ctx, uint8_t *mac) { (void)ctx; (void)mac; return 0; }
@@ -53,7 +64,15 @@ static struct nss_dp_data_plane_ops new_ops;
 static struct nss_dp_data_plane_ops default_ops;
 static struct nss_dp_data_plane_ctx dp_global_data_plane_ctx[NSS_DP_MAX_PORTS];
 static struct nss_dp_data_plane_ops *nss_dp_hal_get_data_plane_ops(void) { return &default_ops; }
+HOST_EDMA_SUPPORT
+#ifdef HOST_EDMA_RETIREMENT
+/* The wrapper observes DP-to-EDMA ordering and delegates to the actual helper. */
+#define edma_retire_port host_observed_retire
+#endif
 HOST_EXTRACTED_FUNCTIONS
+#ifdef HOST_EDMA_RETIREMENT
+#undef edma_retire_port
+#endif
 static const struct net_device_ops host_ndo={ .ndo_open=nss_dp_open, .ndo_stop=nss_dp_close };
 static struct nss_gmac_hal_ops host_gmac={ .getethtoolstats=host_ethtool, .getssetcount=host_sset_count };
 static bool initialized;
@@ -79,6 +98,11 @@ static void setup(bool up, bool overridden) {
     memset(&flow_table,0,sizeof(flow_table)); memset(&sock_table,0,sizeof(sock_table));
     flow_table.log=1; sock_table.mask=1; sock_table.ents[0]=1; rxqueue.rps_flow_table=&flow_table;
     dev._rx=&rxqueue; net_hotdata.rps_sock_flow_table=&sock_table; net_hotdata.rps_cpu_mask=3;
+#ifdef HOST_EDMA_RETIREMENT
+    host_edma_setup(up, overridden);
+    memset(dp_global_data_plane_ctx, 0, sizeof(dp_global_data_plane_ctx));
+    dp_global_data_plane_ctx[0].dev = &dev;
+#endif
 }
 static void isolated(void) {
     struct nss_dp_plane_ref ref;
@@ -88,6 +112,9 @@ static void isolated(void) {
     assert(!(dev.features|dev.hw_features|dev.vlan_features|dev.wanted_features));
     assert(!test_bit(__NSS_DP_UP,&dp.flags)); assert(!(dp.drv_flags&(NSS_DP_PRIV_FLAG(INIT_DONE)|NSS_DP_PRIV_FLAG(INIT_OVERRIDE))));
     assert(!dev.queue_started && !dev.carrier && !dev.device_present);
+#ifdef HOST_EDMA_RETIREMENT
+    host_edma_isolated();
+#endif
 }
 static void detach(void) { rtnl_lock(); nss_dp_restore_data_plane(&dev); rtnl_unlock(); }
 static void passed(const char *name) { printf("PASS %s\n",name); }
@@ -106,9 +133,9 @@ static void *writer_thread(void *arg) {
     (void)arg; detach(); assert(pthread_mutex_lock(&rendezvous)==0); writer_done=1;
     assert(pthread_cond_broadcast(&rendezvous_cond)==0); assert(pthread_mutex_unlock(&rendezvous)==0); return NULL;
 }
-static void drain_case(enum read_kind kind,const char *name) {
+static void drain_case(enum read_kind kind,const char *name, bool overridden) {
     pthread_t reader,writer; struct nss_dp_plane_ref ref; struct sk_buff new_skb={.len=100};
-    setup(true,true); phy.link=true; phy.speed=1000; dp.phydev=&phy; dp.phy_started=true; dp.link_state=__NSS_DP_LINK_DOWN;
+    setup(true,overridden); phy.link=true; phy.speed=1000; dp.phydev=&phy; dp.phy_started=true; dp.link_state=__NSS_DP_LINK_DOWN;
     block_kind=kind;
     assert(pthread_create(&reader,NULL,reader_thread,(void *)(intptr_t)kind)==0);
     assert(pthread_mutex_lock(&rendezvous)==0);
@@ -119,6 +146,12 @@ static void drain_case(enum read_kind kind,const char *name) {
     while(!writer_waiting) assert(pthread_cond_wait(&rendezvous_cond,&rendezvous)==0);
     assert(!writer_done); assert(pthread_mutex_unlock(&rendezvous)==0);
     assert(dp.data_plane_ops==&old_ops && dp.dpc==&old_ctx); assert(!nss_dp_plane_get(&dp,&ref));
+#ifdef HOST_EDMA_RETIREMENT
+    retirement_check(!atomic_load(&host_retire_calls), "not-retired-before-admitted-drain");
+    if (!overridden)
+        retirement_check(edma_hw.netdev_arr[0] == &dev && edma_hw.host_open[0] &&
+                         edma_hw.active == 1, "member-live-until-admitted-drain");
+#endif
     unsigned before=atomic_load(&reads[kind]); call_reader(kind,&new_skb); assert(atomic_load(&reads[kind])==before);
     if(kind==XMIT) assert(new_skb.freed==1 && dev.stats.tx_dropped==1);
     if(kind==RECEIVE) assert(new_skb.freed==1 && dev.stats.rx_dropped==1);
@@ -137,6 +170,9 @@ static void *two_teardowns(void *arg) {
     assert(pthread_cond_broadcast(&rendezvous_cond)==0); assert(pthread_mutex_unlock(&rendezvous)==0); return NULL;
 }
 int main(void) {
+#ifdef HOST_EDMA_RETIREMENT
+    host_retirement_boundaries();
+#endif
     setup(false,true); detach(); isolated(); assert(close_calls==0 && deinit_calls==0); passed("candidate_down_detach_clears_four_masks_without_hardware_callback");
     setup(true,true); detach(); isolated(); assert(close_calls==0 && atomic_load(&reads[PHY])==0); passed("candidate_up_detach_clears_four_masks_without_nss_close_or_link");
     setup(true,true); detach(); rtnl_lock();
@@ -171,10 +207,17 @@ int main(void) {
     nss_dp_receive(&dev,&rx_skb,&napi);
     assert(rx_skb.freed==1 && dev.stats.rx_dropped==1 && atomic_load(&reads[RECEIVE])==0);
     isolated(); passed("quarantined_actual_receive_refused_counted_and_freed_once");
-    drain_case(XMIT,"inflight_xmit_drains_and_new_xmit_is_refused");
-    drain_case(RFS,"inflight_rfs_pair_drains_and_new_rfs_is_refused");
-    drain_case(PHY,"inflight_phy_link_drains_and_carrier_is_reasserted_off");
-    drain_case(STATS,"inflight_actual_ethtool_dp_stats_drains_and_new_reader_is_refused");
-    drain_case(RECEIVE,"inflight_actual_receive_delivery_drains_and_new_receive_is_refused");
+    drain_case(XMIT,"inflight_xmit_drains_and_new_xmit_is_refused",true);
+    drain_case(RFS,"inflight_rfs_pair_drains_and_new_rfs_is_refused",true);
+    drain_case(PHY,"inflight_phy_link_drains_and_carrier_is_reasserted_off",true);
+    drain_case(STATS,"inflight_actual_ethtool_dp_stats_drains_and_new_reader_is_refused",true);
+    drain_case(RECEIVE,"inflight_actual_receive_delivery_drains_and_new_receive_is_refused",true);
+#ifdef HOST_EDMA_RETIREMENT
+    drain_case(XMIT,"host_edma_xmit_reader_drains_before_retirement",false);
+    drain_case(RFS,"host_edma_rfs_reader_drains_before_retirement",false);
+    drain_case(PHY,"host_edma_phy_reader_drains_before_retirement",false);
+    drain_case(STATS,"host_edma_stats_reader_drains_before_retirement",false);
+    drain_case(RECEIVE,"host_edma_receive_reader_drains_before_retirement",false);
+#endif
     return 0;
 }

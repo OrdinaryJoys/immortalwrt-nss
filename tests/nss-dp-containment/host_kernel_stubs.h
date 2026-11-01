@@ -8,11 +8,15 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdatomic.h>
+#ifdef NDEBUG
+#error The host fixture requires enabled assertions
+#endif
 
 #define KERNEL_VERSION(a,b,c) (((a)<<16) | ((b)<<8) | (c))
 #define LINUX_VERSION_CODE KERNEL_VERSION(6,18,38)
 #define CONFIG_RFS_ACCEL 1
 #define __iomem
+#define __rcu
 #define EXPORT_SYMBOL(x)
 #define likely(x) (x)
 #define unlikely(x) (x)
@@ -39,6 +43,8 @@ typedef uint32_t u32;
 typedef uint8_t u8;
 typedef uint16_t u16;
 typedef uint64_t u64;
+typedef uintptr_t dma_addr_t;
+typedef int irqreturn_t;
 typedef pthread_mutex_t spinlock_t;
 typedef struct { atomic_int counter; } atomic_t;
 typedef struct { pthread_mutex_t lock; pthread_cond_t cond; pthread_mutex_t *reader_lock; } wait_queue_head_t;
@@ -92,6 +98,7 @@ struct net_device {
 struct sk_buff { unsigned len, hash, rx_queue, protocol, ip_summed; bool queue_recorded; int freed; struct net_device *dev; };
 struct phy_device { bool link; unsigned speed; };
 struct napi_struct { unsigned host_placeholder; };
+struct resource { uintptr_t host_token; };
 struct nss_dp_hal_info { unsigned host_placeholder; };
 struct nss_dp_hal_gmac_stats { unsigned host_placeholder; };
 #define netdev_priv(dev) ((dev)->priv)

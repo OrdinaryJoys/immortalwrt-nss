@@ -20,6 +20,8 @@ class CandidateOnlyModes(unittest.TestCase):
             raise RuntimeError('set DP_HOST_BASELINE and DP_HOST_CANDIDATE to exact already-prepared inputs')
         cls.baseline = Path(os.environ['DP_HOST_BASELINE']).resolve(strict=True)
         cls.candidate = Path(os.environ['DP_HOST_CANDIDATE']).resolve(strict=True)
+        arch = (cls.candidate / 'hal/soc_ops/ipq807x/nss_ipq807x.h').read_text()
+        cls.candidate_cases = 31 if 'bool edma_retire_port(' in arch else 21
 
     def invoke(self, arguments, output):
         return subprocess.run([sys.executable, str(RUNNER), *arguments, '--output', str(output)],
@@ -60,24 +62,24 @@ class CandidateOnlyModes(unittest.TestCase):
                     self.assertEqual(source['sha256'], hashlib.sha256((root / source['path']).read_bytes()).hexdigest())
             return report
 
-    def test_candidate_only_26_actual_input_roles_hashes(self):
+    def test_candidate_only_actual_input_roles_hashes(self):
         report = self.execute(['--candidate-only', '--candidate', str(self.candidate)])
-        self.assertEqual(report['mode'], 'CANDIDATE_ONLY_26')
+        self.assertEqual(report['mode'], 'CANDIDATE_ONLY_' + str(self.candidate_cases + 5))
         self.assertFalse(report['original_baseline_executed'])
         self.assertIsNone(report['selected_inputs']['baseline'])
-        self.assertEqual(report['total_cases'], 26)
-        self.assertEqual(report['expected_cases'], 26)
-        self.assertEqual([row['count'] for row in report['runs']], [21, 5])
+        self.assertEqual(report['total_cases'], self.candidate_cases + 5)
+        self.assertEqual(report['expected_cases'], self.candidate_cases + 5)
+        self.assertEqual([row['count'] for row in report['runs']], [self.candidate_cases, 5])
         self.assertEqual([row['input_role'] for row in report['runs']],
                          ['ACTUAL_PREPARED_CANDIDATE_IPQ807X', 'ACTUAL_PREPARED_CANDIDATE_OTHER_SOC_CONTROL'])
         self.assertTrue(all(row['prepared_root'] == str(self.candidate) for row in report['runs']))
 
-    def test_baseline_plus_candidate_retains_31(self):
+    def test_baseline_plus_candidate_retains_baseline_controls(self):
         report = self.execute(['--baseline', str(self.baseline), '--candidate', str(self.candidate)])
-        self.assertEqual(report['mode'], 'BASELINE_AND_CANDIDATE_31')
+        self.assertEqual(report['mode'], 'BASELINE_AND_CANDIDATE_' + str(self.candidate_cases + 10))
         self.assertTrue(report['original_baseline_executed'])
-        self.assertEqual(report['total_cases'], 31)
-        self.assertEqual([row['count'] for row in report['runs']], [5, 21, 5])
+        self.assertEqual(report['total_cases'], self.candidate_cases + 10)
+        self.assertEqual([row['count'] for row in report['runs']], [5, self.candidate_cases, 5])
         self.assertEqual(report['runs'][0]['input_role'], 'ORIGINAL_PREPARED_BASELINE_CONTROL')
         self.assertEqual(report['runs'][0]['prepared_root'], str(self.baseline))
 

@@ -5,6 +5,8 @@ import tempfile
 import unittest
 
 from extract_prepared_c import Prepared, function, structure, variable
+# unittest discovers the imported TestCase through the existing CI entry point.
+from retirement_contract_checks import RetirementContract
 
 
 class ExtractionIntegrity(unittest.TestCase):
