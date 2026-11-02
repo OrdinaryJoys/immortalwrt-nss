@@ -1,0 +1,33 @@
+From: AX6 lifecycle review
+Subject: [PATCH] ssdk: keep the local I2C node reference until its last use
+
+of_parse_phandle returns a referenced node. The adapter lookup does not
+transfer that reference. Keep it through of_mdiobus_register, and release it
+on each allocation/lookup failure. This does not change the vendor allocator
+ABI or claim to retire adapter, registered bus or shared PHY ownership.
+
+--- a/src/init/ssdk_dts.c
++++ b/src/init/ssdk_dts.c
+@@ -751,9 +751,9 @@
+ 	}
+ 
+ 	i2c_adpt = of_find_i2c_adapter_by_node(i2c_node);
+-	of_node_put(i2c_node);
+ 	if(!i2c_adpt) {
+ 		SSDK_ERROR("i2c adpt was not found\n");
++		of_node_put(i2c_node);
+ 		return NULL;
+ 	}
+ 	mdio_i2c = mdio_i2c_alloc(&(i2c_adpt->dev), i2c_adpt, MIDO_I2C_QCOM);
+@@ -760,9 +760,11 @@
+ 	if (!mdio_i2c) {
+ 		SSDK_ERROR("mdio_i2c bus alloc failed\n");
++		of_node_put(i2c_node);
+ 		return NULL;
+ 	}
+ 	mdio_i2c->name = SFP_I2C_BUS;
+ 	ret = of_mdiobus_register(mdio_i2c, i2c_node);
++	of_node_put(i2c_node);
+ 	if (ret < 0) {
+ 		SSDK_ERROR("mdio_i2c bus register failed\n");
+ 		mdiobus_free(mdio_i2c);

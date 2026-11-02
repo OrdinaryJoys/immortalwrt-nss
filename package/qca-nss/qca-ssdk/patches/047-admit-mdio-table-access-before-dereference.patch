@@ -1,0 +1,80 @@
+From: AX6 lifecycle review
+Subject: [PATCH] ssdk: admit MDIO table arguments before dereferencing metadata
+
+Use the private-data getter instead of indexing the global table directly,
+and bound that getter by the actual topology count used to allocate its table.
+Reject a missing output pointer before add mutates anything,
+and do not mistake an empty bus slot for the index of a NULL bus. Successful
+lookup/insertion and the existing duplicate/full-table policy stay unchanged.
+This is argument/absent-metadata admission, not a concurrent reader lease or
+ownership transfer; do not add speculative provider puts or bus destruction.
+
+--- a/src/init/ssdk_plat.c
++++ b/src/init/ssdk_plat.c
+@@ -712,4 +712,9 @@
+ struct mii_bus *ssdk_miibus_get(a_uint32_t dev_id, a_uint32_t index)
+ {
+-	return qca_phy_priv_global[dev_id]->miibus[index];
++	struct qca_phy_priv *priv = ssdk_phy_priv_data_get(dev_id);
++
++	if (!priv || index >= SSDK_MII_BUS_MAX)
++		return NULL;
++
++	return priv->miibus[index];
+ }
+@@ -737,21 +742,21 @@
+ sw_error_t ssdk_miibus_add(a_uint32_t dev_id, struct mii_bus *miibus,
+ 	a_uint32_t *index)
+ {
+ 	a_uint32_t i = 0;
++	struct qca_phy_priv *priv = ssdk_phy_priv_data_get(dev_id);
+ 
+-	if(!miibus)
++	if (!priv || !miibus || !index)
+ 		return SW_BAD_PTR;
+ 
+ 	for(i = 0; i < SSDK_MII_BUS_MAX; i++)
+ 	{
+-		if(qca_phy_priv_global[dev_id]->miibus[i] == miibus ||
+-			qca_phy_priv_global[dev_id]->miibus[i] == NULL)
++		if(priv->miibus[i] == miibus || priv->miibus[i] == NULL)
+ 		{
+ 			*index = i;
+-			qca_phy_priv_global[dev_id]->miibus[i] = miibus;
++			priv->miibus[i] = miibus;
+ 			return SW_OK;
+ 		}
+ 	}
+ 
+ 	return SW_OUT_OF_RANGE;
+ }
+@@ -759,12 +764,16 @@
+ a_uint32_t ssdk_miibus_index_get(a_uint32_t dev_id, struct mii_bus *miibus)
+ {
+ 	a_uint32_t index = 0;
++	struct qca_phy_priv *priv = ssdk_phy_priv_data_get(dev_id);
++
++	if (!priv || !miibus)
++		return SSDK_MII_INVALID_BUS_ID;
+ 
+ 	for(index = 0; index < SSDK_MII_BUS_MAX; index++)
+ 	{
+-		if(qca_phy_priv_global[dev_id]->miibus[index] == miibus)
++		if(priv->miibus[index] == miibus)
+ 			return index;
+ 	}
+ 
+ 	return SSDK_MII_INVALID_BUS_ID;
+ }
+--- a/src/init/ssdk_init.c
++++ b/src/init/ssdk_init.c
+@@ -128,7 +128,8 @@
+ struct qca_phy_priv* ssdk_phy_priv_data_get(a_uint32_t dev_id)
+ {
+-	if (dev_id >= SW_MAX_NR_DEV || !qca_phy_priv_global)
++	if (dev_id >= SW_MAX_NR_DEV || dev_id >= ssdk_switch_device_num_get() ||
++	    !qca_phy_priv_global)
+ 		return NULL;
+ 
+ 	return qca_phy_priv_global[dev_id];
+ }

@@ -1,0 +1,39 @@
+From: AX6 lifecycle review
+Subject: [PATCH] ssdk: balance temporary default and legacy MDIO node leases
+
+Keep the acquired node through its last lookup/use, then release that local
+reference. The platform-device and bus references are independent: this does
+not authorize unregistering a borrowed provider or retiring its raw readers.
+The legacy child iterator consumes the previous child on its next iteration,
+but not when the loop breaks at the port limit.
+
+--- a/src/init/ssdk_dts.c
++++ b/src/init/ssdk_dts.c
+@@ -1053,7 +1053,9 @@
+ 	if (switch_node) {
+ 		mdio_node = of_parse_phandle(switch_node, "mdio-bus", 0);
+ 		if (mdio_node) {
+-			return ssdk_miibus_add(dev_id, of_mdio_find_bus(mdio_node),
++			rv = ssdk_miibus_add(dev_id, of_mdio_find_bus(mdio_node),
+ 				&miibus_index);
++			of_node_put(mdio_node);
++			return rv;
+ 		}
+ 	}
+@@ -1065,6 +1067,7 @@
+ 	}
+ 
+ 	mdio_plat = of_find_device_by_node(mdio_node);
++	of_node_put(mdio_node);
+ 	if (!mdio_plat) {
+ 		SSDK_ERROR("cannot find platform device from mdio node\n");
+ 		return SW_NOT_FOUND;
+@@ -1140,6 +1143,8 @@
+ 				break;
+ 			}
+ 		}
++		of_node_put(child);
+ 	}
++	of_node_put(mdio_node);
+ 	return;
+ }

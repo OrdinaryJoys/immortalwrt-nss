@@ -1,7 +1,7 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=qca-nss-dp
-PKG_RELEASE:=9
+PKG_RELEASE:=10
 
 PKG_SOURCE_URL:=https://git.codelinaro.org/clo/qsdk/oss/lklm/nss-dp.git
 PKG_SOURCE_PROTO:=git

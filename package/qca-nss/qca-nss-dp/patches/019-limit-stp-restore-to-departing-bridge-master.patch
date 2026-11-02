@@ -1,0 +1,41 @@
+From: AX6 lifecycle review
+Subject: [PATCH] nss-dp: restore STP only after the owning bridge is removed
+
+NETDEV_CHANGEUPPER also reports non-master upper removal (for example VLANs).
+The core records master before unlink and delivers CHANGEUPPER after unlink.
+Do not overwrite a bridge's blocking state for unrelated upper changes.
+
+--- a/nss_dp_switchdev.c
++++ b/nss_dp_switchdev.c
+@@ -71,22 +71,28 @@
+ 			       unsigned long event, void *ptr)
+ {
+ 	struct netdev_notifier_changeupper_info *info = ptr;
+-	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
++	struct net_device *dev;
+ 	struct nss_dp_dev *dp_priv;
+ 
+-	if (event != NETDEV_CHANGEUPPER)
++	if (event != NETDEV_CHANGEUPPER || !info)
+ 		return NOTIFY_DONE;
+ 
+-	if (info && info->linking)
++	/* master describes the owner before the core unlinks the upper. */
++	if (info->linking || !info->master || !info->upper_dev ||
++	    !netif_is_bridge_master(info->upper_dev))
+ 		return NOTIFY_DONE;
+ 
++	dev = netdev_notifier_info_to_dev(ptr);
+ 	if (!dev || !nss_dp_is_phy_dev(dev))
+ 		return NOTIFY_DONE;
+ 
+ 	dp_priv = netdev_priv(dev);
+ 	if (!dp_priv)
+ 		return NOTIFY_DONE;
+ 
++	if (nss_dp_is_bridge_port(dev))
++		return NOTIFY_DONE;
++
+ 	netdev_dbg(dev, "upper removed, restore forwarding STP state\n");
+ 	nss_dp_stp_state_set(dp_priv, BR_STATE_FORWARDING);
+ 

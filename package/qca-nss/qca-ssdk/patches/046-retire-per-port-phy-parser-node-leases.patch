@@ -1,0 +1,38 @@
+From: AX6 lifecycle review
+Subject: [PATCH] ssdk: retire PHY parser's temporary per-port OF references
+
+The MDIO/I2C and external-switch lookups acquire temporary node references;
+bus/device registrations and scalar metadata do not consume those references.
+Release each port's temporaries and clear their local pointers before the next
+iteration. The existing failure label releases any still-acquired temporaries,
+then the held iterator child and container. Do not retire borrowed providers,
+registered buses, shared PHY ops or published scalar metadata here.
+
+--- a/src/init/ssdk_dts.c
++++ b/src/init/ssdk_dts.c
+@@ -1032,9 +1032,25 @@
+ 			if(!of_property_read_u32(switch_external_node, "switch_cpu_port",
+ 				&switch_cpu_port))
+ 				netdev_switch->switch_cpu_port = switch_cpu_port;
+ 		}
++		of_node_put(netdev_switch_node);
++		netdev_switch_node = NULL;
++		of_node_put(switch_external_node);
++		switch_external_node = NULL;
++#if IS_ENABLED(CONFIG_MDIO_I2C)
++		of_node_put(i2c_node);
++		i2c_node = NULL;
++#endif
++		of_node_put(mdio_node);
++		mdio_node = NULL;
+ 	}
+ 
+ out:
++	of_node_put(netdev_switch_node);
++	of_node_put(switch_external_node);
++#if IS_ENABLED(CONFIG_MDIO_I2C)
++	of_node_put(i2c_node);
++#endif
++	of_node_put(mdio_node);
+ 	of_node_put(port_node);
+ 	of_node_put(phy_info_node);
