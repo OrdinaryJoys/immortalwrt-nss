@@ -40,6 +40,15 @@ copied into fresh directories; reversing only known new patches, with
 full-result inventory hashes, reconstructs DP18 and SSDK31/32/33 baselines.
 The original runners then execute their real old witnesses as well as all
 current positive/negative cases. No empty stub or skipped baseline is used.
+The first cloud run41419937448 exposed a portable patch-format defect:
+047's first hunk had two leading but only one trailing context line. GNU
+patch's zero-fuzz reverse matching interprets that short suffix as an EOF
+constraint and rejects an interior match, unlike the local BSD patch.
+The hunk now has three unchanged lines on both sides. Full-chain GNU replay
+also found the same short-suffix defect in045 and046, so their unchanged
+trailing context is completed too. Production C output, all full-tree baseline
+hashes and zero-fuzz requirements stay unchanged; both GNU2.7.6 and2.8 must
+exercise the complete forward/reverse chain rather than relying on BSD alone.
 The existing EDMA profile changes only to the reviewed19-layer identity;
 its six TX/IRQ/NAPI source inputs and old18 patch prefix are identical.
 

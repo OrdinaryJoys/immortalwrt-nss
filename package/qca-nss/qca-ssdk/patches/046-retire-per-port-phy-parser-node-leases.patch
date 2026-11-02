@@ -10,7 +10,7 @@ registered buses, shared PHY ops or published scalar metadata here.
 
 --- a/src/init/ssdk_dts.c
 +++ b/src/init/ssdk_dts.c
-@@ -1032,9 +1032,25 @@
+@@ -1032,11 +1032,27 @@
  			if(!of_property_read_u32(switch_external_node, "switch_cpu_port",
  				&switch_cpu_port))
  				netdev_switch->switch_cpu_port = switch_cpu_port;
@@ -36,3 +36,5 @@ registered buses, shared PHY ops or published scalar metadata here.
 +	of_node_put(mdio_node);
  	of_node_put(port_node);
  	of_node_put(phy_info_node);
+ 	return rv;
+ }

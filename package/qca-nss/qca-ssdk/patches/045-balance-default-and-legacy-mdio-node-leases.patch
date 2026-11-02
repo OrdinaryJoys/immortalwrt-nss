@@ -9,7 +9,7 @@ but not when the loop breaks at the port limit.
 
 --- a/src/init/ssdk_dts.c
 +++ b/src/init/ssdk_dts.c
-@@ -1053,7 +1053,9 @@
+@@ -1053,8 +1053,10 @@
  	if (switch_node) {
  		mdio_node = of_parse_phandle(switch_node, "mdio-bus", 0);
  		if (mdio_node) {
@@ -20,6 +20,7 @@ but not when the loop breaks at the port limit.
 +			return rv;
  		}
  	}
+ 
 @@ -1065,6 +1067,7 @@
  	}
  
@@ -28,7 +29,7 @@ but not when the loop breaks at the port limit.
  	if (!mdio_plat) {
  		SSDK_ERROR("cannot find platform device from mdio node\n");
  		return SW_NOT_FOUND;
-@@ -1140,6 +1143,8 @@
+@@ -1140,7 +1143,9 @@
  				break;
  			}
  		}
@@ -37,3 +38,4 @@ but not when the loop breaks at the port limit.
 +	of_node_put(mdio_node);
  	return;
  }
+ 
