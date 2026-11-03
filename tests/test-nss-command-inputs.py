@@ -34,6 +34,8 @@ NEGATIVES=(
  ('ppe-position','ppe-bounds','PPE_POSITION'),('mirror-copy','mirror-dispatch','MIRROR_DISPATCH'),
  ('mirror-limit','mirror-bounds','MIRROR_LIMIT'),('mirror-proc','mirror-errors','MIRROR_PROC'),
  ('mirror-empty-name','mirror-invalid','MIRROR_EMPTY_NAME'),
+ ('mirror-display-empty','mirror-invalid','MIRROR_EMPTY_NAME'),
+ ('mirror-next-empty','mirror-invalid','MIRROR_EMPTY_INDEX'),
  ('tunip-copy','tunip-frag','TUNIP_FRAG'),('tunip-limit','tunip-bounds','TUNIP_LIMIT'),
  ('tunip-size','tunip-bounds','TUNIP_ALLOC'),('tunip-suffix-length','tunip-map','TUNIP_SUFFIX_LENGTH'))
 
@@ -44,7 +46,7 @@ def need(ok,why):
 
 def obligation_gate(rows):
     rows=[tuple(r) for r in rows]
-    need(len(rows)==20 and len(set(rows))==20 and set(rows)==set(NEGATIVES),'FIXED_NEGATIVE_INVENTORY')
+    need(len(rows)==22 and len(set(rows))==22 and set(rows)==set(NEGATIVES),'FIXED_NEGATIVE_INVENTORY')
 
 
 def inventory_controls():
@@ -111,14 +113,16 @@ class Run:
              'stdout_sha256':source.sha(p.stdout),'stderr_sha256':source.sha(p.stderr)}
         self.commands.append(row); self.write(name+'.json',json.dumps(row,indent=2)+'\n'); return p
 
-    def compile(self,label,bodies,types,provenance,text=None):
+    def compile(self,label,bodies,types,provenance,text=None,model_override=None):
         if bodies is not None:
             for group,items in bodies.items():
                 code='\n'.join('#line '+str(provenance[n]['line'])+' "'+provenance[n]['path']+'"\n'+b
                                for n,b in items.items())
                 self.write(label+'/actual-'+group+'.c',code+'\n')
             self.write(label+'/types.h',types)
-            for name in ('model.h','fixture.c'): self.write(label+'/'+name,(SUPPORT/name).read_bytes())
+            for name in ('model.h','fixture.c'):
+                raw=model_override if name=='model.h' and model_override is not None else (SUPPORT/name).read_bytes()
+                self.write(label+'/'+name,raw)
         else: self.write(label+'/fixture.c',text)
         directory=self.root/label; binary=directory/'program.host'
         flags=['-std=gnu11','-O1','-g','-Wall','-Wextra','-Werror']
@@ -210,6 +214,22 @@ def main():
         obligation_gate(NEGATIVES)
         run.write('OBLIGATIONS.json',json.dumps(NEGATIVES,indent=2)+'\n')
         binary=run.compile('positive',bodies,types,provenance)
+        expected=b'PASS kernel-numeric-model\n'
+        run.write('numeric-model/positive.expected',expected)
+        p=run.invoke('numeric-model/positive',[str(binary),'kernel-numeric-model'])
+        need(p.returncode==0 and p.stdout==expected and not p.stderr,'KERNEL_NUMERIC_MODEL')
+        model=(SUPPORT/'model.h').read_bytes(); anchor=b'return result==EOF?0:result;'
+        need(model.count(anchor)==1,'NUMERIC_MODEL_CONTROL_ANCHOR')
+        model_binary=run.compile('numeric-model/libc-eof',bodies,types,provenance,
+                                 model_override=model.replace(anchor,b'return result;',1))
+        expected=b'NSS_INPUT:KERNEL_SCAN_EMPTY\n'
+        run.write('numeric-model/negative.expected',expected)
+        p=run.invoke('numeric-model/negative',[str(model_binary),'kernel-numeric-model'])
+        need(p.returncode==86 and not p.stdout and p.stderr==expected,'EXACT_NUMERIC_MODEL_CONTROL')
+        report['numeric_model_controls']={'valid':1,'rejected':1,
+            'classification':'NATIVE_NUMERIC_MODEL_CONTROL_NOT_PRODUCTION_SOURCE_MUTANT',
+            'mutation':'Remove only libc EOF-to-kernel zero-assignment normalization',
+            'marker':'KERNEL_SCAN_EMPTY'}
         for case in CASES:
             expected=('PASS '+case+'\n').encode(); run.write('positive/'+case+'.expected',expected)
             p=run.invoke('positive/'+case,[str(binary),case])

@@ -17,6 +17,13 @@ also exposed the existing unused suffix-length-valid flag: tunipip6 now requires
 that actual field before copying its length into a map request. The ordinary
 parsed-error return0 behavior is not changed. No remote or unprivileged trigger
 is claimed; relevant registered privileged sysctl/module paths are required.
+Display's separate name copy rejects an empty value before its local index;
+next-hop's newline index tests *value first, leaving its original invalid-value
+branch/put intact. These do not change central argument reading or ownership.
+The proposed seven scanf-EOF source changes were not made: Linux empty-input
+vsscanf returns zero assignments, while libc may return EOF. This attribution
+was corrected in the host numeric leaf and independent model controls, not in
+production parsing or source-mutant counts.
 
 A07: PPE parses a private copy of the current bounded request, never its shared
 proc backing array. proc errors are returned; write offsets must be0. Real
@@ -31,7 +38,7 @@ bounded. Firmware loader handling of the diagnostic result is untouched: this
 does not validate/reject an image, establish FW safety, or prove a device fault.
 
 Verification: fixed vendor/full-tree inputs, exact reverse/forward new patches,
-20 actual-function cases,20 directed controls, ordinary GCC plus Clang ASan/
+20 actual-function cases,22 directed controls, ordinary GCC plus Clang ASan/
 UBSan activation controls, exact stdout/marker/exit/clean compile and end hashes.
 Models and safe boundary witnesses are detailed in tests/nss-command-inputs/README.md.
 Fixed code inventory excludes only proven prepare metadata, individually bound.

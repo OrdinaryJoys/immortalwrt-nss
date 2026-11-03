@@ -11,10 +11,18 @@ static ssize_t checked_mirror_name_copy(char *dst,const char *src,size_t cap) {
     CHECK(src && *src,"MIRROR_EMPTY_NAME");
     return strscpy(dst,src,cap);
 }
+static size_t checked_mirror_index_length(const char *text) {
+    CHECK(text && *text,"MIRROR_EMPTY_INDEX");
+    return strlen(text);
+}
+#define sscanf model_kernel_sscanf
 #define strscpy checked_mirror_name_copy
+#define strlen checked_mirror_index_length
 #include "actual-mirror.c"
+#undef strlen
 #undef strscpy
 #include "actual-tunip.c"
+#undef sscanf
 
 static char storage[NSS_PPE_VP_MAX_CMD_STR];
 static struct ctl_table ctl = {storage,sizeof(storage)};
@@ -141,6 +149,20 @@ static void test_mirror_dispatch(void) {
     for(size_t i=0;i<8;i++) {
         CHECK(mirror(commands[i])==0 && !strcmp(last_action,expected[i]),"MIRROR_DISPATCH"); clean();
     }
+    const char *display_commands[]={"display mirrordev=all","display mirrordev=all\n",
+                                    "display mirrordev=ath0","display mirrordev=ath0\n"};
+    for(size_t i=0;i<4;i++) {
+        CHECK(mirror(display_commands[i])==0 &&
+              !strcmp(last_action,i<2?"mirror-display-all":"mirror-display"),"MIRROR_DISPLAY_VALID");
+        clean();
+    }
+    const char *next_values[]={"n2h","n2h\n","eth_rx","eth_rx\n"};
+    for(size_t i=0;i<4;i++) {
+        char command[100]; snprintf(command,sizeof(command),"set_nexthop mirrordev=ath0 mirror_next_hop=%s",next_values[i]);
+        CHECK(mirror(command)==0 && !strcmp(last_action,"mirror-next") &&
+              last_type==(uint32_t)(i<2?NSS_N2H_INTERFACE:NSS_ETH_RX_INTERFACE),"MIRROR_NEXTHOP_VALID");
+        clean();
+    }
     struct net_device *out=NULL;
     CHECK(nss_mirror_ctl_get_netdev_by_name("ath0\n",&out)==0 && out==&device,"MIRROR_NAME_NEWLINE");
     dev_put(out); clean();
@@ -154,6 +176,12 @@ static void test_mirror_dispatch(void) {
     }
     CHECK(mirror("enable mirrordev=abcdefghijklmno\n")==0 &&
           !strcmp(last_action,"mirror-enable") && !strcmp(last_name,device.name),"MIRROR_NAME_MAX_PARSER");
+    const char *display_long[]={"display mirrordev=abcdefghijklmno","display mirrordev=abcdefghijklmno\n"};
+    for(size_t i=0;i<2;i++) {
+        CHECK(mirror(display_long[i])==0 && !strcmp(last_action,"mirror-display") &&
+              !strcmp(last_name,device.name),"MIRROR_DISPLAY_MAX");
+        clean();
+    }
     clean(); strcpy(device.name,"ath0");
     CHECK(copy_user_calls==0,"MIRROR_KERNEL_INPUT");
 }
@@ -175,11 +203,20 @@ static void test_mirror_invalid(void) {
         clean();
     }
     const char *bad[]={" ","not-a-command","enable","enable wrong=ath0","enable mirrordev=missing",
-                       "enable mirrordev=","disable mirrordev=","reset_nexthop mirrordev="};
+                       "enable mirrordev=","disable mirrordev=","reset_nexthop mirrordev=",
+                       "display mirrordev="};
     for(size_t i=0;i<sizeof(bad)/sizeof(bad[0]);i++) {
         int gets_before=dev_gets, puts_before=dev_puts;
         CHECK(mirror(bad[i])==-EINVAL && !actions,"MIRROR_INVALID"); clean();
         if(i>=5) CHECK(dev_gets==gets_before && dev_puts==puts_before,"MIRROR_EMPTY_PARSER");
+    }
+    const char *empty_next[]={"set_nexthop mirror_next_hop= mirrordev=ath0",
+                             "set_nexthop mirrordev=ath0 mirror_next_hop="};
+    for(size_t i=0;i<2;i++) {
+        int gets_before=dev_gets, puts_before=dev_puts;
+        CHECK(mirror(empty_next[i])==-EINVAL && !actions &&
+              dev_gets==gets_before+(int)i && dev_puts==puts_before+(int)i,"MIRROR_EMPTY_NEXTHOP");
+        clean();
     }
 }
 static void test_mirror_errors(void) {
@@ -230,6 +267,33 @@ static void test_tunip_errors(void) {
     CHECK(tunip("frag_id_update=2",NSS_TUNIPIP6_SYSCTL_FRAG_ID)==0 && !frag_id_update,"TUNIP_INVALID_VALUE"); clean();
     size_t len=1; loff_t pos=0; char input='1'; int old=allocations;
     CHECK(nss_tunipip6_cmd_procfs_enable_frag_id(&ctl,0,&input,&len,&pos)==-EINVAL && allocations==old,"TUNIP_READ");
+    const char *empty_fields[]={"rule_type","ipv4_prefix_len","ipv6_prefix_len","ipv6_suffix_len","ea_len","psid_offset"};
+    for(size_t i=0;i<sizeof(empty_fields)/sizeof(empty_fields[0]);i++) {
+        char command[100]; struct nss_connmgr_tunipip6_maprule_cfg saved;
+        memcpy(&saved,&last_rule,sizeof(saved));
+        snprintf(command,sizeof(command),"netdev=ath0 %s=",empty_fields[i]);
+        CHECK(tunip(command,NSS_TUNIPIP6_SYSCTL_ADD_MAPRULE)==0 && !actions &&
+              !memcmp(&last_rule,&saved,sizeof(saved)),"TUNIP_KERNEL_EMPTY_SCALAR");
+        clean();
+    }
+    frag_id_update=true;
+    CHECK(tunip("frag_id_update=",NSS_TUNIPIP6_SYSCTL_FRAG_ID)==0 && frag_id_update && !actions,"TUNIP_KERNEL_EMPTY_FRAG");
+    frag_id_update=false; clean();
+}
+static void test_kernel_numeric_model(void) {
+    const char *inputs[]={""," \t\n","wrong","0","42tail"};
+    for(size_t i=0;i<sizeof(inputs)/sizeof(inputs[0]);i++) {
+        unsigned value=0x87654321u; unsigned short small=0xa55au;
+        int expected=i<3?0:1;
+        const char *marker=i<2?"KERNEL_SCAN_EMPTY":i==2?"KERNEL_SCAN_MALFORMED":"KERNEL_SCAN_CONVERSION";
+        CHECK(model_kernel_sscanf(inputs[i],"%u",&value)==expected &&
+              value==(i<3?0x87654321u:i==3?0u:42u),marker);
+        CHECK(model_kernel_sscanf(inputs[i],"%hu",&small)==expected &&
+              small==(i<3?0xa55au:i==3?0u:42u),marker);
+    }
+    unsigned value=0; unsigned short small=0;
+    CHECK(model_kernel_sscanf("4294967295","%u",&value)==1 && value==UINT32_MAX &&
+          model_kernel_sscanf("65535","%hu",&small)==1 && small==UINT16_MAX,"KERNEL_SCAN_CONVERSION");
 }
 static void test_tunip_bounds(void) {
     char input[MAX_PROC_SIZE+1]; memset(input,' ',sizeof(input));
@@ -249,7 +313,8 @@ static const struct test tests[]={
     {"mirror-dispatch",test_mirror_dispatch},{"mirror-config",test_mirror_config},
     {"mirror-invalid",test_mirror_invalid},{"mirror-errors",test_mirror_errors},{"mirror-bounds",test_mirror_bounds},
     {"tunip-frag",test_tunip_frag},{"tunip-map",test_tunip_map},{"tunip-del-flush",test_tunip_del_flush},
-    {"tunip-errors",test_tunip_errors},{"tunip-bounds",test_tunip_bounds}
+    {"tunip-errors",test_tunip_errors},{"tunip-bounds",test_tunip_bounds},
+    {"kernel-numeric-model",test_kernel_numeric_model}
 };
 int main(int argc,char **argv) {
     CHECK(argc==2,"CASE_ARGUMENT");

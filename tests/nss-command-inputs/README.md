@@ -25,6 +25,9 @@ digest. Both copies are retained as source data. Runtime inputs and every output
 are hashed; expected output hashes originate from in-memory expected bytes.
 Only the explicitly authorized release pairs are ignored in a whole-recipe
 normalization; all other recipe bytes and all patches remain fixed.
+Clients admits release28/29 only as explicitly permitted identical-code recipe
+texts;28 is historical compatibility, not evidence of the new package version.
+The final freeze records the actual live recipe29 hash and per-run inputs.
 
 Default Build/Prepare generates only version.date plus a prepared stamp for
 these two recipes. No recipe Build/Prepare override or src overlay is selected.
@@ -44,10 +47,10 @@ not target headers, ABI or firmware execution. Kernel proc string behavior was
 checked against cached Linux6.18.38 sources. The actual core parsers are NOT
 substituted or cropped to compile; `-Wall -Wextra -Werror` remains enabled.
 
-Twenty fixed negative obligations are separate from metadata/inventory model
+Twenty-two fixed negative obligations are separate from metadata/inventory model
 controls. Every mutant must compile clean, then exit86 with empty stdout and
 one exact NSS_INPUT marker. Timeout, compiler failure, crash and sanitizer noise
-never count. Four witnesses have narrower classifications: sequence-short
+never count. Six witnesses have narrower classifications: sequence-short
 uses a memcmp range-check leaf before the old underflow can access memory;
 tunip-size checks the actual allocation argument before unsafe token traversal;
 tunip-suffix-length seeds the removed-validation variant's missing length to0
@@ -61,6 +64,29 @@ overwriting an externally held output pointer, changing its bytes/references,
 or calling lookup/put. Terminal mirrordev= is also passed through real parsers.
 Normal/newline names and the existing 15-character IFNAME plus echo-newline
 behavior remain covered; no overlong-name policy is changed.
+The display-empty variant removes the independent display parser's empty-value
+check and is caught by the same checked copy leaf. The next-empty variant
+removes only the nonempty condition on the next-hop newline index; a checked
+mirror strlen leaf rejects the empty index before any read-before-array. Its
+positive cases cover both parameter orders, with/without a held mirror dev,
+and require exactly the existing lookup/put balance. Both remain instrumented
+boundary witnesses, not crash reproductions or new reference unwind policies.
+
+Numeric-model correction: Linux vsscanf returns zero assignments on empty
+input, not libc EOF. The seven existing tunipip6 !sscanf checks are RETAINED;
+the initial libc-EOF interpretation was a host-model mismatch, not an evidenced
+target defect. Only the %u/%hu provider leaf normalizes libc EOF to zero and
+still performs actual libc value conversions. Dedicated empty/whitespace,
+malformed, zero, ordinary value and in-range maximum controls check unchanged
+outputs on no assignment. A separate model-only reverse control removes that
+normalization and must fail exactly86/KERNEL_SCAN_EMPTY; it is NOT a production
+source mutant or repaired finding. Actual handler cases check all seven empty
+scalar fields without provider/frag changes. Full kernel numeric lexical,
+overflow, duplicate-token and value-domain equivalence is not qualified.
+Primary is Linux stable v6.18.38 lib/vsprintf.c (vsscanf at line3430), SHA256
+d2ca4b38e198c64535a076a67689b413cf510455609ff6ff215ce1af51071067:
+num starts0 and no-input/no-digit exits precede assignment. No claim is made
+that libc and the kernel agree on every sign, range or other format string.
 
 PPE proc storage is deliberately overwritten by another modeled request after
 proc_dostring. The actual parser must still use this request's private kernel
@@ -78,6 +104,9 @@ Tunipip6's pre-existing semantic-failure return0 and FW diagnostic-only loader
 behavior are retained. Legacy subparser defects beyond the repaired memory/input
 boundaries (including duplicate/missing argument reference unwinds) are OPEN,
 not swept into a claim that every malformed root command is transactional.
+Missing frag_id_update presence tracking, typed grammar and provider/FW
+transactions also remain OPEN; no central read_value or error-return rewrite
+is made by the two local display/next-hop index repairs.
 
 Prep history is explicit: old driver022 needs +18 coordinates; clients005 has
 an EOF-without-newline outside this repair and clients023 has stale coordinates.

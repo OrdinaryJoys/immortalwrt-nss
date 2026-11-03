@@ -55,6 +55,19 @@ static void info(struct device *d, const char *fmt, ...) {
 }
 #define dev_info(d,...) info(d,__VA_ARGS__)
 #define dev_err(d,...) do { (void)(d); model_log(__VA_ARGS__); } while(0)
+/* Restricted scalar conversion model: Linux returns assignment count 0 for
+ * empty input, unlike libc EOF. Real libc conversions still produce values;
+ * this is not a claim of full kernel scanf lexical/overflow equivalence.
+ * Primary: Linux v6.18.38 lib/vsprintf.c vsscanf, line3430 onward;
+ * SHA256 d2ca4b38e198c64535a076a67689b413cf510455609ff6ff215ce1af51071067. */
+static int model_kernel_sscanf(const char *input,const char *format,...)
+    __attribute__((format(scanf,2,3)));
+static int model_kernel_sscanf(const char *input,const char *format,...) {
+    va_list ap;
+    CHECK(input && format && (!strcmp(format,"%u") || !strcmp(format,"%hu")),"KERNEL_SCAN_FORMAT");
+    va_start(ap,format); int result=vsscanf(input,format,ap); va_end(ap);
+    return result==EOF?0:result;
+}
 static ssize_t strscpy(char *dst,const char *src,size_t cap) {
     size_t n=strlen(src); if (!cap) return -E2BIG;
     size_t copied=n<cap-1?n:cap-1; memcpy(dst,src,copied); dst[copied]=0;

@@ -2,7 +2,7 @@
   "schema": 1,
   "origin": "Fixed exact vendor pins plus immutable old patches and the explicit new leaf patches; author-generated, never refreshed by runner",
   "baseline_receipt_sha256": "607205bec8ba2023abc0f41ba89e3e3e487e86ec0d4319a74e4ef21f3003fb3e",
-  "candidate_receipt_sha256": "65a2fc2e0632eac67a5a976327894686cb7324ef2458fd7a97c039ffb6e83ca3",
+  "candidate_receipt_sha256": "3a05724df073b624a23c3efdadabbc06c882630c08267f7ba0c56c2b142704ac",
   "driver": {
     "package": "qca-nss-drv",
     "pin": "6aa14c78e097b29c493ff2fef87e4d35906b2b5a",
@@ -48,11 +48,11 @@
     "pin": "51be82d43ef85079f78aa163d014223b05baa6a2",
     "archive_sha256": "c7403345ef0fb2bb89ab517a43a311e3f24bc63d7889e1c5913559566733b137",
     "files": 298,
-    "candidate_inventory_sha256": "110e092da793842bee36e31599ab2937d90744d7b1b424c9fcc58c5007e3ebea",
+    "candidate_inventory_sha256": "eca9bd5f9f893e6d817a456e54a054ddb774e1d30d1bec55347e7912c55c61d1",
     "baseline_inventory_sha256": "400e98fc68995358eb0b686d6c709ba2b0a501f350199e1a26ed3c9fb028b779",
     "allowed_releases": [
-      "27",
-      "28"
+      "28",
+      "29"
     ],
     "recipe_without_release_sha256": "0c3762c59e623e50435b02ba43d022992d712c6f7030be82600a52addb1acc07",
     "patches": {
@@ -81,7 +81,7 @@
       "023-igs-ifb-find-reference.patch": "3d2fa458ea9eb3f8037d10620346e219ec03ede6bf9f3add064e34be49f23605",
       "024-match-bound-nexthop-command-and-preserve-errors.patch": "48c3c8828b3ce924b3ed164b461ccd2e57a3f256e24d27c7042364674e3d8bb7",
       "025-netlink-admin-for-all-mutating-ops.patch": "2187756f3cfa81a632de16448d18c16dde654d5646e503434b8d4bfcdfcc2978",
-      "026-parse-sysctl-kernel-buffers.patch": "2464da71d0ba9d5c354203cbf97ccd8cf9c655dd44c39c1b677336a494c474f1"
+      "026-parse-sysctl-kernel-buffers.patch": "4312013bdb5b756dcb3f0a00890bf139192886a4f318d2dd2f1e2b40300d9715"
     }
   },
   "metadata_rule_inputs": {

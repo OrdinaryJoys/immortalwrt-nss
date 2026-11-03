@@ -17,6 +17,8 @@ EDITS = {
     "mirror-limit": ("mirror", "nss_mirror_ctl_config_handler", "\tif (write && (!count || ctl->maxlen <= 0 || count > (size_t)ctl->maxlen)) {\n\t\treturn -E2BIG;\n\t}\n", ""),
     "mirror-proc": ("mirror", "nss_mirror_ctl_config_handler", "\tif (ret || !write) {\n\t\treturn ret;\n\t}\n", ""),
     "mirror-empty-name": ("mirror", "nss_mirror_ctl_get_netdev_by_name", "\tif (!name || !*name) {\n\t\treturn -1;\n\t}\n", ""),
+    "mirror-display-empty": ("mirror", "nss_mirror_ctl_parse_display_cmd", "!param || !value || !*value", "!param || !value"),
+    "mirror-next-empty": ("mirror", "nss_mirror_ctl_parse_set_nexthop_cmd", "if (*value && value[strlen(value) - 1] == '\\n')", "if (value[strlen(value) - 1] == '\\n')"),
     "tunip-copy": ("tunip", "nss_tunipip6_data_parser", "memcpy(buf, buffer, count);", "if (copy_from_user(buf, buffer, count)) { kfree(pfree); return -EFAULT; }"),
     "tunip-limit": ("tunip", "nss_tunipip6_data_parser", "\tif (!count || count > MAX_PROC_SIZE) {\n\t\treturn -E2BIG;\n\t}\n", ""),
     "tunip-size": ("tunip", "nss_tunipip6_data_parser", "kzalloc(MAX_PROC_SIZE + 1, GFP_KERNEL)", "kzalloc(MAX_PROC_SIZE, GFP_KERNEL)"),

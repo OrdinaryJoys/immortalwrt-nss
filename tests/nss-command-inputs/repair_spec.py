@@ -34,6 +34,14 @@ def edits(label, relative, text):
     if relative == "mirror/nss_mirror_ctl.c":
         text = once(text, "\tchar dev_name[IFNAMSIZ] = {0};\n\n\tstrscpy(dev_name, name, IFNAMSIZ);",
                     "\tchar dev_name[IFNAMSIZ] = {0};\n\n\tif (!name || !*name) {\n\t\treturn -1;\n\t}\n\n\tstrscpy(dev_name, name, IFNAMSIZ);")
+        display = ("static int nss_mirror_ctl_parse_display_cmd(char *buffer)\n{\n"
+                   "\tchar *param, *value;\n\tchar dev_name[IFNAMSIZ] = {0};\n"
+                   "\tstruct net_device *mirror_dev;\n\n"
+                   "\tparam = nss_mirror_ctl_read_value(&buffer, &value, \"=\");\n"
+                   "\tif (!param || !value) {")
+        text = once(text, display, display.replace("!param || !value", "!param || !value || !*value"))
+        text = once(text, "\t\t} else if (!strcmp(param, \"mirror_next_hop\")) {\n\t\t\tif (value[strlen(value) - 1] == '\\n') {",
+                    "\t\t} else if (!strcmp(param, \"mirror_next_hop\")) {\n\t\t\tif (*value && value[strlen(value) - 1] == '\\n') {")
         text = once(text, "\tsize_t count = *lenp;\n\n\t/*", "\tsize_t count = *lenp;\n\n\tif (write && (!count || ctl->maxlen <= 0 || count > (size_t)ctl->maxlen)) {\n\t\treturn -E2BIG;\n\t}\n\n\t/*")
         text = once(text, "\tif (copy_from_user(buffer, buf, count)) {\n\t\tvfree(pfree);\n\t\treturn -EFAULT;\n\t}",
                     "\t/* Sysctl supplies kernel memory on Linux6.18. */\n\tmemcpy(buffer, buf, count);")
