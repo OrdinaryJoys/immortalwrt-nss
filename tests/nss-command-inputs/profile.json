@@ -1,0 +1,91 @@
+{
+  "schema": 1,
+  "origin": "Fixed exact vendor pins plus immutable old patches and the explicit new leaf patches; author-generated, never refreshed by runner",
+  "baseline_receipt_sha256": "607205bec8ba2023abc0f41ba89e3e3e487e86ec0d4319a74e4ef21f3003fb3e",
+  "candidate_receipt_sha256": "65a2fc2e0632eac67a5a976327894686cb7324ef2458fd7a97c039ffb6e83ca3",
+  "driver": {
+    "package": "qca-nss-drv",
+    "pin": "6aa14c78e097b29c493ff2fef87e4d35906b2b5a",
+    "archive_sha256": "3c375c137df0b6bff9d296d53c04ca0fbbd1f55722bc5c0f0cafdaa546fcfd66",
+    "files": 481,
+    "candidate_inventory_sha256": "8725c8ee568d698941659db9ac546c165b7817cb4787d8fe73ea163ecc19f4ce",
+    "baseline_inventory_sha256": "db390d46a7cd1e496caeb1de3599bcfe517d96afbb10cb9a2fbd167050c0bf5d",
+    "allowed_releases": [
+      "24",
+      "25"
+    ],
+    "recipe_without_release_sha256": "d2dd463e77ad99c0325b5ac0163eaafa8d86a61f3f8b28430190c863dc3200fa",
+    "patches": {
+      "001-build-system-and-export-headers.patch": "f078617eede247e9df2103868d8dce3ba6766cef4d0dd7b716dbdc082dd0a523",
+      "002-core-linux-6.18-apis.patch": "971ce7ff61e8149fc0ede33f527406f59477efc8702a838fd4a4efc16dd94725",
+      "003-hal-and-data-plane.patch": "099bc27963fdb23014c0665e8af31d5f5d29a2c48b1114b51e712cce6d1698ce",
+      "004-edma-eth-rx-and-igs.patch": "60d16f66e899eddaa78d989e570a9fb9ae245d555f5d7d9fc423987ece33aedd",
+      "005-ipv4-ipv6-and-reassembly.patch": "5b1dc3bf35fe6f6c83a7df0a1ea082b7319be676414deebf2ac1fe7f58238003",
+      "006-bridge-lag-match-mirror-pppoe.patch": "42b4de36e69d1e3ee1160537d3ca8b34b904ab2ff053129eca7eb5e68a6e124e",
+      "007-tunnel-and-session-offloads.patch": "1de0ed248a7ba1fdf634e0bfa2dbef71d6f42e27c483bdc0616c8fea57e2e292",
+      "008-n2h-dma-ppe-c2c-and-flow-steering.patch": "c90e34d29925e67513ac8cf0d9fa39fe39835e58fcf1997f371537f2ffb840c7",
+      "009-crypto-security-and-tls.patch": "d95c19be888ecbf9f17a73b7cba8459f149549bec37ae7b4e0c135aae0d5b1bb",
+      "010-wifi-dynamic-rmnet-and-aux-logs.patch": "eb46d0c852f94dc61ff31ba1b812a7820f0390aade628bbdd3b52a7ed46733d3",
+      "011-backport-fix-shaper-bounce-lock-unwind.patch": "2ed0b9a8b30aa60543919b79176c4b5cfba6d9ef3f66e353d41e4724b18153c3",
+      "012-fix-autoscale-stats-and-current-freq-read.patch": "b919564f02592086017328b5181fdbabf2f9314db933ee9e0d4486c966bd29e2",
+      "015-fix-fraglist-skb-truesize-underaccounting.patch": "5242126dd65ac9b84518e24a3fc923916a19a6c3880f0d18a0f69062b6648c06",
+      "016-back-fw-empty-buffer-payloads-with-kmalloc.patch": "136c11ed90d8870909fac6e1694caed61f1a03fb36538f4e919f284593c77b01",
+      "017-guard-auto-scale-against-uninit-core.patch": "da85c66ec9b7c19bfa709e8d93585315bf7e2234985523b33fb5bbd8eda52df4",
+      "018-fix-napi-request-irq-unwind.patch": "5ba4dab15aa37b2ca220d1419c0d7633b662ea6d2faa04d102067bc654cde7ca",
+      "019-fix-n2h-pool-dma-unwind.patch": "3c153fe095fe82dd1e3a5f5364f04c6d16254d980b3d4e7dc5b307eba120258a",
+      "020-static-analysis-bounds-fixes.patch": "671f4dc8370773d73b74ad58f92f89181ce5119d86b16fd34e2eb91c77c430ab",
+      "021-data-plane-guard-double-unregister.patch": "5da3b79b655351fb1e3ad9087f1d477be63480261876482625d7556a3e3384d8",
+      "022-lower-sysctl-read-log-level.patch": "3455b7338980f2464407859e7510fd5ae456ccaae3970559e4cbdae751bd1b7a",
+      "023-ipq807x-host-only-detach-containment.patch": "92f2a80f43e74753d00103243c6156c95bb6b854b344b6018799ab2df9cd08d9",
+      "024-n2h-extra-pbuf-sysctl-errors.patch": "1c07b389526ec5da71fd21e197cf32bfe1ff0da98c59a62e7b4c3b1c078035e8",
+      "025-igs-serialize-owner-publication-and-reference-admission.patch": "bebc19144be8249d3d26f6ef6b850a54354cedec44a664c6b8dfc6f30628a470",
+      "026-wifili-separate-opaque-context-from-netdev.patch": "e6752199ec0f5b7f358bcad7702f2a4a63331036718db9e569dfed6a1ae841a7",
+      "027-checked-command-and-sequence-inputs.patch": "eb2772f945784d08cf40159665aa2c58d45ea052131e0100023752423708053c"
+    }
+  },
+  "clients": {
+    "package": "qca-nss-clients",
+    "pin": "51be82d43ef85079f78aa163d014223b05baa6a2",
+    "archive_sha256": "c7403345ef0fb2bb89ab517a43a311e3f24bc63d7889e1c5913559566733b137",
+    "files": 298,
+    "candidate_inventory_sha256": "110e092da793842bee36e31599ab2937d90744d7b1b424c9fcc58c5007e3ebea",
+    "baseline_inventory_sha256": "400e98fc68995358eb0b686d6c709ba2b0a501f350199e1a26ed3c9fb028b779",
+    "allowed_releases": [
+      "27",
+      "28"
+    ],
+    "recipe_without_release_sha256": "0c3762c59e623e50435b02ba43d022992d712c6f7030be82600a52addb1acc07",
+    "patches": {
+      "001-build-system-and-common-apis.patch": "4a6ec8df3356e8c61269fcf46019a19e193803d2fa1f67cee97b4f7c48a049d1",
+      "002-bridge-vlan-lag-port-managers.patch": "8f78d21f51e0919e84af877482dfaa9530e3f24b9fec13706e748775629218a1",
+      "003-gre-ip-tunnel-and-vxlan-managers.patch": "dd4a6d1f4c0359dc866b8aee3c9a2d7ab9f2c42319338b83d84899a07ab9bf22",
+      "004-l2tp-pppoe-pptp-and-map-t.patch": "8cb6d464b10e4784121e0880f17178b94ce6177410e8e55340dd22be37779d20",
+      "005-qdisc-and-traffic-control.patch": "408d3ea06ef215569c8bf461b061a040cc47b9a925c057b91dad87e37c1a9b2f",
+      "006-netlink-api-updates.patch": "5c481205e90c7dfd78e3c01014208cd6e33179e7d1dd75ad5071d80f7760f1c2",
+      "007-security-vpn-and-tls-managers.patch": "61e6bdec6c64124036c845c694fff7b5ba8e43d024b5453ed05fec0d2a422ac7",
+      "008-match-mirror-and-misc-managers.patch": "c891f454e973667f31f7dcae1e31eb41f415f675a8d6a82a16902b4d26e51150",
+      "009-netlink-reduce-startup-logging.patch": "35953aa5a914bdcf7b0eb5d9dbb9a7d1101b969fd8eb56e88004dd546963f16a",
+      "010-wifi-no-runtime-guards.patch": "91ebb76558ff463064bfdabd0d17d97fc9f3a128756edb0116bc24d1495084b8",
+      "011-act_nssmirred-fix-action-list-corruption-on-release.patch": "9f9fe8a246cd6020dc1824f9cc84967079a890713eb9504f0d55f901301e1c2f",
+      "012-nss_qdisc-guard-stats-attach-detach-against-noop-root.patch": "a3450da6e7b815cc7b49edaf84c79749d7a0b09d619331ae9633d5c83d47cd96",
+      "013-netlink-require-admin-for-rule-injection.patch": "fe4144c5ebbcb41dfcb68bdb141dc319a6b5aa3cbf869bf69c00e5e1b4fd3f8f",
+      "014-igs-preserve-interface-lookup-errors.patch": "8d19eb48d8d59f250ce7d4b80f1dec7d95bc6a4d1c671a994a0403d425579485",
+      "015-igs-reserve-action-before-interface-config.patch": "4d205ce44462c9fa285b804ce8ca32b738817c0e6e78bd303706fff1ecad4718",
+      "016-igs-preserve-early-synchronous-replies.patch": "826f6a81edd82ac3fc8a21e1bea7909a33ae55a13ea87755f6b4cc67903b3d18",
+      "017-igs-reserve-binding-before-firmware-configuration.patch": "353ed8a90b07a4ebaffe9e0c8e9d61db5f83200b1beb5e2bb67fe8c987d41490",
+      "018-igs-validate-and-retire-reply-admission.patch": "402626bbb3d1760ec36449451c37d3e68baee1c3870a739fa76e7b419902cae1",
+      "019-igs-initialize-ifb-before-publishing-module-entrypoints.patch": "c3eced042ea2d818f62d0027404ad89d6ea235ef5c0e7135b654f5054bd5c531",
+      "020-igs-defer-module-put-until-cleanup.patch": "8c6059b9f6abfbc1bd3717299449a2ba67b0feb29c7badab7d2f78673b416b09",
+      "021-igs-ifb-binding-refcount.patch": "868b327db32560458bfc98ff975b9cf8c90e993f45f994442008021a77067d1b",
+      "022-igs-release-replaced-dev-reference.patch": "b2ea6ef7403a6608c7c0caa19140db99c109840a9d1ce13e45f1428d9edfc173",
+      "023-igs-ifb-find-reference.patch": "3d2fa458ea9eb3f8037d10620346e219ec03ede6bf9f3add064e34be49f23605",
+      "024-match-bound-nexthop-command-and-preserve-errors.patch": "48c3c8828b3ce924b3ed164b461ccd2e57a3f256e24d27c7042364674e3d8bb7",
+      "025-netlink-admin-for-all-mutating-ops.patch": "2187756f3cfa81a632de16448d18c16dde654d5646e503434b8d4bfcdfcc2978",
+      "026-parse-sysctl-kernel-buffers.patch": "2464da71d0ba9d5c354203cbf97ccd8cf9c655dd44c39c1b677336a494c474f1"
+    }
+  },
+  "metadata_rule_inputs": {
+    "include/package-defaults.mk": "cdb9a02ff1f3fe6e867fb9dcdc109ee93632b72be92e02e7b70f542e400ff710",
+    "include/package.mk": "adca9e09c7bbbb140dce31e454934299b77a8cd62530c60ac932ded0218a8ac9"
+  }
+}

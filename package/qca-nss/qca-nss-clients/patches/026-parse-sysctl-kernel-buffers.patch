@@ -1,0 +1,102 @@
+From: AX6 NSS input repair
+Subject: [PATCH] Parse bounded kernel commands and guard sequence searches
+
+--- a/mirror/nss_mirror_ctl.c
++++ b/mirror/nss_mirror_ctl.c
+@@ -133,6 +133,10 @@
+ {
+ 	char dev_name[IFNAMSIZ] = {0};
+ 
++	if (!name || !*name) {
++		return -1;
++	}
++
+ 	strscpy(dev_name, name, IFNAMSIZ);
+ 	if (dev_name[strlen(dev_name) - 1] == '\n') {
+ 		dev_name[strlen(dev_name) - 1] = '\0';
+@@ -763,6 +767,10 @@
+ 	int command, ret;
+ 	size_t count = *lenp;
+ 
++	if (write && (!count || ctl->maxlen <= 0 || count > (size_t)ctl->maxlen)) {
++		return -E2BIG;
++	}
++
+ 	/*
+ 	 * Find the string, return an error if not found
+ 	 */
+@@ -779,13 +787,11 @@
+ 
+ 	pfree = buffer;
+ 
+-	if (copy_from_user(buffer, buf, count)) {
+-		vfree(pfree);
+-		return -EFAULT;
+-	}
++	/* Sysctl supplies kernel memory on Linux6.18. */
++	memcpy(buffer, buf, count);
+ 
+ 	nextarg = nss_mirror_ctl_read_nextarg(&buffer);
+-	if (!nextarg) {
++	if (!nextarg || !*nextarg) {
+ 		goto err;
+ 	}
+ 
+--- a/tunipip6/nss_connmgr_tunipip6_sysctl.c
++++ b/tunipip6/nss_connmgr_tunipip6_sysctl.c
+@@ -29,6 +29,7 @@
+ #include <linux/if_arp.h>
+ #include <nss_api_if.h>
+ #include <linux/sysctl.h>
++#include <linux/string.h>
+ #include <linux/printk.h>
+ #include <linux/inet.h>
+ #include "nss_connmgr_tunipip6.h"
+@@ -67,26 +68,27 @@
+ 	char *pfree;
+ 	char *token;
+ 	int ret;
+-	int count;
++	size_t count = *lenp;
++
++	/* This write-only parser uses the request, not ctl storage or offsets. */
++	(void)ctl;
++	(void)ppos;
+ 
+         if (!write) {
+                 return -EINVAL;
+         }
+ 
+-	buf = kzalloc(MAX_PROC_SIZE, GFP_KERNEL);
++	if (!count || count > MAX_PROC_SIZE) {
++		return -E2BIG;
++	}
++
++	buf = kzalloc(MAX_PROC_SIZE + 1, GFP_KERNEL);
+ 	if (!buf) {
+ 		return -ENOMEM;
+ 	}
+ 	pfree = buf;
+-	count = *lenp;
+-	if (count > MAX_PROC_SIZE) {
+-		count = MAX_PROC_SIZE;
+-	}
+-
+-	if (copy_from_user(buf, buffer, count)) {
+-		kfree(pfree);
+-		return -EFAULT;
+-	}
++	/* Keep a terminator even for a full MAX_PROC_SIZE kernel input. */
++	memcpy(buf, buffer, count);
+ 
+ 	while (buf) {
+ 		char *param, *value;
+@@ -288,7 +290,7 @@
+ 	__attribute__((__fallthrough__));
+ #endif
+ 	case NSS_TUNIPIP6_SYSCTL_ADD_MAPRULE:
+-		if (!(rule_type_valid && ipv6_prefix_valid && ipv6_prefix_len_valid && ipv6_suffix_valid &&
++		if (!(rule_type_valid && ipv6_prefix_valid && ipv6_prefix_len_valid && ipv6_suffix_valid && ipv6_suffix_len_valid &&
+ 			ipv4_prefix_valid && ipv4_prefix_len_valid && ea_len_valid &&
+ 			psid_offset_valid)) {
+ 			goto fail;

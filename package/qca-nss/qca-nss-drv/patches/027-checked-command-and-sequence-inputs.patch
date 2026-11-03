@@ -1,0 +1,96 @@
+From: AX6 NSS input repair
+Subject: [PATCH] Parse bounded kernel commands and guard sequence searches
+
+--- a/nss_hal/nss_hal.c
++++ b/nss_hal/nss_hal.c
+@@ -72,6 +72,10 @@
+ 				      const unsigned char *sequence,
+ 				      size_t sequence_size)
+ {
++	if (!buffer || !sequence || !sequence_size || sequence_size > buffer_size) {
++		return NULL;
++	}
++
+ 	for (size_t i = 0; i <= buffer_size - sequence_size; i++) {
+ 		if (memcmp(buffer + i, sequence, sequence_size) == 0) {
+ 			return (unsigned char *)(buffer + i);
+--- a/nss_ppe_vp.c
++++ b/nss_ppe_vp.c
+@@ -225,7 +225,19 @@
+ 	struct nss_ctx_instance *nss_ctx = nss_ppe_vp_get_context();
+ 	char *pos;
+ 	char cmd_buf[NSS_PPE_VP_MAX_CMD_STR] = {0}, dev_name[NSS_PPE_VP_MAX_CMD_STR] = {0};
+-	int ret = proc_dostring(ctl, write, buffer, lenp, ppos);
++	size_t count = *lenp;
++	int ret;
++
++	if (write && *ppos) {
++		return -EINVAL;
++	}
++	if (write && (!count || count >= sizeof(cmd_buf))) {
++		return -E2BIG;
++	}
++	ret = proc_dostring(ctl, write, buffer, lenp, ppos);
++	if (ret) {
++		return ret;
++	}
+ 
+ 	if (!write) {
+ 		nss_ppe_vp_proc_help();
+@@ -239,12 +251,17 @@
+ 
+ 	NSS_VERIFY_CTX_MAGIC(nss_ctx);
+ 
+-	/* proc_dostring has already copied the data to nss_ppe_vp_cmd */
++	/* The sysctl kernel buffer belongs to this request; ctl->data is shared. */
++	memcpy(cmd_buf, buffer, count);
+ 	if ((pos = strrchr(cmd_buf, '\n')) != NULL) {
+ 		*pos = '\0';
+ 	}
+ 
+-	if (sscanf(cmd_buf, "%s %u", dev_name, &dynamic_if_type) < 0) {
++	pos = strim(cmd_buf);
++	if (strscpy(dev_name, strsep(&pos, " \t"), IFNAMSIZ) < 0 || !dev_name[0]) {
++		return -EINVAL;
++	}
++	if (pos && *strim(pos) && kstrtou32(strim(pos), 10, &dynamic_if_type)) {
+ 		nss_warning("%px: PPE VP command parse failed", nss_ctx);
+ 		return -EFAULT;
+ 	}
+@@ -256,7 +273,7 @@
+ 	}
+ 
+ 	nss_info("%px: Dynamic interface type: %u", nss_ctx, dynamic_if_type);
+-	if ((dynamic_if_type < NSS_DYNAMIC_INTERFACE_TYPE_NONE) || (dynamic_if_type >= NSS_DYNAMIC_INTERFACE_TYPE_MAX)) {
++	if (dynamic_if_type >= NSS_DYNAMIC_INTERFACE_TYPE_MAX) {
+ 		nss_warning("%px: Invalid dynamic interface type: %d", nss_ctx, dynamic_if_type);
+ 		dev_put(dev);
+ 		return -EFAULT;
+@@ -698,9 +715,12 @@
+ 	NSS_VERIFY_CTX_MAGIC(nss_ctx);
+ 
+ 	if_num = nss_ppe_vp_parse_vp_cmd(ctl, write, buffer, lenp, ppos);
++	if (!write) {
++		return if_num;
++	}
+ 	if (if_num < 0) {
+ 		nss_warning("%px: Invalid interface number: %d", nss_ctx, if_num);
+-		return -EFAULT;
++		return if_num;
+ 	}
+ 
+ 	if (nss_ppe_vp_get_ppe_port_by_nssif(nss_ctx, if_num) < 0) {
+@@ -735,9 +755,12 @@
+ 	NSS_VERIFY_CTX_MAGIC(nss_ctx);
+ 
+ 	if_num = nss_ppe_vp_parse_vp_cmd(ctl, write, buffer, lenp, ppos);
++	if (!write) {
++		return if_num;
++	}
+ 	if (if_num < 0) {
+ 		nss_warning("%px: Invalid interface number: %d", nss_ctx, if_num);
+-		return -EFAULT;
++		return if_num;
+ 	}
+ 
+ 	nss_info("%px: NSS interface number: %d", nss_ctx, if_num);
