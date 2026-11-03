@@ -52,7 +52,7 @@ not reclassify the old UK witness: UK/cohort remains KNOWN_OPEN_NOT_REPAIRED.
 Compile failures, timeouts, signals and sanitizer failures earn no semantic
 credit. Exact ordered stdout is independent of C output. Result pollution
 controls and sanitizer activation canaries are reported separately.
-LeakSanitizer is disabled (unsupported by this Apple runtime); no LSan/leak
+LeakSanitizer is disabled by test policy (the Apple runtime lacks support); no LSan/leak
 qualification is claimed. Explicit modeled ownership/free counters remain
 active. Borrowed heap test storage is released only by fixture module teardown,
 after fixture publications are dropped, never by the SDK under test.
@@ -70,6 +70,30 @@ are checked at the end. This runner does not change recipe, CI, old tests or git
 The short getter lock intentionally shares the writer arbitration protocol;
 no performance benchmark or complete raw-reader-drain claim is made. An
 acquire/release-only getter is not part of this patch.
+
+The formal C campaign still uses -fsanitize=address,undefined with recovery
+disabled. Activation probes run before the campaign and use address-only and
+undefined-only instrumentation respectively. In the failed Linux GCC11 cloud
+run41567115773, the old dual-instrumented heap probe stopped in UBSan's
+object-size check, before the expected ASan diagnostic. An exit97 alone is not
+ASan activation. Each isolated probe now requires the exact sanitizer identity,
+directed fault and exit97/98, empty stdout, and no competing diagnostic.
+This is a test repair, not a production PHY or driver change. The old cloud
+failure remains INCOMPLETE; this does not retroactively qualify that run.
+
+The independent test-ssdk-phy-sanitizer-canaries.py runs both real probes,
+two probes compiled without instrumentation, two crossed-identity controls and
+24 synthetic result-pollution controls. Disabled probes may crash and are only
+fail-closed activation controls, never SDK semantic-mutant credit. No program
+from an archived artifact is run. Example:
+
+```sh
+python3 -B tests/test-ssdk-phy-sanitizer-canaries.py --cc /usr/bin/clang --output /absolute/fresh-canary-controls
+```
+
+No Linux GCC11 qualification follows from a macOS GCC/Clang run. The fixed
+build/source admission profile must be reviewed separately before another
+cloud dispatch; changing this runner does not refresh that profile or a lock.
 
 No full unload/reader drain, borrowed provider/code pin, PHY attachment, MDIO,
 global UK/SD ownership, root-fatal unwind, hardware/FW or device approval follows.
