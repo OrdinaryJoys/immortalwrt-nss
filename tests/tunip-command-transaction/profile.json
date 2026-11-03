@@ -1,0 +1,17 @@
+{
+  "pin": "51be82d43ef85079f78aa163d014223b05baa6a2",
+  "archive_sha256": "c7403345ef0fb2bb89ab517a43a311e3f24bc63d7889e1c5913559566733b137",
+  "baseline_inventory_sha256": "eca9bd5f9f893e6d817a456e54a054ddb774e1d30d1bec55347e7912c55c61d1",
+  "candidate_inventory_sha256": "b97dff12f0c552f0e4278bd3f945334c468a03f893116303f776c588f60165fc",
+  "patch_sha256": "c053acb88b89a191828c7fc0572b5c1bc550d3478d636993f17873b7a81aaef6",
+  "recipe_without_release_sha256": "0c3762c59e623e50435b02ba43d022992d712c6f7030be82600a52addb1acc07",
+  "allowed_releases": [
+    "30"
+  ],
+  "helper_inputs": {
+    "tests/nss-dp-containment/extract_prepared_c.py": "7ce823535edbce4205e992a37a9fe93c88627026149459ace1b99567f8707614",
+    "tests/edma_patch_context.py": "1f4e7c6cede52ca6c3d76a807e79e593aa4fb0c764172a16e69f73ee1f054e32",
+    "include/package-defaults.mk": "cdb9a02ff1f3fe6e867fb9dcdc109ee93632b72be92e02e7b70f542e400ff710",
+    "include/package.mk": "adca9e09c7bbbb140dce31e454934299b77a8cd62530c60ac932ded0218a8ac9"
+  }
+}

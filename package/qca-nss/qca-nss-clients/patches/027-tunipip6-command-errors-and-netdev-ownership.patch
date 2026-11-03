@@ -1,0 +1,260 @@
+From: AX6 tunip command repair
+Subject: [PATCH] Balance per-command netdev holds and report command failures
+
+--- a/tunipip6/nss_connmgr_tunipip6_sysctl.c
++++ b/tunipip6/nss_connmgr_tunipip6_sysctl.c
+@@ -29,6 +29,7 @@
+ #include <linux/if_arp.h>
+ #include <nss_api_if.h>
+ #include <linux/sysctl.h>
++#include <linux/errno.h>
+ #include <linux/string.h>
+ #include <linux/printk.h>
+ #include <linux/inet.h>
+@@ -53,11 +54,28 @@
+ };
+ 
+ 
++/* Translate client status, not its positive enum value, to sysctl errno. */
++static int nss_tunipip6_sysctl_errno(enum nss_connmgr_tunipip6_err_codes status)
++{
++	switch (status) {
++	case NSS_CONNMGR_TUNIPIP6_SUCCESS:
++		return 0;
++	case NSS_CONNMGR_TUNIPIP6_INVALID_PARAM:
++	case NSS_CONNMGR_TUNIPIP6_INVALID_RULE_TYPE:
++		return -EINVAL;
++	case NSS_CONNMGR_TUNIPIP6_NO_DEV:
++		return -ENODEV;
++	default:
++		return -EIO;
++	}
++}
++
+ static int nss_tunipip6_data_parser(const struct ctl_table *ctl, int write, void __user *buffer, size_t *lenp, loff_t *ppos, enum nss_tunipip6_sysctl_mode mode)
+ {
+ 	char dev_name[NETDEV_STR_LEN] = {0}, ipv6_prefix_str[PREFIX_STR_LEN] = {0}, ipv6_suffix_str[PREFIX_STR_LEN] = {0}, ipv4_prefix_str[PREFIX_STR_LEN] = {0};
+ 	uint32_t ipv6_prefix[4], ipv6_prefix_len, ipv6_suffix[4], ipv6_suffix_len, ipv4_prefix, ipv4_prefix_len, ea_len, psid_offset;
+ 	int rule_type = 0, frag_id = 0;
++	bool frag_id_valid = false;
+ 	bool ipv6_prefix_valid = false, ipv6_prefix_len_valid = false, ipv6_suffix_valid = false;
+ 	bool ipv4_prefix_valid = false, ipv4_prefix_len_valid = false, ipv6_suffix_len_valid = false;
+ 	bool rule_type_valid = false, ea_len_valid = false, psid_offset_valid = false, netdev_valid = false;
+@@ -68,15 +86,17 @@
+ 	char *pfree;
+ 	char *token;
+ 	int ret;
+-	size_t count = *lenp;
++	int error = -EINVAL;
++	size_t count;
+ 
+ 	/* This write-only parser uses the request, not ctl storage or offsets. */
+ 	(void)ctl;
+ 	(void)ppos;
+ 
+-        if (!write) {
+-                return -EINVAL;
+-        }
++	if (!write || !buffer || !lenp) {
++		return -EINVAL;
++	}
++	count = *lenp;
+ 
+ 	if (!count || count > MAX_PROC_SIZE) {
+ 		return -E2BIG;
+@@ -101,7 +121,6 @@
+ 		value = token;
+ 
+ 		if (!value || !param) {
+-			kfree(pfree);
+ 			goto fail;
+ 		}
+ 
+@@ -110,25 +129,29 @@
+ 		 */
+ 
+ 		if (!strcmp(param, "netdev")) {
++			struct net_device *next_dev;
++
+ 			strscpy(dev_name, value, 30);
+-			dev = dev_get_by_name(&init_net, dev_name);
+-			if (!dev) {
+-				kfree(pfree);
+-				goto fail;
+-			}
++			next_dev = dev_get_by_name(&init_net, dev_name);
++			if (!next_dev) {
++				error = -ENODEV;
++				goto fail;
++			}
++			if (dev) {
++				dev_put(dev);
++			}
++			dev = next_dev;
+ 			netdev_valid = true;
+ 			continue;
+ 		}
+ 
+ 		if (!strcmp(param, "rule_type")) {
+ 			if (!sscanf(value, "%u", &rule_type)) {
+-				kfree(pfree);
+ 				goto fail;
+ 			}
+ 
+ 			if ((rule_type !=NSS_CONNMGR_TUNIPIP6_RULE_BMR) &&
+ 				       (rule_type != NSS_CONNMGR_TUNIPIP6_RULE_FMR)) {
+-				kfree(pfree);
+ 				goto fail;
+ 			}
+ 			rule_type_valid = true;
+@@ -137,14 +160,13 @@
+ 
+ 		if (!strcmp(param, "frag_id_update")) {
+ 			if (!sscanf(value, "%u", &frag_id)) {
+-				kfree(pfree);
+ 				goto fail;
+ 			}
+ 
+ 			if (frag_id != 0 && frag_id != 1) {
+-				kfree(pfree);
+-				goto fail;
+-			}
++				goto fail;
++			}
++			frag_id_valid = true;
+ 			continue;
+ 		}
+ 
+@@ -152,7 +174,6 @@
+ 			strscpy(ipv4_prefix_str, value, 30);
+ 			ret = in4_pton(ipv4_prefix_str, -1, (uint8_t *)&ipv4_prefix, -1, NULL);
+ 			if (ret != 1) {
+-				kfree(pfree);
+ 				goto fail;
+ 			}
+ 			ipv4_prefix_valid = true;
+@@ -161,12 +182,10 @@
+ 
+ 		if (!strcmp(param, "ipv4_prefix_len")) {
+ 			if (!sscanf(value, "%u", &ipv4_prefix_len)) {
+-				kfree(pfree);
+ 				goto fail;
+ 			}
+ 
+ 			if (ipv4_prefix_len > MAX_IPV4_PREFIX_LEN) {
+-				kfree(pfree);
+ 				goto fail;
+ 			}
+ 
+@@ -178,7 +197,6 @@
+ 			strscpy(ipv6_prefix_str, value, 100);
+ 			ret = in6_pton(ipv6_prefix_str, -1, (uint8_t *)&ipv6_prefix, -1, NULL);
+ 			if (ret != 1) {
+-				kfree(pfree);
+ 				goto fail;
+ 			}
+ 			ipv6_prefix_valid = true;
+@@ -187,12 +205,10 @@
+ 
+ 		if (!strcmp(param, "ipv6_prefix_len")) {
+ 			if (!sscanf(value, "%u", &ipv6_prefix_len)) {
+-				kfree(pfree);
+ 				goto fail;
+ 			}
+ 
+ 			if (ipv6_prefix_len > MAX_IPV6_PREFIX_LEN) {
+-				kfree(pfree);
+ 				goto fail;
+ 			}
+ 
+@@ -204,7 +220,6 @@
+ 			strscpy(ipv6_suffix_str, value, 100);
+ 			ret = in6_pton(ipv6_suffix_str, -1, (uint8_t *)&ipv6_suffix, -1, NULL);
+ 			if (ret != 1) {
+-				kfree(pfree);
+ 				goto fail;
+ 			}
+ 			ipv6_suffix_valid = true;
+@@ -213,12 +228,10 @@
+ 
+ 		if (!strcmp(param, "ipv6_suffix_len")) {
+ 			if (!sscanf(value, "%u", &ipv6_suffix_len)) {
+-				kfree(pfree);
+ 				goto fail;
+ 			}
+ 
+ 			if (ipv6_suffix_len > MAX_IPV6_PREFIX_LEN) {
+-				kfree(pfree);
+ 				goto fail;
+ 			}
+ 
+@@ -228,7 +241,6 @@
+ 
+ 		if (!strcmp(param, "ea_len")) {
+ 			if (!sscanf(value, "%u", &ea_len)) {
+-				kfree(pfree);
+ 				goto fail;
+ 			}
+ 
+@@ -238,12 +250,10 @@
+ 
+ 		if (!strcmp(param, "psid_offset")) {
+ 			if (!sscanf(value, "%u", &psid_offset)) {
+-				kfree(pfree);
+ 				goto fail;
+ 			}
+ 
+ 			if (psid_offset> MAX_PSID_OFFSET_LEN) {
+-				kfree(pfree);
+ 				goto fail;
+ 			}
+ 
+@@ -253,6 +263,7 @@
+ 	}
+ 
+ 	kfree(pfree);
++	pfree = NULL;
+ 
+ 	/*
+ 	 * Netdev param is not needed only for frag_id command
+@@ -342,7 +353,7 @@
+ 		break;
+ 
+ 	case NSS_TUNIPIP6_SYSCTL_FRAG_ID:
+-		if ((netdev_valid || rule_type_valid || ipv6_prefix_valid || ipv6_prefix_len_valid || ipv6_suffix_valid ||
++		if (!frag_id_valid || (netdev_valid || rule_type_valid || ipv6_prefix_valid || ipv6_prefix_len_valid || ipv6_suffix_valid ||
+ 				ipv4_prefix_valid || ipv4_prefix_len_valid || ea_len_valid ||
+ 				psid_offset_valid)) {
+ 				goto fail;
+@@ -355,19 +366,23 @@
+ 			frag_id_update = false;
+ 			pr_info("Frag Id disabled for all tunnels.\n");
+ 		}
+-		return 0;
+-	}
+-
+-	dev_put(dev);
+-	return 0;
++		error = 0;
++		goto out;
++	default:
++		goto fail;
++	}
++
++	error = nss_tunipip6_sysctl_errno(status);
++	goto out;
+ 
+ fail:
++	pr_info("Wrong input, check help. (cat /proc/sys/dev/nss/ipip6/help)\n");
++out:
+ 	if (dev) {
+ 		dev_put(dev);
+ 	}
+-
+-	pr_info("Wrong input, check help. (cat /proc/sys/dev/nss/ipip6/help)\n");
+-	return 0;
++	kfree(pfree);
++	return error;
+ }
+ 
+ static int nss_tunipip6_cmd_procfs_add_maprule(const struct ctl_table *ctl, int write, void __user *buffer, size_t *lenp, loff_t *ppos)
