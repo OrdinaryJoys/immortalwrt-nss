@@ -1,0 +1,44 @@
+From: AX6 lifecycle audit <ax6-audit@localhost>
+Subject: [PATCH] ssdk: exclude unconnected external switch consumers
+
+An empty global external-switch table has zero-valued device and port
+fields. Do not return an unconnected slot as device/port zero, or let a
+stale unconnected slot hide a later connected match. The netdev publisher
+must apply the same admission before acquiring an external-slot reference.
+Keep primary PHY cache registration, indexed access and retirement sweeps
+unchanged; this is not a reader lease or a complete metadata transaction.
+
+--- a/src/init/ssdk_dts.c
++++ b/src/init/ssdk_dts.c
+@@ -336,7 +336,8 @@ ssdk_netdev_switch_t *ssdk_dts_netdev_switch_find(a_uint32_t port_id)
+ 	a_uint32_t index = 0;
+ 
+ 	for(index = 0; index < SSDK_NETDEV_SWITCH_NUM; index++) {
+-		if(ssdk_dt_global.netdev_switch[index].switch_netdev_port == port_id)
++		if(ssdk_dt_global.netdev_switch[index].switch_connected &&
++			ssdk_dt_global.netdev_switch[index].switch_netdev_port == port_id)
+ 			return &ssdk_dt_global.netdev_switch[index];
+ 	}
+ 
+@@ -357,7 +358,8 @@ ssdk_dts_netdev_switch_find_by_devid(a_uint32_t dev_id)
+ 	a_uint32_t index = 0;
+ 
+ 	for(index = 0; index < SSDK_NETDEV_SWITCH_NUM; index++) {
+-		if(ssdk_dt_global.netdev_switch[index].switch_dev_id == dev_id)
++		if(ssdk_dt_global.netdev_switch[index].switch_connected &&
++			ssdk_dt_global.netdev_switch[index].switch_dev_id == dev_id)
+ 			return &ssdk_dt_global.netdev_switch[index];
+ 	}
+ 
+--- a/src/init/ssdk_plat.c
++++ b/src/init/ssdk_plat.c
+@@ -1725,7 +1725,8 @@ sw_error_t ssdk_netdev_switch_init(struct net_device *dev)
+ 	ret = SW_NOT_FOUND;
+ 	for (p = 0; p < SSDK_NETDEV_SWITCH_NUM; p++) {
+ 		sw = ssdk_dts_netdev_switch_get(p);
+-		if (sw->switch_netdev_port != port_id)
++		if (!sw->switch_connected ||
++			sw->switch_netdev_port != port_id)
+ 			continue;
+ 		if (sw->dev != dev) {
+ 			dev_hold(dev);
