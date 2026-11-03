@@ -37,3 +37,20 @@ Blocked from this patch: live unregister/replace/free, full bare-reader leases,
 metadata retirement, foreign provider module lifetime, full root-init rollback,
 global sharedUK/SD cleanup and router/target acceptance. In particular no new
 global final-free or last-device refcount is inferred from discovery bitmaps.
+
+## Host activation correction after run41567115773
+
+The cloud failure was a test-probe assumption, not evidence of a target PHY
+fault: the dual-sanitized heap probe first raised GCC11 UBSan object-size,
+not the required ASan heap diagnostic. Its status stays INCOMPLETE. The runner
+isolates address and undefined probes while the real-source campaign retains
+both sanitizers, precise semantic negative oracles, all four profiles and the
+fixed 68/80/8 obligations. Probe identity and exit97/98 are checked together;
+disabled and crossed-identity controls earn no SDK mutation coverage.
+
+The separate native canary regression records actual compiles/runs and result
+pollution controls. Current local validation does not replace Linux GCC11,
+target-toolchain, final firmware or runtime acceptance. No production patch,
+recipe, vendor pin, build lock or performance setting is changed by this test
+correction. The next candidate's newer I2C/TUNIP production changes require
+their own reviewed CI admission and may not silently use the old37 profile.

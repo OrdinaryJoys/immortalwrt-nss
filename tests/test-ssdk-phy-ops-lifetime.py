@@ -30,6 +30,55 @@ MUTANT_NAMES = ('overwrite-foreign', 'same-object-not-idempotent', 'unregister-m
                 'getter-without-lock', 'prepare-without-lock', 'unregister-without-lock',
                 'getter-rejects-last-port', 'ignore-registration-error', 'discard-hw-error',
                 'failed-once-latch', 'wrong-field-mapping')
+BASE_FLAGS = ('-std=gnu11', '-O1', '-g', '-pthread', '-Wall', '-Wextra', '-Werror',
+              '-Wno-unused-parameter', '-DIN_AQUANTIA_PHY')
+CANARY_PROGRAMS = {
+    'asan': '#include <stdlib.h>\nint main(void){volatile int i=2;volatile int *p=malloc(sizeof(int));p[i]=1;free((void*)p);return 0;}\n',
+    'ubsan': '#include <limits.h>\nint main(void){volatile int n=INT_MAX;volatile int r=n+1;(void)r;return 0;}\n',
+}
+
+
+def host_flags(sanitizers):
+    source.require(sanitizers in (None, 'address', 'undefined', 'address,undefined'),
+                   'known host instrumentation')
+    flags = list(BASE_FLAGS)
+    if sanitizers:
+        flags += ['-fsanitize=' + sanitizers, '-fno-sanitize-recover=all', '-fno-omit-frame-pointer']
+    return flags
+
+
+def sanitizer_result(record, kind):
+    source.require(kind in CANARY_PROGRAMS, 'known sanitizer canary')
+    if (type(record['returncode']) is not int or record['returncode'] != {'asan': 97, 'ubsan': 98}[kind]
+            or record['stdout'] != '' or not isinstance(record['stderr'], str)):
+        return False
+    diagnostic = record['stderr']
+    if kind == 'asan':
+        return ('ERROR: AddressSanitizer: heap-buffer-overflow' in diagnostic and
+                'WRITE of size 4' in diagnostic and 'runtime error:' not in diagnostic and
+                'DEADLYSIGNAL' not in diagnostic)
+    return ('runtime error: signed integer overflow:' in diagnostic and
+            '2147483647 + 1' in diagnostic and 'AddressSanitizer' not in diagnostic)
+
+
+def sanitizer_oracle_controls():
+    examples = {
+        'asan': dict(returncode=97, stdout='', stderr='ERROR: AddressSanitizer: heap-buffer-overflow\nWRITE of size 4\n'),
+        'ubsan': dict(returncode=98, stdout='', stderr='runtime error: signed integer overflow: 2147483647 + 1\n'),
+    }
+    controls = []
+    for kind, good in examples.items():
+        source.require(sanitizer_result(good, kind), 'valid sanitizer oracle ' + kind)
+        for key, value in [('returncode', 0), ('returncode', 1), ('returncode', -6),
+                           ('returncode', 86), ('returncode', True), ('returncode', str(good['returncode'])),
+                           ('returncode', 'timeout'), ('stdout', 'noise\n'), ('stderr', ''),
+                           ('stderr', 'runtime error: unrelated\n'),
+                           ('stderr', 'AddressSanitizer: DEADLYSIGNAL\n'),
+                           ('stderr', examples['ubsan' if kind == 'asan' else 'asan']['stderr'])]:
+            row = dict(good); row[key] = value
+            source.require(not sanitizer_result(row, kind), 'polluted sanitizer oracle ' + kind)
+            controls.append(dict(kind=kind, field=key, value=value))
+    return dict(valid=2, rejected_pollution=len(controls), controls=controls)
 
 
 def semantic(record, marker):
@@ -78,6 +127,32 @@ def invoke(command, out, label, env=None):
     (out / (label + '.stderr')).write_text(row['stderr'])
     (out / (label + '.json')).write_text(json.dumps(row, indent=2) + '\n')
     return row
+
+
+def compile_program(cc, out, label, c, profile, sanitizers):
+    path = out / (label + '.c'); binary = out / (label + '.host'); path.write_text(c)
+    record = invoke([cc, *host_flags(sanitizers), *PROFILES[profile], path, '-o', binary],
+                    out, label + '.compile')
+    source.require(record['returncode'] == 0 and not record['stdout'] and not record['stderr'],
+                   'clean compile required: ' + label)
+    return binary, {'generated_c_sha256': source.sha(c.encode()),
+                    'binary_sha256': source.sha(binary.read_bytes()), 'compile': record}
+
+
+def verify_sanitizer_canaries(cc, out, env):
+    rows = {}
+    for kind, sanitizers, code in [('asan', 'address', 97), ('ubsan', 'undefined', 98)]:
+        # A combined canary may stop in UBSan before ASan sees the same access.
+        binary, record = compile_program(cc, out, 'canary-' + kind,
+                                         CANARY_PROGRAMS[kind], 'full', sanitizers)
+        canary_env = dict(env, ASAN_OPTIONS=f'detect_leaks=0:halt_on_error=1:abort_on_error=0:exitcode={code}',
+                          UBSAN_OPTIONS=f'halt_on_error=1:abort_on_error=0:exitcode={code}')
+        run = invoke([binary], out, 'canary-' + kind + '.run', canary_env)
+        source.require(sanitizer_result(run, kind), 'precise sanitizer activation ' + kind)
+        rows[kind] = dict(instrumentation=sanitizers,
+                          environment={k: canary_env[k] for k in ('ASAN_OPTIONS', 'UBSAN_OPTIONS')},
+                          run=run, **record)
+    return rows
 
 
 def metadata_controls(out):
@@ -130,6 +205,7 @@ def main():
     report = {'status': 'INCOMPLETE', 'scope': 'ACTUAL_FUNCTIONS_HOST_SUBSTITUTES_ONLY',
               'target_kernel_runtime_approved': False, 'profiles': PROFILES,
               'expected_case_names': CASES, 'oracle_controls': oracle_controls(),
+              'sanitizer_oracle_controls': sanitizer_oracle_controls(),
               'positives': [], 'negatives': [], 'old_counterexamples': [],
               'remaining_open': ['UK shared endpoint cohort', 'metadata concurrent retirement',
                                  'borrowed provider/code lifetime', 'raw getter reader drain',
@@ -137,14 +213,15 @@ def main():
     source.require({p.name for p in SUPPORT.iterdir()} ==
                    {'source.py', 'mutations.py', 'fixture.c', 'README.md'}, 'complete support inventory')
     assets = [Path(__file__), source.PATCH, source.EXTRACTOR, source.CONTEXT,
+              source.REPO / 'tests/test-ssdk-phy-sanitizer-canaries.py',
               source.REPO / 'tests/SSDK_PHY_OPS_LIFETIME_2026-11-03.md', *sorted(SUPPORT.glob('*'))]
-    assets = [p for p in assets if p.is_file()]
+    source.require(all(p.is_file() for p in assets), 'complete runner input assets')
     inputs = {str(p): source.sha(p.read_bytes()) for p in assets}
     report['inputs'] = inputs
     env = dict(os.environ, ASAN_OPTIONS='detect_leaks=0:halt_on_error=1:abort_on_error=0:exitcode=97',
                UBSAN_OPTIONS='halt_on_error=1:abort_on_error=0:print_stacktrace=1:exitcode=97')
     report['runtime_environment'] = {k: env[k] for k in ('ASAN_OPTIONS', 'UBSAN_OPTIONS')}
-    report['leak_sanitizer'] = 'NOT_ENABLED_APPLE_RUNTIME_UNSUPPORTED; no leak-detector qualification'
+    report['leak_sanitizer'] = 'DISABLED_BY_TEST_POLICY; no leak-detector qualification'
     report['python_optimize'] = sys.flags.optimize
     def save():
         (out / 'RESULTS.json').write_text(json.dumps(report, indent=2) + '\n')
@@ -183,17 +260,11 @@ def main():
         report['mapping'] = [{'field': f, 'function': n, 'mini_excluded': m} for f, n, m in data['pairs']]
         report['functions'] = {n: source.sha(c.encode()) for n, c in data['funcs'].items()}
         report['compiler'] = invoke([a.cc, '--version'], out, 'compiler')
-        flags = ['-std=gnu11', '-O1', '-g', '-pthread', '-Wall', '-Wextra', '-Werror',
-                 '-Wno-unused-parameter', '-DIN_AQUANTIA_PHY']
+        sanitizers = 'address,undefined' if a.sanitize else None
         if a.sanitize:
-            flags += ['-fsanitize=address,undefined', '-fno-sanitize-recover=all', '-fno-omit-frame-pointer']
+            report['canaries'] = verify_sanitizer_canaries(a.cc, out, env)
         def build(label, c, profile):
-            path = out / (label + '.c'); binary = out / (label + '.host'); path.write_text(c)
-            record = invoke([a.cc, *flags, *PROFILES[profile], path, '-o', binary], out, label + '.compile')
-            source.require(record['returncode'] == 0 and not record['stdout'] and not record['stderr'],
-                           'clean compile required: ' + label)
-            return binary, {'generated_c_sha256': source.sha(c.encode()),
-                            'binary_sha256': source.sha(binary.read_bytes()), 'compile': record}
+            return compile_program(a.cc, out, label, c, profile, sanitizers)
         for profile in PROFILES:
             label = profile + '-positive'
             binary, record = build(label, source.program(data), profile)
@@ -224,20 +295,6 @@ def main():
                 report['old_counterexamples'].append(dict(profile=profile, case=case,
                                                          marker='ops-not-owned', run=run, **record))
             save()
-        if a.sanitize:
-            report['canaries'] = {}
-            for kind, c, code, marker in [
-                ('asan', '#include <stdlib.h>\nint main(void){volatile int i=2;volatile int *p=malloc(sizeof(int));p[i]=1;free((void*)p);return 0;}\n', 97, 'AddressSanitizer'),
-                ('ubsan', 'int main(void){volatile unsigned i=32;return 1U<<i;}\n', 98, 'runtime error:')]:
-                binary, record = build('canary-' + kind, c, 'full')
-                canary_env = dict(env, ASAN_OPTIONS=f'detect_leaks=0:halt_on_error=1:abort_on_error=0:exitcode={code}',
-                                  UBSAN_OPTIONS=f'halt_on_error=1:abort_on_error=0:exitcode={code}')
-                run = invoke([binary], out, 'canary-' + kind + '.run', canary_env)
-                source.require(run['returncode'] == code and not run['stdout'] and marker in run['stderr'],
-                               'precise sanitizer activation ' + kind)
-                report['canaries'][kind] = dict(
-                    environment={k: canary_env[k] for k in ('ASAN_OPTIONS', 'UBSAN_OPTIONS')},
-                    run=run, **record)
         source.require(source.inventory(a.baseline.resolve()) == before, 'baseline end stability')
         source.require(source.inventory(candidate) == report['candidate_files'], 'candidate end stability')
         source.require(source.check_prepared(prepared, actual) == (actual, metadata),
