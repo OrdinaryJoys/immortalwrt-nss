@@ -85,7 +85,7 @@ Invalid device cleanup cannot stop global controls. No reader drain implied.
  /*qca808x_start*/
 --- a/src/sal/sd/sd.c
 +++ b/src/sal/sd/sd.c
-@@ -339,8 +339,62 @@
+@@ -339,8 +339,64 @@
  
  /*qca808x_start*/
  sw_error_t
@@ -111,6 +111,7 @@ Invalid device cleanup cannot stop global controls. No reader drain implied.
 +    if (cfg->reg_func.i2c_get && ssdk_i2c_get &&
 +        cfg->reg_func.i2c_get != ssdk_i2c_get)
 +        return SW_BUSY;
++/*qca808x_end*/
 +    if (cfg->reg_func.header_reg_set && ssdk_hdr_reg_set &&
 +        cfg->reg_func.header_reg_set != ssdk_hdr_reg_set)
 +        return SW_BUSY;
@@ -136,6 +137,7 @@ Invalid device cleanup cannot stop global controls. No reader drain implied.
 +        cfg->reg_func.mii_reg_get != ssdk_mii_reg_get)
 +        return SW_BUSY;
 +
++/*qca808x_start*/
 +    return SW_OK;
 +}
 +

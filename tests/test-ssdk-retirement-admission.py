@@ -159,6 +159,29 @@ def typedef(text, name):
     return found[0]
 
 
+def qca808x_fields(tree):
+    def region(text):
+        keep, chunks = False, []
+        for line in text.splitlines(True):
+            if '/*qca808x_start*/' in line:
+                need(not keep, 'nested SDK export marker'); keep = True
+            elif '/*qca808x_end*/' in line:
+                need(keep, 'unpaired SDK export marker'); keep = False
+            elif keep:
+                chunks.append(line)
+        need(not keep, 'unterminated SDK export marker')
+        return ''.join(chunks)
+    header = region((tree / 'include/init/ssdk_init.h').read_text())
+    sd = region((tree / 'src/sal/sd/sd.c').read_text())
+    fields = set(re.findall(r'\b\w+\s+(\w+)\s*;', typedef(header, 'hsl_reg_func')))
+    need(fields == {'mdio_set', 'mdio_get', 'i2c_set', 'i2c_get'}, 'real SDK4 exported fields')
+    for name in ('sd_init_check', 'sd_init'):
+        actual = reader.function(sd, name)
+        need(set(re.findall(r'cfg->reg_func\.(\w+)', actual)) <= fields,
+             'SDK extraction references excluded callback fields')
+    return sorted(fields)
+
+
 def render(tree, sd=None, root=None, sd_init=None, root_init=None, hsl_admit=None):
     header = (tree / 'include/init/ssdk_init.h').read_text()
     typedefs = header[header.index('    typedef sw_error_t\n    (*mdio_reg_set)'):
@@ -242,6 +265,7 @@ def main():
         tree, old, patches, expected = (from_prepared(args.baseline38, args.prepared, args.output)
             if args.prepared else prepare(args.upstream_cache, args.output))
         report.update(patches=patches, prepared_inventory=expected)
+        report['qca808x_fields'] = qca808x_fields(tree)
         # The old SDK sd_init has an unused dev_id; keep its body unchanged.
         flags = ['-std=gnu11', '-Wall', '-Wextra', '-Werror', '-Wno-unused-parameter', '-O1', '-g']
         if args.hppe:
