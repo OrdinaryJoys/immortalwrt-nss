@@ -1,0 +1,150 @@
+From: AX6 lifecycle review
+Subject: [PATCH] ssdk: reject conflicting SD publication and preserve PHY on FAL failure
+
+SD borrows callback providers: equal pointers and NULL contributions are
+compatible, but a conflicting live provider is not a replacement lease.
+Check the complete typed vector before publishing any contribution. Callers
+must still serialize initialization and keep providers alive for all readers;
+this is not a concurrent reader drain or a global UK/SD owner coordinator.
+
+If FAL cleanup refuses or fails, its dependents have not been certified as
+retired. Keep PHY metadata and driver state available for the caller's retry.
+Do not turn an error report into permission to release a lower dependency.
+The void module-exit path and the earlier FAL/UK ordering remain separate.
+
+Read-only admission is also checked before outer FAL/PHY initialization.
+Invalid device cleanup cannot stop global controls. No reader drain implied.
+
+--- a/include/sal/sd/sd.h
++++ b/include/sal/sd/sd.h
+@@ -77,6 +77,8 @@
+ 		sd_reg_mii_mdio_set(a_uint32_t dev_id, a_uint32_t reg_addr,
+ 				a_uint8_t value[], a_uint32_t value_len);
+ 	/*qca808x_start*/
++	/* Read-only admission; not a provider lease or concurrent reservation. */
++	sw_error_t sd_init_check(a_uint32_t dev_id, const ssdk_init_cfg *cfg);
+ 	sw_error_t sd_init(a_uint32_t dev_id, ssdk_init_cfg * cfg);
+ 
+ #ifdef __cplusplus
+--- a/src/hsl/hsl_dev.c
++++ b/src/hsl/hsl_dev.c
+@@ -155,10 +155,14 @@
+     sw_error_t rv;
+     hsl_api_t *api;
+ 
+-    (void)cfg; /* Used only by HPPE or combined-mode admission below. */
+     HSL_DEV_ID_CHECK(dev_id);
+     if (hsl_dev_guards[dev_id].phase != HSL_DEV_IDLE)
+         return SW_BUSY;
++    /* Reject a conflicting provider before FAL resets its API table. */
++    if (cfg) {
++        rv = sd_init_check(dev_id, cfg);
++        SW_RTN_ON_ERROR(rv);
++    }
+     if (dev_ssdk_cfg[dev_id])
+         return SW_ALREADY_EXIST;
+ #ifdef HPPE
+--- a/src/init/ssdk_init.c
++++ b/src/init/ssdk_init.c
+@@ -24,6 +24,7 @@
+ #include "hsl.h"
+ #include "hsl_dev.h"
+ #include "hsl_phy.h"
++#include "sd.h"
+ /*qca808x_end*/
+ #include "ssdk_dts.h"
+ #include "ssdk_interrupt.h"
+@@ -1597,6 +1598,9 @@
+ {
+ 	sw_error_t rv;
+ 
++	/* The legacy FAL-error path may continue into PHY initialization. */
++	rv = sd_init_check(dev_id, cfg);
++	SW_RTN_ON_ERROR(rv);
+ 	rv = fal_init(dev_id, cfg);
+ 	if (rv != SW_OK)
+ 		SSDK_ERROR("ssdk fal init failed: %d. \r\n", rv);
+@@ -1642,11 +1646,17 @@
+ {
+ 	sw_error_t rv, phy_rv;
+ 
++	/* Invalid requests must not retire every device's control producers. */
++	if (dev_id >= SW_MAX_NR_DEV)
++		return SW_BAD_PARAM;
+ 	ssdk_netdev_cache_stop();
+ 	ssdk_fdb_retire_controls();
+ 	rv = fal_cleanup(dev_id);
+-	if (rv != SW_OK)
++	if (rv != SW_OK) {
+ 		SSDK_ERROR("ssdk FAL cleanup failed for device %u: %d\n", dev_id, rv);
++		/* Failed FAL retirement does not authorize dependent PHY release. */
++		return rv;
++	}
+ /*qca808x_end*/
+ 	if(!ssdk_is_emulation(dev_id))
+ /*qca808x_start*/
+--- a/src/sal/sd/sd.c
++++ b/src/sal/sd/sd.c
+@@ -339,8 +339,62 @@
+ 
+ /*qca808x_start*/
+ sw_error_t
++sd_init_check(a_uint32_t dev_id, const ssdk_init_cfg *cfg)
++{
++    if (dev_id >= SW_MAX_NR_DEV)
++        return SW_BAD_PARAM;
++    if (!cfg)
++        return SW_BAD_PTR;
++
++    /* Borrowed providers cannot be replaced while bare readers may exist.
++     * Validate every field before publishing even a NULL-slot contribution.
++     */
++    if (cfg->reg_func.mdio_set && ssdk_mdio_set &&
++        cfg->reg_func.mdio_set != ssdk_mdio_set)
++        return SW_BUSY;
++    if (cfg->reg_func.mdio_get && ssdk_mdio_get &&
++        cfg->reg_func.mdio_get != ssdk_mdio_get)
++        return SW_BUSY;
++    if (cfg->reg_func.i2c_set && ssdk_i2c_set &&
++        cfg->reg_func.i2c_set != ssdk_i2c_set)
++        return SW_BUSY;
++    if (cfg->reg_func.i2c_get && ssdk_i2c_get &&
++        cfg->reg_func.i2c_get != ssdk_i2c_get)
++        return SW_BUSY;
++    if (cfg->reg_func.header_reg_set && ssdk_hdr_reg_set &&
++        cfg->reg_func.header_reg_set != ssdk_hdr_reg_set)
++        return SW_BUSY;
++    if (cfg->reg_func.header_reg_get && ssdk_hdr_reg_get &&
++        cfg->reg_func.header_reg_get != ssdk_hdr_reg_get)
++        return SW_BUSY;
++    if (cfg->reg_func.psgmii_reg_set && ssdk_psgmii_reg_set &&
++        cfg->reg_func.psgmii_reg_set != ssdk_psgmii_reg_set)
++        return SW_BUSY;
++    if (cfg->reg_func.psgmii_reg_get && ssdk_psgmii_reg_get &&
++        cfg->reg_func.psgmii_reg_get != ssdk_psgmii_reg_get)
++        return SW_BUSY;
++    if (cfg->reg_func.uniphy_reg_set && ssdk_uniphy_reg_set &&
++        cfg->reg_func.uniphy_reg_set != ssdk_uniphy_reg_set)
++        return SW_BUSY;
++    if (cfg->reg_func.uniphy_reg_get && ssdk_uniphy_reg_get &&
++        cfg->reg_func.uniphy_reg_get != ssdk_uniphy_reg_get)
++        return SW_BUSY;
++    if (cfg->reg_func.mii_reg_set && ssdk_mii_reg_set &&
++        cfg->reg_func.mii_reg_set != ssdk_mii_reg_set)
++        return SW_BUSY;
++    if (cfg->reg_func.mii_reg_get && ssdk_mii_reg_get &&
++        cfg->reg_func.mii_reg_get != ssdk_mii_reg_get)
++        return SW_BUSY;
++
++    return SW_OK;
++}
++
++sw_error_t
+ sd_init(a_uint32_t dev_id, ssdk_init_cfg * cfg)
+ {
++    sw_error_t rv = sd_init_check(dev_id, cfg);
++
++    SW_RTN_ON_ERROR(rv);
+     if (NULL != cfg->reg_func.mdio_set)
+     {
+         ssdk_mdio_set = cfg->reg_func.mdio_set;
