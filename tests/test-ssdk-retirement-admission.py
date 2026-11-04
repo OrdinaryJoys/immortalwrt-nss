@@ -257,13 +257,16 @@ def canary_result(code, out, err, kind):
     if kind == 'asan':
         return (b'ERROR: AddressSanitizer: heap-buffer-overflow' in err and b'WRITE of size 1' in err and
                 b'runtime error:' not in err and b'DEADLYSIGNAL' not in err)
-    return (b'runtime error: signed integer overflow:' in err and b'2147483647 + 1' in err and
+    # GCC11 may commute addition operands; the operation, values and type stay fixed.
+    return (err.count(b'runtime error:') == 1 and re.search(
+            rb"runtime error: signed integer overflow: (?:2147483647 \+ 1|1 \+ 2147483647) "
+            rb"cannot be represented in type 'int'(?:\r?\n|$)", err) is not None and
             b'AddressSanitizer' not in err)
 
 
 def sanitizer_controls(cc, output, hppe, env):
     examples = {'asan': b'ERROR: AddressSanitizer: heap-buffer-overflow\nWRITE of size 1\n',
-                'ubsan': b'runtime error: signed integer overflow: 2147483647 + 1\n'}
+                'ubsan': b"runtime error: signed integer overflow: 2147483647 + 1 cannot be represented in type 'int'\n"}
     report = {'activation': [], 'disabled': [], 'crossed': [], 'oracle_rejections': 0}
     for kind, (instrumentation, code, body) in CANARIES.items():
         need(canary_result(code, b'', examples[kind], kind), 'positive canary oracle')

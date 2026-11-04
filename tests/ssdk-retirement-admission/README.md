@@ -65,6 +65,9 @@ Activation probes use address-only and undefined-only instrumentation separately
 GCC11 otherwise diagnoses the ASan probe's object-size UB first. Exact detector
 diagnostics, disabled-instrumentation and crossed-identity controls are required.
 Formal positive/mutant programs retain combined address,undefined instrumentation.
+The overflow oracle accepts exactly INT_MAX+1 or its commuted 1+INT_MAX GCC11
+diagnostic, with signed addition, type int, exit98 and empty stdout still required.
+Wrong values, operators, types, truncated messages and mixed detectors are rejected.
 `--canaries-only --sanitize` runs bounded activation controls without SDK prepare
 or a formal campaign, suitable for an early Linux/GCC11 preflight.
 
