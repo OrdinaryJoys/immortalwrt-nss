@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Reproduce still-open ownership gaps using actual functions, not a repaired SDK.
+"""Historical pre-049 ownership witness, never current-driver qualification.
 
 The retirement substitutes record frees and endpoint shutdown; they do not free
 host storage or pretend that RCU, callers or hardware have been drained.
@@ -18,6 +18,17 @@ spec = importlib.util.spec_from_file_location(
     'dp_extract', HERE / 'nss-dp-containment/extract_prepared_c.py')
 extract = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(extract)
+
+HISTORICAL_FUNCTIONS = {
+    'hsl_phy_api_ops_get': '4438c617d2f28e8dc36c75a38f3ae0079e625b26d3bfa2f2685d481c0b1878ac',
+    'ssdk_phy_driver_cleanup': '6c3b8328d7723d979fad46dfe8fc229080f1bd5a479a82ea8e4ff52fa4bafc84',
+    'hsl_dev_cleanup_core': '5758b6f3f059a23057124b1c416b2a6a83625628bb24b94c5016d026266f0b0c',
+}
+
+
+def admit_hashes(actual):
+    if actual != HISTORICAL_FUNCTIONS:
+        raise RuntimeError('historical SSDK36/pre-049 functions required; use current PHY049/SSDK051 suites for current code')
 
 PHY = r'''
 #include <stdbool.h>
@@ -110,16 +121,23 @@ def main():
     parser.add_argument('prepared', type=Path)
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--cc', required=True)
+    parser.add_argument('--historical-pre049', action='store_true',
+                        help='Explicitly acknowledge this is a frozen historical counterexample')
     args = parser.parse_args()
-    args.output.mkdir(parents=True, exist_ok=False)
+    if not args.historical_pre049:
+        parser.error('--historical-pre049 is required; this does not test current driver ownership')
     paths = {'phy': args.prepared / 'src/hsl/phy/hsl_phy.c',
              'uk': args.prepared / 'src/hsl/hsl_dev.c'}
     raw = {key: path.read_bytes() for key, path in paths.items()}
-    phy = extract.function(raw['phy'].decode(), 'hsl_phy_api_ops_get')
-    phy += extract.function(raw['phy'].decode(), 'ssdk_phy_driver_cleanup')
-    uk = extract.function(raw['uk'].decode(), 'hsl_dev_cleanup_core')
-    report = {'status': 'KNOWN_OPEN_NOT_REPAIRED',
-              'scope': 'CONSTRUCTED_PRECONDITIONS_NOT_PROOF_OF_AX6_RUNTIME_REACHABILITY',
+    functions = {name: extract.function(raw['phy' if name != 'hsl_dev_cleanup_core' else 'uk'].decode(), name)
+                 for name in HISTORICAL_FUNCTIONS}
+    admit_hashes({name: hashlib.sha256(body.encode()).hexdigest() for name, body in functions.items()})
+    args.output.mkdir(parents=True, exist_ok=False)
+    phy = functions['hsl_phy_api_ops_get'] + functions['ssdk_phy_driver_cleanup']
+    uk = functions['hsl_dev_cleanup_core']
+    report = {'status': 'HISTORICAL_PRE049_WITNESSES_ONLY_NOT_CURRENT_FAULTS',
+              'scope': 'THREE_FROZEN_OLD_FUNCTIONS_NOT_CURRENT_SDK_OR_RUNTIME_REACHABILITY',
+              'function_contract': HISTORICAL_FUNCTIONS,
               'source_sha256': {k: hashlib.sha256(v).hexdigest() for k, v in raw.items()},
               'records': []}
     for label, source in [('phy', PHY + phy + PHY_MAIN), ('uk', UK + uk + UK_MAIN)]:

@@ -53,10 +53,20 @@ statistics checks also pass; this does not supply a shared hardware reset epoch.
 The API substitutes are models, not real RCU, RTNL, FAL, MDIO, firmware or DMA.
 Neither scenario counts nor sanitizers prove kernel concurrency or AX6 runtime.
 
+## Historical Witness Scope Correction (2026-11-05)
+
+The witness paragraph below describes pre-049 source, not current behavior.
+049 no longer frees borrowed global PHY ops during per-device cleanup. The
+legacy witness now requires `--historical-pre049` and the exact three frozen
+SSDK36 function hashes; current source is rejected before host compilation.
+Use the current PHY049 and retirement-admission051 suites for current behavior.
+Provider/module and raw metadata-reader lifetime remain open; the old global
+ops free is not evidence that this same free still exists after049.
+
 ## Open Shared-Resource Contract
 
-`witness-ssdk-shared-ownership.py` executes real cleanup/getter functions and
-explicitly reports KNOWN_OPEN_NOT_REPAIRED, not PASS for the SDK. It reproduces:
+`witness-ssdk-shared-ownership.py` executes three frozen pre-049 functions and
+reports HISTORICAL_PRE049_WITNESSES_ONLY_NOT_CURRENT_FAULTS. Historically:
 
 - PHY cleanup for one device retires a global ops table still used by another,
   including a case where the retiring device has no bitmap ownership. A retained

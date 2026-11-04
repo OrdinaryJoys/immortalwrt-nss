@@ -235,6 +235,71 @@ def render(tree, sd=None, root=None, sd_init=None, root_init=None, hsl_admit=Non
     return text
 
 
+CANARIES = {
+    'asan': ('address', 97, '#include <stdlib.h>\nint main(int argc,char **argv) {(void)argv; volatile int i=argc; char *p=malloc(1); p[i]=1; volatile char x=p[i]; free(p); return x;}\n'),
+    'ubsan': ('undefined', 98, '#include <limits.h>\nint main(int argc,char **argv) {(void)argv; volatile int i=INT_MAX; return i+argc;}\n'),
+}
+
+
+def host_flags(hppe, sanitize=False):
+    flags = ['-std=gnu11', '-Wall', '-Wextra', '-Werror', '-Wno-unused-parameter', '-O1', '-g']
+    if hppe:
+        flags += ['-DHPPE=1']
+    if sanitize:
+        flags += ['-fsanitize=address,undefined', '-fno-omit-frame-pointer']
+    return flags
+
+
+def canary_result(code, out, err, kind):
+    need(kind in CANARIES, 'known sanitizer probe')
+    if type(code) is not int or code != CANARIES[kind][1] or out != b'' or not isinstance(err, bytes):
+        return False
+    if kind == 'asan':
+        return (b'ERROR: AddressSanitizer: heap-buffer-overflow' in err and b'WRITE of size 1' in err and
+                b'runtime error:' not in err and b'DEADLYSIGNAL' not in err)
+    return (b'runtime error: signed integer overflow:' in err and b'2147483647 + 1' in err and
+            b'AddressSanitizer' not in err)
+
+
+def sanitizer_controls(cc, output, hppe, env):
+    examples = {'asan': b'ERROR: AddressSanitizer: heap-buffer-overflow\nWRITE of size 1\n',
+                'ubsan': b'runtime error: signed integer overflow: 2147483647 + 1\n'}
+    report = {'activation': [], 'disabled': [], 'crossed': [], 'oracle_rejections': 0}
+    for kind, (instrumentation, code, body) in CANARIES.items():
+        need(canary_result(code, b'', examples[kind], kind), 'positive canary oracle')
+        other = 'ubsan' if kind == 'asan' else 'asan'
+        for bad_code, out, err in [(0, b'', examples[kind]), (1, b'', examples[kind]),
+                (-6, b'', examples[kind]), (86, b'', examples[kind]), (True, b'', examples[kind]),
+                (str(code), b'', examples[kind]), ('timeout', b'', examples[kind]),
+                (code, b'noise', examples[kind]), (code, b'', b''),
+                (code, b'', b'runtime error: store to address with insufficient space for char'),
+                (code, b'', b'AddressSanitizer: DEADLYSIGNAL'), (code, b'', examples[other])]:
+            need(not canary_result(bad_code, out, err, kind), 'polluted canary oracle')
+            report['oracle_rejections'] += 1
+        path = output / ('canary-' + kind + '.c'); path.write_text(body)
+        binary = path.with_suffix('.host')
+        # Isolate activation probes: GCC object-size UBSan can otherwise stop ASan first.
+        flags = host_flags(hppe) + ['-fsanitize=' + instrumentation, '-fno-omit-frame-pointer']
+        compiled = run([cc, *flags, str(path), '-o', str(binary)], output / ('canary-' + kind + '-compile'), env)
+        need(compiled.returncode == 0 and not compiled.stdout and not compiled.stderr, 'canary compile')
+        probe_env = dict(env, ASAN_OPTIONS=f'detect_leaks=0:halt_on_error=1:abort_on_error=0:exitcode={code}',
+                         UBSAN_OPTIONS=f'halt_on_error=1:abort_on_error=0:print_stacktrace=1:exitcode={code}')
+        executed = run([str(binary)], output / ('canary-' + kind + '-run'), probe_env)
+        need(canary_result(executed.returncode, executed.stdout, executed.stderr, kind), 'active sanitizer canary')
+        report['activation'].append({'name': kind, 'instrumentation': instrumentation, 'exit': code})
+        need(not canary_result(CANARIES[other][1], executed.stdout, executed.stderr, other), 'crossed sanitizer identity')
+        report['crossed'].append({'actual': kind, 'rejected_as': other})
+        disabled = output / ('disabled-' + kind + '.host')
+        compiled = run([cc, *host_flags(hppe), str(path), '-o', str(disabled)],
+                       output / ('disabled-' + kind + '-compile'), env)
+        need(compiled.returncode == 0 and not compiled.stdout and not compiled.stderr, 'disabled probe compile')
+        raw = run([str(disabled)], output / ('disabled-' + kind + '-run'), probe_env)
+        need(not canary_result(raw.returncode, raw.stdout, raw.stderr, kind), 'disabled detector cannot earn activation')
+        report['disabled'].append({'name': kind, 'returncode': raw.returncode})
+    need('-fsanitize=address,undefined' in host_flags(hppe, True), 'formal dual instrumentation')
+    return report
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--upstream-cache', type=Path)
@@ -244,6 +309,7 @@ def main():
     parser.add_argument('--cc', required=True)
     parser.add_argument('--sanitize', action='store_true')
     parser.add_argument('--hppe', action='store_true')
+    parser.add_argument('--canaries-only', action='store_true')
     args = parser.parse_args()
     need(not args.output.exists(), 'fresh output required'); args.output.mkdir(parents=True)
     report = {'status': 'INCOMPLETE', 'qualification': 'SERIAL_NATIVE_HOST_NOT_TARGET_OR_RUNTIME'}
@@ -258,6 +324,15 @@ def main():
         result.write_text(json.dumps(report, indent=2) + '\n')
     save()
     try:
+        import os
+        env = dict(os.environ)
+        if args.canaries_only:
+            need(args.sanitize and not any((args.upstream_cache, args.baseline38, args.prepared)),
+                 'activation-only mode has no SDK preparation or campaign')
+            report['sanitizer_controls'] = sanitizer_controls(args.cc, args.output, args.hppe, env)
+            need(all(sha(Path(name).read_bytes()) == digest for name, digest in identities.items()), 'probe input stability')
+            report.update(status='PASS_SANITIZER_CONTROLS_ONLY', qualification='NO_SSDK_PREPARATION_OR_FORMAL_CAMPAIGN')
+            save(); print(json.dumps({'status': report['status']})); return
         need(bool(args.upstream_cache) != bool(args.baseline38 and args.prepared), 'exclusive archive or actual mode')
         need(bool(args.baseline38) == bool(args.prepared), 'actual mode requires frozen baseline')
         actual_before = inventory(args.prepared) if args.prepared else None
@@ -267,37 +342,11 @@ def main():
         report.update(patches=patches, prepared_inventory=expected)
         report['qca808x_fields'] = qca808x_fields(tree)
         # The old SDK sd_init has an unused dev_id; keep its body unchanged.
-        flags = ['-std=gnu11', '-Wall', '-Wextra', '-Werror', '-Wno-unused-parameter', '-O1', '-g']
-        if args.hppe:
-            flags += ['-DHPPE=1']
-        import os
-        env = dict(os.environ)
+        flags = host_flags(args.hppe, args.sanitize)
         if args.sanitize:
-            flags += ['-fsanitize=address,undefined', '-fno-omit-frame-pointer']
             env.update(ASAN_OPTIONS='detect_leaks=0:halt_on_error=1:abort_on_error=0:exitcode=97',
-                       UBSAN_OPTIONS='halt_on_error=1:print_stacktrace=1:exitcode=98')
-            report['sanitizer_canaries'] = []
-            for label, body, expected_code, diagnostic in [
-                ('asan', '#include <stdlib.h>\nint main(int argc,char **argv) {(void)argv; volatile int i=argc; char *p=malloc(1); p[i]=1; volatile char x=p[i]; free(p); return x;}\n',
-                 97, b'ERROR: AddressSanitizer: heap-buffer-overflow'),
-                ('ubsan', '#include <limits.h>\nint main(int argc,char **argv) {(void)argv; volatile int i=INT_MAX; return i+argc;}\n',
-                 98, b'runtime error: signed integer overflow'),
-            ]:
-                path = args.output / ('canary-' + label + '.c'); path.write_text(body)
-                binary = path.with_suffix('.host')
-                compiled = run([args.cc, *flags, str(path), '-o', str(binary)],
-                               args.output / ('canary-' + label + '-compile'), env)
-                need(compiled.returncode == 0 and not compiled.stdout and not compiled.stderr, 'canary compile')
-                # Darwin's combined runtime may honor the other sanitizer's exitcode.
-                # Both controls must specify this canary's fixed expected exit.
-                probe_env = dict(env)
-                probe_env.update(ASAN_OPTIONS=f'detect_leaks=0:halt_on_error=1:abort_on_error=0:exitcode={expected_code}',
-                                 UBSAN_OPTIONS=f'halt_on_error=1:print_stacktrace=1:exitcode={expected_code}')
-                executed = run([str(binary)], args.output / ('canary-' + label + '-run'), probe_env)
-                need(executed.returncode == expected_code and not executed.stdout and
-                     diagnostic in executed.stderr, 'active sanitizer canary')
-                report['sanitizer_canaries'].append({'name': label, 'exit': expected_code,
-                                                     'diagnostic': diagnostic.decode()})
+                       UBSAN_OPTIONS='halt_on_error=1:abort_on_error=0:print_stacktrace=1:exitcode=98')
+            report['sanitizer_controls'] = sanitizer_controls(args.cc, args.output, args.hppe, env)
             save()
         sd = reader.function((tree / 'src/sal/sd/sd.c').read_text(), 'sd_init_check')
         root = reader.function((tree / 'src/init/ssdk_init.c').read_text(), 'ssdk_cleanup')

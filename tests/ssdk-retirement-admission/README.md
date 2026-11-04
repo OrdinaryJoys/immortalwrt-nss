@@ -61,6 +61,12 @@ clean Werror compilation, exact exit86, empty stdout and a fixed assertion.
 Crashes, compile failures and sanitizer diagnostics do not count as negatives.
 ASan/UBSan must first activate with separate fixed97/98 canaries; both exitcode
 environment controls are bound to the individual probe, including on Darwin.
+Activation probes use address-only and undefined-only instrumentation separately:
+GCC11 otherwise diagnoses the ASan probe's object-size UB first. Exact detector
+diagnostics, disabled-instrumentation and crossed-identity controls are required.
+Formal positive/mutant programs retain combined address,undefined instrumentation.
+`--canaries-only --sanitize` runs bounded activation controls without SDK prepare
+or a formal campaign, suitable for an early Linux/GCC11 preflight.
 
 Example (fresh output directory required):
 
