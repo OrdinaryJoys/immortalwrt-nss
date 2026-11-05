@@ -57,12 +57,26 @@ starts with the very first configuration's bytes.
 
 Each of1705 positive cases has strict process/JSON admission; ordinary
 single-device cases also have independently calculated exact resource counts.
-Twenty source mutations must compile cleanly and execute with precisely
+Thirty-five source mutations must compile cleanly and execute with precisely
 exit86, no stdout and the required one-line diagnostic. Compilation failures,
 signals, timeout, sanitizer findings or arbitrary nonzero status receive no
 negative credit. Four unchanged SSDK40 witnesses are explicitly old-source
 host counterexamples, not newly observed router incidents. Pure oracle tests
 reject duplicate JSON keys, Boolean counts, wrong diagnostics and pollution.
+
+Independent review reproduced three prior oracle blind spots with five paired
+mutant witnesses: same-device wrong mapping addresses, missing read callback
+publication, and foreign-owner exit consuming clock rights. The formal fixture
+now checks each mapping against the map getter's exact address/length, checks
+both read and write callbacks, and snapshots all foreign-exit rights, clock
+state and side-effect counters immediately at each rejection. These checks
+strengthen tests; they are not three newly confirmed production defects.
+The mapping oracle also derives the required device/role sequence from the
+test profile and invocation, independently of the getter selected by the code
+under test. Published slots must match the expected role's exact live mapping.
+Wrong getter, wrong device and swapped-slot negatives prevent both the source
+and its expected address from drifting together. Getter checks apply before
+injected mapping failures, so rollback prefixes cannot escape role admission.
 
 Sanitized runs execute separately instrumented ASan and UBSan activation
 canaries plus disabled/crossed controls; both detectors instrument the formal

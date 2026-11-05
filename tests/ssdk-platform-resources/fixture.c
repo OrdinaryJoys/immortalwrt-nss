@@ -46,6 +46,9 @@ static struct resource region_tokens[SW_MAX_NR_DEV];
 static bool regions[SW_MAX_NR_DEV];
 static unsigned region_base[SW_MAX_NR_DEV], region_size[SW_MAX_NR_DEV];
 static unsigned map_count;
+static ssdk_reg_map_info requested_map;
+static bool map_requested;
+static unsigned init_device, init_map_step;
 static struct { unsigned base, size; u8 token; bool live; } maps[32];
 static u8 foreign_byte;
 #define ERR_CLK ((struct clk *)(intptr_t)-ENOENT)
@@ -60,8 +63,28 @@ static unsigned live_for(unsigned id)
 }
 static unsigned base(unsigned id, unsigned kind)
 { return 0x10000 * (id + 1) + 0x100 * kind + (changed_dt ? 0x400000 : 0); }
+static unsigned required_map_kind(unsigned step)
+{
+    unsigned index = 0;
+#ifdef IN_UNIPHY
+    if ((modes & 1) && step == index++) return 0;
+#endif
+    if ((modes & 2) && step == index++) return 1;
+#ifdef DESS
+    if ((modes & 4) && step == index++) return 2;
+#endif
+    fail("MAP_ROLE"); return 0;
+}
 static void map_info(unsigned id, unsigned kind, ssdk_reg_map_info *map)
-{ cold(); need(id < SW_MAX_NR_DEV, "GETTER_ID"); map->base_addr = base(id, kind); map->size = 0x80; }
+{
+    cold(); need(id < SW_MAX_NR_DEV, "GETTER_ID");
+#ifdef CANDIDATE
+    need(id == init_device, "MAP_DEVICE_ROLE");
+    need(kind == required_map_kind(init_map_step++), "MAP_ROLE");
+#endif
+    map->base_addr = base(id, kind); map->size = 0x80;
+    requested_map = *map; map_requested = true;
+}
 static void ssdk_uniphy_reg_map_info_get(unsigned id, ssdk_reg_map_info *map) { map_info(id, 0, map); }
 static void ssdk_switch_reg_map_info_get(unsigned id, ssdk_reg_map_info *map) { map_info(id, 1, map); }
 static void ssdk_psgmii_reg_map_info_get(unsigned id, ssdk_reg_map_info *map) { map_info(id, 2, map); }
@@ -86,6 +109,9 @@ static void *ioremap(unsigned address, unsigned size)
     cold(); need(size == 0x80 && map_count < 32, "MAP_ARGS");
     unsigned id = (address >> 16) - 1;
     need(id < SW_MAX_NR_DEV, "MAP_DEVICE"); no_publication(id);
+    need(map_requested && address == requested_map.base_addr && size == requested_map.size,
+         "MAP_IDENTITY");
+    map_requested = false;
     if (++attempts == fault) return NULL;
     maps[map_count].base = address; maps[map_count].size = size;
     maps[map_count].live = true; return &maps[map_count++].token;
@@ -104,6 +130,8 @@ static struct resource *request_mem_region(unsigned address, unsigned size, cons
     cold(); need(size == 0x80 && strcmp(name, "psgmii_mem") == 0, "REGION_ARGS");
     unsigned id = (address >> 16) - 1; need(id < SW_MAX_NR_DEV, "REGION_DEVICE");
     no_publication(id);
+    need(map_requested && address == requested_map.base_addr && size == requested_map.size,
+         "REGION_IDENTITY");
     if (fault == 10) return NULL;
     need(!regions[id], "REGION_DUPLICATE");
     regions[id] = true; region_base[id] = address; region_size[id] = size; ++claims;
@@ -157,10 +185,64 @@ static sw_error_t saved_uniphy(unsigned id, unsigned index, unsigned reg, u8 *da
 static sw_error_t saved_psgmii(unsigned id, unsigned reg, u8 *data, unsigned len)
 { return qca_psgmii_reg_write(id, reg, data, len); }
 @ACTUAL_CODE@
+static void published_map_identity(u8 *pointer, unsigned id, unsigned kind, bool selected)
+{
+    need((pointer != NULL) == selected, "MAP_SLOT_IDENTITY");
+    if (!selected) return;
+    for (unsigned i = 0; i < map_count; ++i) if (pointer == &maps[i].token) {
+        need(maps[i].live && maps[i].base == base(id, kind) && maps[i].size == 0x80,
+             "MAP_SLOT_IDENTITY");
+        return;
+    }
+    fail("MAP_SLOT_IDENTITY");
+}
+static void rejected_foreign_exit(unsigned id)
+{
+#ifdef CANDIDATE
+    struct ssdk_plat_resources rights;
+    memcpy(&rights, &ssdk_plat_resources[id], sizeof(rights));
+    struct qca_phy_priv owner, foreign;
+    memcpy(&owner, &slots[id], sizeof(owner));
+    memcpy(&foreign, &foreign_slot, sizeof(foreign));
+    unsigned maps_before = live_maps();
+    unsigned before[] = {attempts, unmapped, claims, releases, enables, disables, gcc_starts, gcc_stops};
+    unsigned refs = ess.refs;
+    bool live = gcc_live;
+#if defined(HPPE) || defined(MP)
+    unsigned users = ssdk_plat_gcc_users;
+#endif
+#endif
+    ssdk_plat_exit(id);
+#ifdef CANDIDATE
+    need(maps_before == live_maps() && memcmp(&owner, &slots[id], sizeof(owner)) == 0 &&
+         memcmp(&foreign, &foreign_slot, sizeof(foreign)) == 0, "FOREIGN_RETIRE");
+    unsigned after[] = {attempts, unmapped, claims, releases, enables, disables, gcc_starts, gcc_stops};
+    need(memcmp(&rights, &ssdk_plat_resources[id], sizeof(rights)) == 0 &&
+         memcmp(before, after, sizeof(before)) == 0 && refs == ess.refs && live == gcc_live,
+         "FOREIGN_RIGHTS");
+#if defined(HPPE) || defined(MP)
+    need(users == ssdk_plat_gcc_users, "FOREIGN_RIGHTS");
+#endif
+#endif
+}
 static int model_init(unsigned id)
 {
+    init_device = id; init_map_step = 0; map_requested = false;
     memcpy(&originals[id], &cfgs[id], sizeof(cfgs[id]));
-    return ssdk_plat_init(&cfgs[id], id);
+    int rv = ssdk_plat_init(&cfgs[id], id);
+    if (!rv) {
+        bool uniphy = false, psgmii = false;
+#ifdef IN_UNIPHY
+        uniphy = !!(modes & 1);
+#endif
+#ifdef DESS
+        psgmii = !!(modes & 4);
+#endif
+        published_map_identity(slots[id].uniphy_hw_addr, id, 0, uniphy);
+        published_map_identity(slots[id].hw_addr, id, 1, !!(modes & 2));
+        published_map_identity(slots[id].psgmii_hw_addr, id, 2, psgmii);
+    }
+    return rv;
 }
 static void admission_snapshot(unsigned id, int error)
 {
@@ -257,17 +339,23 @@ int main(int argc, char **argv)
         } else {
             need(cfgs[id].reg_mode == (modes & 2 ? HSL_HEADER : HSL_MDIO) && cfgs[id].chip_revision == 99, "CFG_MODE");
 #ifdef IN_UNIPHY
-            if (modes & 1) need(slots[id].uniphy_hw_addr && cfgs[id].reg_func.uniphy_reg_set == qca_uniphy_reg_write, "UNIPHY_PUBLICATION");
+            if (modes & 1) {
+                need(slots[id].uniphy_hw_addr && cfgs[id].reg_func.uniphy_reg_set == qca_uniphy_reg_write, "UNIPHY_PUBLICATION");
+                need(cfgs[id].reg_func.uniphy_reg_get == qca_uniphy_reg_read, "UNIPHY_READ_PUBLICATION");
+            }
 #endif
 #ifdef DESS
-            if (modes & 4) need(slots[id].psgmii_hw_addr && cfgs[id].reg_func.psgmii_reg_set == qca_psgmii_reg_write, "PSGMII_PUBLICATION");
+            if (modes & 4) {
+                need(slots[id].psgmii_hw_addr && cfgs[id].reg_func.psgmii_reg_set == qca_psgmii_reg_write, "PSGMII_PUBLICATION");
+                need(cfgs[id].reg_func.psgmii_reg_get == qca_psgmii_reg_read, "PSGMII_READ_PUBLICATION");
+            }
 #endif
             if (scenario == 1) admission_snapshot(id, -EBUSY);
             if (scenario == 4) {
                 unsigned count = live_maps(); u8 *saved = slots[id].hw_addr;
-                table[id] = &foreign_slot; ssdk_plat_exit(id);
+                table[id] = &foreign_slot; rejected_foreign_exit(id);
                 need(live_maps() == count && !foreign_slot.hw_addr && !foreign_slot.psgmii_hw_addr, "FOREIGN_RETIRE");
-                table[id] = &slots[id]; slots[id].hw_addr = &foreign_byte; ssdk_plat_exit(id);
+                table[id] = &slots[id]; slots[id].hw_addr = &foreign_byte; rejected_foreign_exit(id);
                 need(live_maps() == count && slots[id].hw_addr == &foreign_byte, "FOREIGN_RETIRE");
                 slots[id].hw_addr = saved;
             }

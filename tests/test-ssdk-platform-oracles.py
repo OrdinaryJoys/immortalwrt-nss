@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Reader/oracle controls only, not a driver or clock campaign."""
+import ast
 import importlib.util
 import json
 from pathlib import Path
@@ -85,6 +86,34 @@ class Tests(unittest.TestCase):
             else: mutated[m.PATCH.name] = '0'*64
             with self.subTest(change=change), self.assertRaises(ValueError): m.admit_source(mutated, recipe)
         with self.assertRaises(ValueError): m.admit_source(inventory, recipe+b'\n')
+
+    def test_independent_review_obligations_are_runtime_mutants(self):
+        tree = ast.parse(Path(m.__file__).read_text())
+        nodes = [n for n in ast.walk(tree) if isinstance(n, ast.Assign) and
+                 len(n.targets) == 1 and isinstance(n.targets[0], ast.Name) and n.targets[0].id == 'mutants']
+        self.assertEqual(len(nodes), 1)
+        rows = ast.literal_eval(nodes[0].value)
+        self.assertEqual(len(rows), 35)
+        self.assertEqual(len({row[0] for row in rows}), 35)
+        obligations = {
+            'uniphy-wrong-map-address': ((1, 0, 2, 0), 'MAP_IDENTITY'),
+            'switch-wrong-map-address': ((2, 0, 2, 0), 'MAP_IDENTITY'),
+            'psgmii-wrong-map-address': ((4, 0, 2, 0), 'MAP_IDENTITY'),
+            'uniphy-read-not-published': ((1, 0, 2, 0), 'UNIPHY_READ_PUBLICATION'),
+            'psgmii-read-not-published': ((4, 0, 2, 0), 'PSGMII_READ_PUBLICATION'),
+            'foreign-ess-retirement': ((2, 0, 0, 4), 'FOREIGN_RIGHTS'),
+            'foreign-gcc-retirement': ((2, 0, 1, 4), 'FOREIGN_RIGHTS'),
+            'foreign-ledger-erased': ((2, 0, 2, 4), 'FOREIGN_RIGHTS'),
+            'uniphy-wrong-getter': ((7, 1, 2, 0), 'MAP_ROLE'),
+            'switch-wrong-getter': ((7, 2, 2, 0), 'MAP_ROLE'),
+            'psgmii-wrong-getter': ((7, 3, 2, 0), 'MAP_ROLE'),
+            'uniphy-wrong-device': ((1, 0, 2, 0), 'MAP_DEVICE_ROLE'),
+            'uniphy-wrong-slot': ((7, 0, 2, 0), 'MAP_SLOT_IDENTITY'),
+            'switch-wrong-slot': ((7, 0, 2, 0), 'MAP_SLOT_IDENTITY'),
+            'psgmii-wrong-slot': ((7, 0, 2, 0), 'MAP_SLOT_IDENTITY'),
+        }
+        actual = {name: (case, marker) for name, before, after, case, marker in rows if name in obligations}
+        self.assertEqual(actual, obligations)
 
 
 if __name__ == '__main__':
