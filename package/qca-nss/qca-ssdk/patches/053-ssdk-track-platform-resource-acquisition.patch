@@ -1,0 +1,297 @@
+Subject: [PATCH] ssdk: pair cold platform resources with their acquiring instance
+
+Complete fallible mappings/regions before the void GCC initializer. Keep
+publication private, unwind only acquired rights, and share module-global
+GCC invocation until the last participant. Root/reader and nested clock
+failure contracts are not qualified by this prerequisite layer.
+
+--- a/src/init/ssdk_plat.c
++++ b/src/init/ssdk_plat.c
+@@ -47,6 +47,7 @@
+ #include <linux/delay.h>
+ #include <linux/string.h>
+ #include <linux/spinlock.h>
++#include <linux/mutex.h>
+ #include <linux/bitops.h>
+ #include <linux/mdio-bitbang.h>
+ #include <net/dsa.h>
+@@ -1993,128 +1994,190 @@
+ 	mutex_lock(&ssdk_sysfs_lock);
+ 	ssdk_sysfs_remove_locked();
+ 	mutex_unlock(&ssdk_sysfs_lock);
++}
++
++/* Cold root init/exit only; callers still own producer/reader quiescence. */
++struct ssdk_plat_resources {
++	struct qca_phy_priv *owner;
++	u8 __iomem *uniphy;
++	u8 __iomem *switch_base;
++	u8 __iomem *psgmii;
++	ssdk_reg_map_info psgmii_map;
++	bool psgmii_region;
++	struct clk *ess_clk;
++	bool ess_enabled;
++#if defined(HPPE) || defined(MP)
++	bool gcc;
++#endif
++};
++
++static DEFINE_MUTEX(ssdk_plat_resource_lock);
++static struct ssdk_plat_resources ssdk_plat_resources[SW_MAX_NR_DEV];
++#if defined(HPPE) || defined(MP)
++/* The zero-argument GCC helpers operate on module-global clock state. */
++static unsigned int ssdk_plat_gcc_users;
++#endif
++
++static void ssdk_plat_release_resources(struct ssdk_plat_resources *resources)
++{
++	if (resources->ess_enabled)
++		clk_disable_unprepare(resources->ess_clk);
++#if defined(HPPE) || defined(MP)
++	if (resources->gcc && --ssdk_plat_gcc_users == 0)
++		ssdk_gcc_clock_exit();
++#endif
++	if (resources->psgmii)
++		iounmap(resources->psgmii);
++	if (resources->psgmii_region)
++		release_mem_region(resources->psgmii_map.base_addr,
++			resources->psgmii_map.size);
++	if (resources->switch_base)
++		iounmap(resources->switch_base);
++	if (resources->uniphy)
++		iounmap(resources->uniphy);
++	memset(resources, 0, sizeof(*resources));
+ }
+ 
+ /*qca808x_start*/
+ int
+ ssdk_plat_init(ssdk_init_cfg *cfg, a_uint32_t dev_id)
+ {
++	int rv = 0;
+ /*qca808x_end*/
++	struct ssdk_plat_resources pending = {0};
++	struct qca_phy_priv *priv;
++	hsl_reg_func reg_func;
++	hsl_access_mode access_mode;
+ 	hsl_reg_mode reg_mode;
+ 	ssdk_reg_map_info map;
+-	struct clk *  ess_clk;
+-	struct clk *  cmn_clk;
++	struct clk *ess_clk, *cmn_clk;
++	int clock_rv;
+ 
++	rv = -1;
++	mutex_lock(&ssdk_plat_resource_lock);
++	if (!cfg || dev_id >= SW_MAX_NR_DEV ||
++	    dev_id >= ssdk_switch_device_num_get() || !qca_phy_priv_global ||
++	    !qca_phy_priv_global[dev_id]) {
++		rv = -EINVAL;
++		goto out;
++	}
++	priv = qca_phy_priv_global[dev_id];
++	if (ssdk_plat_resources[dev_id].owner || priv->hw_addr ||
++	    priv->uniphy_hw_addr || priv->psgmii_hw_addr) {
++		rv = -EBUSY;
++		goto out;
++	}
++	pending.owner = priv;
++	reg_func = cfg->reg_func;
++	access_mode = cfg->reg_mode;
+ #ifdef IN_UNIPHY
+ 	reg_mode = ssdk_uniphy_reg_access_mode_get(dev_id);
+-	if(reg_mode == HSL_REG_LOCAL_BUS) {
++	if (reg_mode == HSL_REG_LOCAL_BUS) {
+ 		ssdk_uniphy_reg_map_info_get(dev_id, &map);
+-		qca_phy_priv_global[dev_id]->uniphy_hw_addr = ioremap(map.base_addr,
+-									map.size);
+-		if (!qca_phy_priv_global[dev_id]->uniphy_hw_addr) {
+-			SSDK_ERROR("%s ioremap fail.", __func__);
+-			cfg->reg_func.uniphy_reg_set = NULL;
+-			cfg->reg_func.uniphy_reg_get = NULL;
+-			return -1;
+-		}
+-		cfg->reg_func.uniphy_reg_set = qca_uniphy_reg_write;
+-		cfg->reg_func.uniphy_reg_get = qca_uniphy_reg_read;
++		pending.uniphy = ioremap(map.base_addr, map.size);
++		if (!pending.uniphy)
++			goto fail;
++		reg_func.uniphy_reg_set = qca_uniphy_reg_write;
++		reg_func.uniphy_reg_get = qca_uniphy_reg_read;
+ 	}
+ #endif
+ 	reg_mode = ssdk_switch_reg_access_mode_get(dev_id);
+ 	if (reg_mode == HSL_REG_LOCAL_BUS) {
+ 		ssdk_switch_reg_map_info_get(dev_id, &map);
+-		qca_phy_priv_global[dev_id]->hw_addr = ioremap(map.base_addr,
+-								map.size);
+-		if (!qca_phy_priv_global[dev_id]->hw_addr) {
+-			SSDK_ERROR("%s ioremap fail.", __func__);
+-			return -1;
+-		}
++		pending.switch_base = ioremap(map.base_addr, map.size);
++		if (!pending.switch_base)
++			goto fail;
++		access_mode = HSL_HEADER;
++	} else if (reg_mode == HSL_REG_MDIO) {
++		access_mode = HSL_MDIO;
++	}
++#ifdef DESS
++	reg_mode = ssdk_psgmii_reg_access_mode_get(dev_id);
++	if (reg_mode == HSL_REG_LOCAL_BUS) {
++		ssdk_psgmii_reg_map_info_get(dev_id, &pending.psgmii_map);
++		if (!request_mem_region(pending.psgmii_map.base_addr,
++			pending.psgmii_map.size, "psgmii_mem"))
++			goto fail;
++		pending.psgmii_region = true;
++		pending.psgmii = ioremap(pending.psgmii_map.base_addr,
++			pending.psgmii_map.size);
++		if (!pending.psgmii)
++			goto fail;
++		reg_func.psgmii_reg_set = qca_psgmii_reg_write;
++		reg_func.psgmii_reg_get = qca_psgmii_reg_read;
++	}
++#endif
++	/* No mapping failure may unwind an unverified void GCC initializer. */
++	if (pending.switch_base) {
+ 		ess_clk = ssdk_dts_essclk_get(dev_id);
+ 		cmn_clk = ssdk_dts_cmnclk_get(dev_id);
+ 		if (!IS_ERR(ess_clk)) {
+-			/* Enable ess clock here */
+-			SSDK_INFO("Enable ess clk\n");
+-			clk_prepare_enable(ess_clk);
++			clock_rv = clk_prepare_enable(ess_clk);
++			if (clock_rv) {
++				/* Root error rollback is not yet ready for a new fatal path. */
++				SSDK_ERROR("device %u ess clock enable failed: %d\n",
++					dev_id, clock_rv);
++			} else {
++				pending.ess_clk = ess_clk;
++				pending.ess_enabled = true;
++			}
+ 		} else if (!IS_ERR(cmn_clk)) {
+ #if defined(HPPE) || defined(MP)
+-			/* clock ID cmn_ahb_clk defined in DTS */
+-			ssdk_gcc_clock_init();
++			if (!ssdk_plat_gcc_users)
++				ssdk_gcc_clock_init();
++			++ssdk_plat_gcc_users;
++			pending.gcc = true;
+ #endif
+ 		}
+-
+-		cfg->reg_mode = HSL_HEADER;
+-	} else if (reg_mode == HSL_REG_MDIO) {
+-		cfg->reg_mode = HSL_MDIO;
+ 	}
+-
+-#ifdef DESS
+-	reg_mode = ssdk_psgmii_reg_access_mode_get(dev_id);
+-	if(reg_mode == HSL_REG_LOCAL_BUS) {
+-		ssdk_psgmii_reg_map_info_get(dev_id, &map);
+-		if (!request_mem_region(map.base_addr,
+-					map.size, "psgmii_mem")) {
+-			SSDK_ERROR("%s Unable to request psgmii resource.", __func__);
+-			return -1;
+-		}
+-
+-		qca_phy_priv_global[dev_id]->psgmii_hw_addr = ioremap(map.base_addr,
+-								map.size);
+-		if (!qca_phy_priv_global[dev_id]->psgmii_hw_addr) {
+-			SSDK_ERROR("%s ioremap fail.", __func__);
+-			cfg->reg_func.psgmii_reg_set = NULL;
+-			cfg->reg_func.psgmii_reg_get = NULL;
+-			return -1;
+-		}
+-
+-		cfg->reg_func.psgmii_reg_set = qca_psgmii_reg_write;
+-		cfg->reg_func.psgmii_reg_get = qca_psgmii_reg_read;
+-	}
+-#endif
++	/* Publish only after every fallible mapping/region acquisition completed. */
++	priv->uniphy_hw_addr = pending.uniphy;
++	priv->hw_addr = pending.switch_base;
++	priv->psgmii_hw_addr = pending.psgmii;
++	cfg->reg_func = reg_func;
++	cfg->reg_mode = access_mode;
++	ssdk_plat_resources[dev_id] = pending;
++	rv = 0;
++	goto out;
++fail:
++	SSDK_ERROR("device %u platform resource acquisition failed\n", dev_id);
++	ssdk_plat_release_resources(&pending);
++out:
++	mutex_unlock(&ssdk_plat_resource_lock);
+ /*qca808x_start*/
+-
+-	return 0;
++	return rv;
+ }
+ 
+ void
+ ssdk_plat_exit(a_uint32_t dev_id)
+ {
+ /*qca808x_end*/
+-	hsl_reg_mode reg_mode;
+-#ifdef DESS
+-	ssdk_reg_map_info map;
+-#endif
+-/*qca808x_start*/
+-	SSDK_INFO("ssdk_plat_exit\n");
+-/*qca808x_end*/
+-	reg_mode = ssdk_switch_reg_access_mode_get(dev_id);
+-	if (reg_mode == HSL_REG_LOCAL_BUS) {
+-		struct clk *cmn_clk = NULL;
++	struct ssdk_plat_resources *resources;
++	struct qca_phy_priv *priv;
+ 
+-		iounmap(qca_phy_priv_global[dev_id]->hw_addr);
+-		cmn_clk = ssdk_dts_cmnclk_get(dev_id);
+-		if (!IS_ERR(cmn_clk)) {
+-#if defined(HPPE) || defined(MP)
+-			ssdk_gcc_clock_exit();
+-#endif
+-		}
+-	}
+-
+-#ifdef DESS
+-	reg_mode = ssdk_psgmii_reg_access_mode_get(dev_id);
+-	if (reg_mode == HSL_REG_LOCAL_BUS) {
+-		ssdk_psgmii_reg_map_info_get(dev_id, &map);
+-		iounmap(qca_phy_priv_global[dev_id]->psgmii_hw_addr);
+-		release_mem_region(map.base_addr,
+-                                        map.size);
+-	}
+-#endif
+-#ifdef IN_UNIPHY
+-	reg_mode = ssdk_uniphy_reg_access_mode_get(dev_id);
+-	if (reg_mode == HSL_REG_LOCAL_BUS) {
+-		iounmap(qca_phy_priv_global[dev_id]->uniphy_hw_addr);
+-	}
+-#endif
++	mutex_lock(&ssdk_plat_resource_lock);
++	if (dev_id >= SW_MAX_NR_DEV)
++		goto out;
++	resources = &ssdk_plat_resources[dev_id];
++	if (!resources->owner)
++		goto out;
++	if (!qca_phy_priv_global || dev_id >= ssdk_switch_device_num_get() ||
++	    qca_phy_priv_global[dev_id] != resources->owner)
++		goto foreign;
++	priv = resources->owner;
++	if (priv->hw_addr != resources->switch_base ||
++	    priv->uniphy_hw_addr != resources->uniphy ||
++	    priv->psgmii_hw_addr != resources->psgmii)
++		goto foreign;
++	priv->hw_addr = NULL;
++	priv->uniphy_hw_addr = NULL;
++	priv->psgmii_hw_addr = NULL;
++	ssdk_plat_release_resources(resources);
++	goto out;
++foreign:
++	SSDK_ERROR("device %u platform resource owner changed; not released\n", dev_id);
++out:
++	mutex_unlock(&ssdk_plat_resource_lock);
+ /*qca808x_start*/
+ }
+ /*qca808x_end*/
+
