@@ -1,0 +1,5239 @@
+Subject: [PATCH] Own and retire NSS host root controls, diagnostics and producers
+
+Base: current fixed6aa package after 028, driver release26.
+Scope: bounded host transaction; not FW backing retirement or runtime approval.
+
+--- a/nss_c2c_tx.c
++++ b/nss_c2c_tx.c
+@@ -23,6 +23,8 @@
+  */
+ 
+ #include <nss_hal.h>
++#include <linux/mutex.h>
++#include "nss_sysctl.h"
+ #include "nss_c2c_tx_stats.h"
+ #include "nss_c2c_tx_log.h"
+ #include "nss_c2c_tx_strings.h"
+@@ -284,12 +286,16 @@
+  * nss_c2c_tx_performance_test_handler()
+  *	Handles the performance test.
+  */
+-static int nss_c2c_tx_performance_test_handler(struct ctl_table *ctl, int write,
++static int nss_c2c_tx_performance_test_handler(const struct ctl_table *ctl, int write,
+ 				void __user *buffer, size_t *lenp, loff_t *ppos)
+ {
+ 	struct nss_top_instance *nss_top = &nss_top_main;
+ 	struct nss_ctx_instance *nss_ctx = &nss_top->nss[0];
+ 	int ret, ret_c2c_tx, current_state;
++
++	if (write && !nss_sysctl_ctx_ready(nss_ctx))
++		return -ENODEV;
++
+ 	current_state = nss_c2c_tx_test_id;
+ 	ret = proc_dointvec(ctl, write, buffer, lenp, ppos);
+ 
+@@ -334,13 +340,22 @@
+ };
+ 
+ static struct ctl_table_header *nss_c2c_tx_header;
++/* Readers must not take this lock: unregister waits for active handlers. */
++static DEFINE_MUTEX(nss_c2c_tx_sysctl_lock);
+ 
+ /*
+- * nss_c2c_tx_register_sysctl()
++ * nss_c2c_tx_register_sysctl_checked()
+  */
+-void nss_c2c_tx_register_sysctl(void)
++int nss_c2c_tx_register_sysctl_checked(void)
+ {
++	int ret = 0;
+ 
++	mutex_lock(&nss_c2c_tx_sysctl_lock);
++	if (nss_c2c_tx_header) {
++		mutex_unlock(&nss_c2c_tx_sysctl_lock);
++		return -EBUSY;
++	}
++
+ 	/*
+ 	 * c2c_tx sema init.
+ 	 */
+@@ -351,20 +366,36 @@
+ 	 * Register sysctl table.
+ 	 */
+ 	nss_c2c_tx_header = register_sysctl("dev/nss/c2c_tx", nss_c2c_tx_table);
++	if (!nss_c2c_tx_header) {
++		ret = -ENOMEM;
++	}
++	mutex_unlock(&nss_c2c_tx_sysctl_lock);
++	return ret;
+ }
+ 
++void nss_c2c_tx_register_sysctl(void)
++{
++	(void)nss_c2c_tx_register_sysctl_checked();
++}
++
+ /*
+  * nss_c2c_tx_unregister_sysctl()
+  *      Unregister sysctl specific to c2c_tx
+  */
+ void nss_c2c_tx_unregister_sysctl(void)
+ {
++	struct ctl_table_header *header;
++
+ 	/*
+ 	 * Unregister sysctl table.
+ 	 */
+-	if (nss_c2c_tx_header) {
+-		unregister_sysctl_table(nss_c2c_tx_header);
++	mutex_lock(&nss_c2c_tx_sysctl_lock);
++	header = nss_c2c_tx_header;
++	nss_c2c_tx_header = NULL;
++	if (header) {
++		unregister_sysctl_table(header);
+ 	}
++	mutex_unlock(&nss_c2c_tx_sysctl_lock);
+ }
+ 
+ /*
+--- a/nss_core.h
++++ b/nss_core.h
+@@ -1038,6 +1038,7 @@
+  * APIs provided by nss_stats.c
+  */
+ extern void nss_stats_init(void);
++extern int nss_stats_init_checked(void);
+ extern void nss_stats_clean(void);
+ 
+ /*
+@@ -1063,9 +1064,7 @@
+ /*
+  * APIs for coredump
+  */
+-extern void nss_coredump_notify_register(void);
+ extern void nss_fw_coredump_notify(struct nss_ctx_instance *nss_own, int intr);
+-extern int nss_coredump_init_delay_work(void);
+ 
+ /*
+  * APIs provided by nss_freq.c
+--- a/nss_coredump.c
++++ b/nss_coredump.c
+@@ -22,9 +22,14 @@
+  */
+ 
+ #include "nss_core.h"
++#include "nss_coredump.h"
+ #include "nss_hal.h"
+ #include "nss_log.h"
++#include <linux/atomic.h>
+ #include <linux/kernel.h>
++#include <linux/mutex.h>
++#include <linux/spinlock.h>
++#include <linux/wait.h>
+ 
+ #if (LINUX_VERSION_CODE < KERNEL_VERSION(6, 6, 0))
+ #include <linux/notifier.h>	/* for panic_notifier_list */
+@@ -40,8 +45,56 @@
+ 
+ static struct delayed_work coredump_queuewait;
+ static struct workqueue_struct *coredump_workqueue;
++static DEFINE_MUTEX(coredump_lifecycle_lock);
++static DEFINE_SPINLOCK(coredump_gate_lock);
++static DECLARE_WAIT_QUEUE_HEAD(coredump_idle);
++static atomic_t coredump_active = ATOMIC_INIT(0);
++static bool coredump_accepting;
++static bool coredump_notifier_registered;
+ 
+ /*
++ * This count protects component resources, not callback code lifetime. The
++ * caller must still join all IRQ/NAPI callers before module text retirement.
++ */
++static bool nss_coredump_begin(void)
++{
++	unsigned long flags;
++	bool admitted = false;
++
++	spin_lock_irqsave(&coredump_gate_lock, flags);
++	if (coredump_accepting) {
++		atomic_inc(&coredump_active);
++		admitted = true;
++	}
++	spin_unlock_irqrestore(&coredump_gate_lock, flags);
++	return admitted;
++}
++
++static void nss_coredump_end(void)
++{
++	unsigned long flags;
++
++	spin_lock_irqsave(&coredump_gate_lock, flags);
++	if (atomic_dec_and_test(&coredump_active))
++		wake_up_all(&coredump_idle);
++	spin_unlock_irqrestore(&coredump_gate_lock, flags);
++}
++
++/* Presence check only; root must keep mappings live through all caller joins. */
++static bool nss_coredump_can_send(struct nss_ctx_instance *ctx)
++{
++	if (!ctx || ctx->id >= NSS_MAX_CORES || ctx->id >= nss_top_main.num_nss ||
++			!READ_ONCE(ctx->nmap))
++		return false;
++#if defined(NSS_HAL_IPQ807x_SUPPORT) || defined(NSS_HAL_IPQ60XX_SUPPORT) || \
++	defined(NSS_HAL_IPQ50XX_SUPPORT) || defined(NSS_HAL_IPQ95XX_SUPPORT)
++	if (!READ_ONCE(ctx->qgic_map))
++		return false;
++#endif
++	return true;
++}
++
++/*
+  * nss_coredump_wait()
+  *	reboot (panic) if all finished coredump interrupts will not come.
+  *   N2H (C2C) interrupt may get lost during trap, as well NSS may start
+@@ -55,23 +108,6 @@
+ }
+ 
+ /*
+- * nss_coredump_init_delay_work()
+- *	set a wait function in case coredump finish interrupt lost or
+- * only one NSS core is up.
+- */
+-int nss_coredump_init_delay_work(void)
+-{
+-	coredump_workqueue = create_singlethread_workqueue("coredump_wait");
+-	if (!coredump_workqueue) {
+-		nss_warning("can't set wait: hopefully all int will come\n");
+-		return -ENOMEM;
+-	}
+-
+-	INIT_DELAYED_WORK(&coredump_queuewait, nss_coredump_wait);
+-	return 0;
+-}
+-
+-/*
+  * nss_panic_handler()
+  *	notification callback register to panic chain
+  */
+@@ -83,7 +119,7 @@
+ 
+ 	for (i = 0; i < nss_top_main.num_nss; i++) {
+ 		struct nss_ctx_instance *nss_ctx = &nss_top_main.nss[i];
+-		if (nss_ctx->state & NSS_CORE_STATE_FW_DEAD || !nss_ctx->nmap)
++		if (nss_ctx->state & NSS_CORE_STATE_FW_DEAD || !nss_coredump_can_send(nss_ctx))
+ 			continue;
+ 		nss_ctx->state |= NSS_CORE_STATE_PANIC;
+ 		nss_hal_send_interrupt(nss_ctx, NSS_H2N_INTR_TRIGGER_COREDUMP);
+@@ -102,7 +138,7 @@
+ 		for (i = 0; i < nss_top_main.num_nss; i++) {
+ 			struct nss_ctx_instance *nss_ctx = &nss_top_main.nss[i];
+ 			if ((nss_ctx->state & NSS_CORE_STATE_FW_DEAD ||
+-				!nss_ctx->nmap) &&
++				!nss_coredump_can_send(nss_ctx)) &&
+ 			    !(nss_ctx->state & NSS_CORE_STATE_FW_DUMP)) {
+ 				nss_ctx->state |= NSS_CORE_STATE_FW_DUMP;
+ 				dumped++;
+@@ -126,19 +162,90 @@
+ };
+ 
+ /*
+- * nss_coredump_notify_register()
+- *	API for nss_init to register coredump notifier to panic chain
++ * nss_coredump_init()
++ *	Acquire the queue before publishing the notifier or notify admission.
+  */
+-void nss_coredump_notify_register(void)
++int nss_coredump_init(void)
+ {
+-	atomic_notifier_chain_register(&panic_notifier_list, &nss_panic_nb);
++	unsigned long flags;
++	int ret;
++
++	mutex_lock(&coredump_lifecycle_lock);
++	if (coredump_workqueue) {
++		ret = -EBUSY;
++		goto out;
++	}
++
++	INIT_DELAYED_WORK(&coredump_queuewait, nss_coredump_wait);
++	coredump_workqueue = create_singlethread_workqueue("coredump_wait");
++	if (!coredump_workqueue) {
++		nss_warning("can't create coredump wait queue\n");
++		ret = -ENOMEM;
++		goto out;
++	}
++
++	ret = atomic_notifier_chain_register(&panic_notifier_list, &nss_panic_nb);
++	if (ret) {
++		destroy_workqueue(coredump_workqueue);
++		coredump_workqueue = NULL;
++		goto out;
++	}
++	coredump_notifier_registered = true;
++	spin_lock_irqsave(&coredump_gate_lock, flags);
++	coredump_accepting = true;
++	spin_unlock_irqrestore(&coredump_gate_lock, flags);
++out:
++	mutex_unlock(&coredump_lifecycle_lock);
++	return ret;
+ }
+ 
++/* Lifecycle lock held; no callback acquires it. All joins run without RTNL. */
++static void __nss_coredump_quiesce(void)
++{
++	unsigned long flags;
++
++	if (!coredump_workqueue)
++		return;
++
++	spin_lock_irqsave(&coredump_gate_lock, flags);
++	coredump_accepting = false;
++	spin_unlock_irqrestore(&coredump_gate_lock, flags);
++
++	if (coredump_notifier_registered) {
++		/* Atomic unregister includes the RCU join of panic callbacks. */
++		atomic_notifier_chain_unregister(&panic_notifier_list, &nss_panic_nb);
++		coredump_notifier_registered = false;
++	}
++	wait_event(coredump_idle, !atomic_read(&coredump_active));
++	/* Join the final decrement/wake before cancelling or destroying resources. */
++	spin_lock_irqsave(&coredump_gate_lock, flags);
++	spin_unlock_irqrestore(&coredump_gate_lock, flags);
++	cancel_delayed_work_sync(&coredump_queuewait);
++}
++
++void nss_coredump_quiesce(void)
++{
++	mutex_lock(&coredump_lifecycle_lock);
++	__nss_coredump_quiesce();
++	mutex_unlock(&coredump_lifecycle_lock);
++}
++
++void nss_coredump_exit(void)
++{
++	mutex_lock(&coredump_lifecycle_lock);
++	__nss_coredump_quiesce();
++	if (coredump_workqueue) {
++		destroy_workqueue(coredump_workqueue);
++		coredump_workqueue = NULL;
++	}
++	mutex_unlock(&coredump_lifecycle_lock);
++}
++
+ /*
+  * nss_fw_coredump_notify()
+  *	handler for coredump notification from NSS FW
+  */
+-void nss_fw_coredump_notify(struct nss_ctx_instance *nss_own,
++static void nss_fw_coredump_notify_active(struct nss_ctx_instance *nss_own,
+ 				int intr __attribute__ ((unused)))
+ {
+ 	int i, j, curr_index, useful_entries, num_cores_wait;
+@@ -231,7 +338,7 @@
+ 		/*
+ 		 * Notify any live core to dump.
+ 		 */
+-		if (!(nss_ctx->state & NSS_CORE_STATE_FW_DEAD) && nss_ctx->nmap) {
++		if (!(nss_ctx->state & NSS_CORE_STATE_FW_DEAD) && nss_coredump_can_send(nss_ctx)) {
+ 			nss_warning("notify NSS FW %px for coredump\n", nss_ctx->nmap);
+ 			nss_hal_send_interrupt(nss_ctx, NSS_H2N_INTR_TRIGGER_COREDUMP);
+ 			continue;
+@@ -264,3 +371,28 @@
+ 
+ 	}
+ }
++
++void nss_fw_coredump_notify(struct nss_ctx_instance *nss_own, int intr)
++{
++	if (!nss_coredump_begin())
++		return;
++
++	nss_fw_coredump_notify_active(nss_own, intr);
++	nss_coredump_end();
++}
++
++bool nss_coredump_request(struct nss_ctx_instance *ctx)
++{
++	bool sent = false;
++
++	if (!ctx || !nss_coredump_begin())
++		return false;
++
++	if (!nss_coredump_can_send(ctx))
++		goto out;
++	nss_hal_send_interrupt(ctx, NSS_H2N_INTR_TRIGGER_COREDUMP);
++	sent = true;
++out:
++	nss_coredump_end();
++	return sent;
++}
+--- /dev/null
++++ b/nss_coredump.h
+@@ -0,0 +1,40 @@
++/* SPDX-License-Identifier: ISC */
++#ifndef __NSS_COREDUMP_H
++#define __NSS_COREDUMP_H
++
++#include <linux/types.h>
++
++struct nss_ctx_instance;
++
++/*
++ * Process-context lifecycle only, never under RTNL or callback-required locks.
++ * Initialize before publishing core/IRQ producers. Quiesce before retiring any
++ * core MMIO, device or DMA/log resources; exit releases the owned workqueue.
++ * Quiesce/exit may sleep. Duplicate init fails, including after quiesce alone.
++ * Init returns -ENOMEM, -EBUSY or the notifier registration errno on failure;
++ * a failed init owns no new queue or notifier. Only exit permits another init.
++ *
++ * Quiesce closes notify/request admission, unregisters/RCU-joins the panic
++ * notifier, joins admitted notify/request bodies and their final wake, then
++ * synchronously cancels delayed work. The delayed callback is joined by cancel,
++ * not the active count; a callback already executing panic need not return.
++ *
++ * Active notify/request accounting is not a module code pin: callers must
++ * separately retire/join IRQ/NAPI and sysctl callers before module text
++ * retirement. Raw MMIO producers must be scoped or joined before core resource
++ * retirement. These APIs do not establish FW/DMA idle.
++ */
++int nss_coredump_init(void);
++void nss_coredump_quiesce(void);
++void nss_coredump_exit(void);
++
++/*
++ * Non-NMI callers must supply a live core context. True means one admitted H2N
++ * request was sent, not FW receipt/completion. False also covers an unready or
++ * invalid core, not only closed admission. Notify callers are IRQ/NAPI owners.
++ * Mapping-presence checks do not serialize probe/remove or pin those mappings.
++ */
++bool nss_coredump_request(struct nss_ctx_instance *ctx);
++void nss_fw_coredump_notify(struct nss_ctx_instance *nss_own, int intr);
++
++#endif /* __NSS_COREDUMP_H */
+--- /dev/null
++++ b/nss_debugfs.h
+@@ -0,0 +1,27 @@
++/* SPDX-License-Identifier: ISC */
++#ifndef __NSS_DEBUGFS_H
++#define __NSS_DEBUGFS_H
++
++#include <linux/debugfs.h>
++
++enum nss_debugfs_parent {
++	NSS_DEBUGFS_TOP,
++	NSS_DEBUGFS_STATS,
++	NSS_DEBUGFS_STRINGS,
++	NSS_DEBUGFS_PROJECT,
++};
++
++/* Failed creation rolls back the transaction's first new subtree at end. */
++/* No creator mutex is held while rollback or terminal removal joins fops. */
++bool nss_debugfs_begin(enum nss_debugfs_parent parent);
++bool nss_debugfs_end(void);
++struct dentry *nss_debugfs_create_dir_locked(const char *name, struct dentry *parent);
++struct dentry *nss_debugfs_create_file_locked(const char *name, umode_t mode,
++		struct dentry *parent, void *data, const struct file_operations *ops);
++struct dentry *nss_debugfs_lookup_locked(const char *name, struct dentry *parent);
++void nss_debugfs_remove_locked(struct dentry *dentry);
++void nss_debugfs_remove(struct dentry **dentry);
++int nss_debugfs_open_allowed(void);
++int nss_stats_init_checked(void);
++
++#endif
+--- a/nss_dma.c
++++ b/nss_dma.c
+@@ -23,6 +23,8 @@
+  */
+ 
+ #include <nss_hal.h>
++#include <linux/mutex.h>
++#include "nss_sysctl.h"
+ #include "nss_dma_stats.h"
+ #include "nss_dma_log.h"
+ #include "nss_dma_strings.h"
+@@ -290,6 +292,9 @@
+ 	struct nss_ctx_instance *nss_ctx = nss_dma_get_context();
+ 	int cur_state = test_cfg.run.val;
+ 	int ret;
++
++	if (write && !nss_sysctl_ctx_ready(nss_ctx))
++		return -ENODEV;
+ 
+ 	ret = proc_dointvec(ctl, write, buffer, lenp, ppos);
+ 	if (ret != NSS_SUCCESS) {
+@@ -408,13 +413,22 @@
+ #endif
+ 
+ static struct ctl_table_header *nss_dma_header;
++/* Readers must not take this lock: unregister waits for active handlers. */
++static DEFINE_MUTEX(nss_dma_sysctl_lock);
+ 
+ /*
+- * nss_dma_register_sysctl()
++ * nss_dma_register_sysctl_checked()
+  */
+-void nss_dma_register_sysctl(void)
++int nss_dma_register_sysctl_checked(void)
+ {
++	int ret = 0;
+ 
++	mutex_lock(&nss_dma_sysctl_lock);
++	if (nss_dma_header) {
++		mutex_unlock(&nss_dma_sysctl_lock);
++		return -EBUSY;
++	}
++
+ 	/*
+ 	 * dma sema init.
+ 	 */
+@@ -429,20 +443,36 @@
+ #else
+ 	nss_dma_header = register_sysctl("dev/nss/dma", nss_dma_table);
+ #endif
++	if (!nss_dma_header) {
++		ret = -ENOMEM;
++	}
++	mutex_unlock(&nss_dma_sysctl_lock);
++	return ret;
+ }
+ 
++void nss_dma_register_sysctl(void)
++{
++	(void)nss_dma_register_sysctl_checked();
++}
++
+ /*
+  * nss_dma_unregister_sysctl()
+  *      Unregister sysctl specific to dma
+  */
+ void nss_dma_unregister_sysctl(void)
+ {
++	struct ctl_table_header *header;
++
+ 	/*
+ 	 * Unregister sysctl table.
+ 	 */
+-	if (nss_dma_header) {
+-		unregister_sysctl_table(nss_dma_header);
++	mutex_lock(&nss_dma_sysctl_lock);
++	header = nss_dma_header;
++	nss_dma_header = NULL;
++	if (header) {
++		unregister_sysctl_table(header);
+ 	}
++	mutex_unlock(&nss_dma_sysctl_lock);
+ }
+ 
+ /*
+--- a/nss_dynamic_interface_stats.c
++++ b/nss_dynamic_interface_stats.c
+@@ -158,21 +158,29 @@
+  * nss_dynamic_interface_stats_dentry_create()
+  *	Create dynamic-interface statistics debug entry.
+  */
+-void nss_dynamic_interface_stats_dentry_create(void)
++static void nss_dynamic_interface_stats_dentry_create_locked(void)
+ {
+ 	struct dentry *di_dentry = NULL;
+ 	struct dentry *di_type_name_d = NULL;
+ 
+-	di_dentry = debugfs_create_dir("dynamic_if", nss_top_main.stats_dentry);
++	di_dentry = nss_debugfs_create_dir_locked("dynamic_if", nss_top_main.stats_dentry);
+ 	if (unlikely(di_dentry == NULL)) {
+ 		nss_warning("Failed to create qca-nss-drv/stats/dynamic_if directory");
+ 		return;
+ 	}
+ 
+-	di_type_name_d = debugfs_create_file("type_names", 0400, di_dentry,
++	di_type_name_d = nss_debugfs_create_file_locked("type_names", 0400, di_dentry,
+ 					&nss_top_main, &nss_dynamic_interface_type_names_stats_ops);
+ 	if (unlikely(di_type_name_d == NULL)) {
+ 		nss_warning("Failed to create qca-nss-drv/stats/dynamic_if/type_names file");
+ 		return;
+ 	}
+ }
++
++void nss_dynamic_interface_stats_dentry_create(void)
++{
++	if (!nss_debugfs_begin(NSS_DEBUGFS_STATS))
++		return;
++	nss_dynamic_interface_stats_dentry_create_locked();
++	nss_debugfs_end();
++}
+--- a/nss_edma_lite_stats.c
++++ b/nss_edma_lite_stats.c
+@@ -479,7 +479,7 @@
+  * nss_edma_lite_stats_dentry_create()
+  *	Create edma statistics debug entry.
+  */
+-void nss_edma_lite_stats_dentry_create(void)
++static void nss_edma_lite_stats_dentry_create_locked(void)
+ {
+ 	struct dentry *edma_d = NULL;
+ 	struct dentry *edma_rings_dir_d = NULL;
+@@ -490,7 +490,7 @@
+ 	struct dentry *edma_err_stats_d = NULL;
+ 	struct dentry *edma_node_stats_d = NULL;
+ 
+-	edma_d = debugfs_create_dir("edma_lite", nss_top_main.stats_dentry);
++	edma_d = nss_debugfs_create_dir_locked("edma_lite", nss_top_main.stats_dentry);
+ 	if (unlikely(edma_d == NULL)) {
+ 		nss_warning("Failed to create qca-nss-drv/stats/edma directory");
+ 		return;
+@@ -499,7 +499,7 @@
+ 	/*
+ 	 *  edma node stats
+ 	 */
+-	edma_node_stats_d = debugfs_create_file("node_stats", 0400, edma_d, &nss_top_main, &nss_edma_lite_node_stats_ops);
++	edma_node_stats_d = nss_debugfs_create_file_locked("node_stats", 0400, edma_d, &nss_top_main, &nss_edma_lite_node_stats_ops);
+ 	if (unlikely(edma_node_stats_d == NULL)) {
+ 		nss_warning("Failed to create qca-nss-drv/stats/edma/node_stats file");
+ 		return;
+@@ -508,7 +508,7 @@
+ 	/*
+ 	 *  edma error stats
+ 	 */
+-	edma_err_stats_d = debugfs_create_file("err_stats", 0400, edma_d, &nss_top_main, &nss_edma_lite_err_stats_ops);
++	edma_err_stats_d = nss_debugfs_create_file_locked("err_stats", 0400, edma_d, &nss_top_main, &nss_edma_lite_err_stats_ops);
+ 	if (unlikely(edma_err_stats_d == NULL)) {
+ 		nss_warning("Failed to create qca-nss-drv/stats/edma/err_stats file");
+ 		return;
+@@ -517,7 +517,7 @@
+ 	/*
+ 	 * edma ring stats
+ 	 */
+-	edma_rings_dir_d = debugfs_create_dir("rings", edma_d);
++	edma_rings_dir_d = nss_debugfs_create_dir_locked("rings", edma_d);
+ 	if (unlikely(edma_rings_dir_d == NULL)) {
+ 		nss_warning("Failed to create qca-nss-drv/stats/edma/rings directory");
+ 		return;
+@@ -526,7 +526,7 @@
+ 	/*
+ 	 * edma tx ring stats
+ 	 */
+-	edma_tx_d = debugfs_create_file("tx", 0400, edma_rings_dir_d, &nss_top_main, &nss_edma_lite_txring_stats_ops);
++	edma_tx_d = nss_debugfs_create_file_locked("tx", 0400, edma_rings_dir_d, &nss_top_main, &nss_edma_lite_txring_stats_ops);
+ 	if (unlikely(edma_tx_d == NULL)) {
+ 		nss_warning("Failed to create qca-nss-drv/stats/edma/rings/tx file");
+ 		return;
+@@ -535,7 +535,7 @@
+ 	/*
+ 	 * edma rx ring stats
+ 	 */
+-	edma_rx_d = debugfs_create_file("rx", 0400, edma_rings_dir_d, &nss_top_main, &nss_edma_lite_rxring_stats_ops);
++	edma_rx_d = nss_debugfs_create_file_locked("rx", 0400, edma_rings_dir_d, &nss_top_main, &nss_edma_lite_rxring_stats_ops);
+ 	if (unlikely(edma_rx_d == NULL)) {
+ 		nss_warning("Failed to create qca-nss-drv/stats/edma/rings/rx file");
+ 		return;
+@@ -544,7 +544,7 @@
+ 	/*
+ 	 * edma tx cmpl ring stats
+ 	 */
+-	edma_txcmpl_d = debugfs_create_file("txcmpl", 0400, edma_rings_dir_d, &nss_top_main, &nss_edma_lite_txcmplring_stats_ops);
++	edma_txcmpl_d = nss_debugfs_create_file_locked("txcmpl", 0400, edma_rings_dir_d, &nss_top_main, &nss_edma_lite_txcmplring_stats_ops);
+ 	if (unlikely(edma_txcmpl_d == NULL)) {
+ 		nss_warning("Failed to create qca-nss-drv/stats/edma/rings/txcmpl file");
+ 		return;
+@@ -553,13 +553,21 @@
+ 	/*
+ 	 * edma rx fill ring stats
+ 	 */
+-	edma_rxfill_d = debugfs_create_file("rxfill", 0400, edma_rings_dir_d, &nss_top_main, &nss_edma_lite_rxfillring_stats_ops);
++	edma_rxfill_d = nss_debugfs_create_file_locked("rxfill", 0400, edma_rings_dir_d, &nss_top_main, &nss_edma_lite_rxfillring_stats_ops);
+ 	if (unlikely(edma_rxfill_d == NULL)) {
+ 		nss_warning("Failed to create qca-nss-drv/stats/edma/rings/rxfill file");
+ 		return;
+ 	}
+ }
+ 
++void nss_edma_lite_stats_dentry_create(void)
++{
++	if (!nss_debugfs_begin(NSS_DEBUGFS_STATS))
++		return;
++	nss_edma_lite_stats_dentry_create_locked();
++	nss_debugfs_end();
++}
++
+ /*
+  * nss_edma_lite_node_stats_sync()
+  *	Handle the syncing of EDMA node statistics.
+--- a/nss_edma_lite_strings.c
++++ b/nss_edma_lite_strings.c
+@@ -160,7 +160,7 @@
+  * nss_edma_lite_strings_dentry_create()
+  *      Create EDMA statistics strings debug entry.
+  */
+-void nss_edma_lite_strings_dentry_create(void)
++static void nss_edma_lite_strings_dentry_create_locked(void)
+ {
+ 	struct dentry *edma_d;
+ 	struct dentry *edma_rings_dir_d;
+@@ -171,7 +171,7 @@
+ 		return;
+ 	}
+ 
+-	edma_d = debugfs_create_dir("edma", nss_top_main.strings_dentry);
++	edma_d = nss_debugfs_create_dir_locked("edma", nss_top_main.strings_dentry);
+ 	if (!edma_d) {
+ 		nss_warning("Failed to create qca-nss-drv/strings/edma directory");
+ 		return;
+@@ -180,7 +180,7 @@
+ 	/*
+ 	 *  edma node stats
+ 	 */
+-	file_d = debugfs_create_file("node_stats", 0400, edma_d, &nss_top_main, &nss_edma_lite_node_stats_strings_ops);
++	file_d = nss_debugfs_create_file_locked("node_stats", 0400, edma_d, &nss_top_main, &nss_edma_lite_node_stats_strings_ops);
+ 	if (!file_d) {
+ 		nss_warning("Failed to create qca-nss-drv/strings/edma/node_stats file");
+ 		goto fail;
+@@ -189,7 +189,7 @@
+ 	/*
+ 	 *  edma error stats
+ 	 */
+-	file_d = debugfs_create_file("err_stats", 0400, edma_d, &nss_top_main, &nss_edma_lite_err_strings_ops);
++	file_d = nss_debugfs_create_file_locked("err_stats", 0400, edma_d, &nss_top_main, &nss_edma_lite_err_strings_ops);
+ 	if (!file_d) {
+ 		nss_warning("Failed to create qca-nss-drv/strings/edma/err_stats file");
+ 		goto fail;
+@@ -198,7 +198,7 @@
+ 	/*
+ 	 * edma ring stats
+ 	 */
+-	edma_rings_dir_d = debugfs_create_dir("rings", edma_d);
++	edma_rings_dir_d = nss_debugfs_create_dir_locked("rings", edma_d);
+ 	if (!edma_rings_dir_d) {
+ 		nss_warning("Failed to create qca-nss-drv/strings/edma/rings directory");
+ 		goto fail;
+@@ -207,7 +207,7 @@
+ 	/*
+ 	 * edma tx ring stats
+ 	 */
+-	file_d = debugfs_create_file("tx", 0400, edma_rings_dir_d, &nss_top_main, &nss_edma_lite_txring_strings_ops);
++	file_d = nss_debugfs_create_file_locked("tx", 0400, edma_rings_dir_d, &nss_top_main, &nss_edma_lite_txring_strings_ops);
+ 	if (!file_d) {
+ 		nss_warning("Failed to create qca-nss-drv/strings/edma/rings/tx file");
+ 		goto fail;
+@@ -216,7 +216,7 @@
+ 	/*
+ 	 * edma rx ring stats
+ 	 */
+-	file_d = debugfs_create_file("rx", 0400, edma_rings_dir_d, &nss_top_main, &nss_edma_lite_rxring_strings_ops);
++	file_d = nss_debugfs_create_file_locked("rx", 0400, edma_rings_dir_d, &nss_top_main, &nss_edma_lite_rxring_strings_ops);
+ 	if (!file_d) {
+ 		nss_warning("Failed to create qca-nss-drv/strings/edma/rings/rx file");
+ 		goto fail;
+@@ -225,7 +225,7 @@
+ 	/*
+ 	 * edma tx cmpl ring stats
+ 	 */
+-	file_d = debugfs_create_file("txcmpl", 0400, edma_rings_dir_d, &nss_top_main, &nss_edma_lite_txcmplring_strings_ops);
++	file_d = nss_debugfs_create_file_locked("txcmpl", 0400, edma_rings_dir_d, &nss_top_main, &nss_edma_lite_txcmplring_strings_ops);
+ 	if (!file_d) {
+ 		nss_warning("Failed to create qca-nss-drv/strings/edma/rings/txcmpl file");
+ 		goto fail;
+@@ -234,7 +234,7 @@
+ 	/*
+ 	 * edma rx fill ring stats
+ 	 */
+-	file_d = debugfs_create_file("rxfill", 0400, edma_rings_dir_d, &nss_top_main, &nss_edma_lite_rxfillring_strings_ops);
++	file_d = nss_debugfs_create_file_locked("rxfill", 0400, edma_rings_dir_d, &nss_top_main, &nss_edma_lite_rxfillring_strings_ops);
+ 	if (!file_d) {
+ 		nss_warning("Failed to create qca-nss-drv/strings/edma/rings/rxfill file");
+ 		goto fail;
+@@ -242,5 +242,13 @@
+ 
+ 	return;
+ fail:
+-	debugfs_remove_recursive(edma_d);
++	nss_debugfs_remove_locked(edma_d);
+ }
++
++void nss_edma_lite_strings_dentry_create(void)
++{
++	if (!nss_debugfs_begin(NSS_DEBUGFS_STRINGS))
++		return;
++	nss_edma_lite_strings_dentry_create_locked();
++	nss_debugfs_end();
++}
+--- a/nss_edma_stats.c
++++ b/nss_edma_stats.c
+@@ -582,7 +582,7 @@
+  * nss_edma_stats_dentry_create()
+  *	Create edma statistics debug entry.
+  */
+-void nss_edma_stats_dentry_create(void)
++static void nss_edma_stats_dentry_create_locked(void)
+ {
+ 	int i;
+ 	struct dentry *edma_d = NULL;
+@@ -603,7 +603,7 @@
+ 	struct dentry *edma_err_stats_d = NULL;
+ 	char file_name[10];
+ 
+-	edma_d = debugfs_create_dir("edma", nss_top_main.stats_dentry);
++	edma_d = nss_debugfs_create_dir_locked("edma", nss_top_main.stats_dentry);
+ 	if (unlikely(edma_d == NULL)) {
+ 		nss_warning("Failed to create qca-nss-drv/stats/edma directory");
+ 		return;
+@@ -612,7 +612,7 @@
+ 	/*
+ 	 * edma port stats
+ 	 */
+-	edma_port_dir_d = debugfs_create_dir("ports", edma_d);
++	edma_port_dir_d = nss_debugfs_create_dir_locked("ports", edma_d);
+ 	if (unlikely(edma_port_dir_d == NULL)) {
+ 		nss_warning("Failed to create qca-nss-drv/stats/edma/ports directory");
+ 		return;
+@@ -622,25 +622,25 @@
+ 		memset(file_name, 0, sizeof(file_name));
+ 		snprintf(file_name, sizeof(file_name), "%d", i);
+ 
+-		edma_port_d = debugfs_create_dir(file_name, edma_port_dir_d);
++		edma_port_d = nss_debugfs_create_dir_locked(file_name, edma_port_dir_d);
+ 		if (unlikely(edma_port_d == NULL)) {
+ 			nss_warning("Failed to create qca-nss-drv/stats/edma/ports/%d directory", i);
+ 			return;
+ 		}
+ 
+-		edma_port_stats_d = debugfs_create_file("stats", 0400, edma_port_d, (void *)(nss_ptr_t)i, &nss_edma_port_stats_ops);
++		edma_port_stats_d = nss_debugfs_create_file_locked("stats", 0400, edma_port_d, (void *)(nss_ptr_t)i, &nss_edma_port_stats_ops);
+ 		if (unlikely(edma_port_stats_d == NULL)) {
+ 			nss_warning("Failed to create qca-nss-drv/stats/edma/ports/%d/stats file", i);
+ 			return;
+ 		}
+ 
+-		edma_port_type_d = debugfs_create_file("type", 0400, edma_port_d, (void *)(nss_ptr_t)i, &nss_edma_port_type_stats_ops);
++		edma_port_type_d = nss_debugfs_create_file_locked("type", 0400, edma_port_d, (void *)(nss_ptr_t)i, &nss_edma_port_type_stats_ops);
+ 		if (unlikely(edma_port_type_d == NULL)) {
+ 			nss_warning("Failed to create qca-nss-drv/stats/edma/ports/%d/type file", i);
+ 			return;
+ 		}
+ 
+-		edma_port_ring_map_d = debugfs_create_file("ring_map", 0400, edma_port_d, (void *)(nss_ptr_t)i, &nss_edma_port_ring_map_stats_ops);
++		edma_port_ring_map_d = nss_debugfs_create_file_locked("ring_map", 0400, edma_port_d, (void *)(nss_ptr_t)i, &nss_edma_port_ring_map_stats_ops);
+ 		if (unlikely(edma_port_ring_map_d == NULL)) {
+ 			nss_warning("Failed to create qca-nss-drv/stats/edma/ports/%d/ring_map file", i);
+ 			return;
+@@ -650,7 +650,7 @@
+ 	/*
+ 	 *  edma error stats
+ 	 */
+-	edma_err_stats_d = debugfs_create_file("err_stats", 0400, edma_d, &nss_top_main, &nss_edma_err_stats_ops);
++	edma_err_stats_d = nss_debugfs_create_file_locked("err_stats", 0400, edma_d, &nss_top_main, &nss_edma_err_stats_ops);
+ 	if (unlikely(edma_err_stats_d == NULL)) {
+ 		nss_warning("Failed to create qca-nss-drv/stats/edma/%d/err_stats file", 0);
+ 		return;
+@@ -659,7 +659,7 @@
+ 	/*
+ 	 * edma ring stats
+ 	 */
+-	edma_rings_dir_d = debugfs_create_dir("rings", edma_d);
++	edma_rings_dir_d = nss_debugfs_create_dir_locked("rings", edma_d);
+ 	if (unlikely(edma_rings_dir_d == NULL)) {
+ 		nss_warning("Failed to create qca-nss-drv/stats/edma/rings directory");
+ 		return;
+@@ -668,7 +668,7 @@
+ 	/*
+ 	 * edma tx ring stats
+ 	 */
+-	edma_tx_dir_d = debugfs_create_dir("tx", edma_rings_dir_d);
++	edma_tx_dir_d = nss_debugfs_create_dir_locked("tx", edma_rings_dir_d);
+ 	if (unlikely(edma_tx_dir_d == NULL)) {
+ 		nss_warning("Failed to create qca-nss-drv/stats/edma/rings/tx directory");
+ 		return;
+@@ -677,7 +677,7 @@
+ 	for (i = 0; i < NSS_EDMA_NUM_TX_RING_MAX; i++) {
+ 		memset(file_name, 0, sizeof(file_name));
+ 		scnprintf(file_name, sizeof(file_name), "%d", i);
+-		edma_tx_d = debugfs_create_file(file_name, 0400, edma_tx_dir_d, (void *)(nss_ptr_t)i, &nss_edma_txring_stats_ops);
++		edma_tx_d = nss_debugfs_create_file_locked(file_name, 0400, edma_tx_dir_d, (void *)(nss_ptr_t)i, &nss_edma_txring_stats_ops);
+ 		if (unlikely(edma_tx_d == NULL)) {
+ 			nss_warning("Failed to create qca-nss-drv/stats/edma/rings/tx/%d file", i);
+ 			return;
+@@ -687,7 +687,7 @@
+ 	/*
+ 	 * edma rx ring stats
+ 	 */
+-	edma_rx_dir_d = debugfs_create_dir("rx", edma_rings_dir_d);
++	edma_rx_dir_d = nss_debugfs_create_dir_locked("rx", edma_rings_dir_d);
+ 	if (unlikely(edma_rx_dir_d == NULL)) {
+ 		nss_warning("Failed to create qca-nss-drv/stats/edma/rings/rx directory");
+ 		return;
+@@ -696,7 +696,7 @@
+ 	for (i = 0; i < NSS_EDMA_NUM_RX_RING_MAX; i++) {
+ 		memset(file_name, 0, sizeof(file_name));
+ 		scnprintf(file_name, sizeof(file_name), "%d", i);
+-		edma_rx_d = debugfs_create_file(file_name, 0400, edma_rx_dir_d, (void *)(nss_ptr_t)i, &nss_edma_rxring_stats_ops);
++		edma_rx_d = nss_debugfs_create_file_locked(file_name, 0400, edma_rx_dir_d, (void *)(nss_ptr_t)i, &nss_edma_rxring_stats_ops);
+ 		if (unlikely(edma_rx_d == NULL)) {
+ 			nss_warning("Failed to create qca-nss-drv/stats/edma/rings/rx/%d file", i);
+ 			return;
+@@ -706,7 +706,7 @@
+ 	/*
+ 	 * edma tx cmpl ring stats
+ 	 */
+-	edma_txcmpl_dir_d = debugfs_create_dir("txcmpl", edma_rings_dir_d);
++	edma_txcmpl_dir_d = nss_debugfs_create_dir_locked("txcmpl", edma_rings_dir_d);
+ 	if (unlikely(edma_txcmpl_dir_d == NULL)) {
+ 		nss_warning("Failed to create qca-nss-drv/stats/edma/rings/txcmpl directory");
+ 		return;
+@@ -715,7 +715,7 @@
+ 	for (i = 0; i < NSS_EDMA_NUM_TXCMPL_RING_MAX; i++) {
+ 		memset(file_name, 0, sizeof(file_name));
+ 		scnprintf(file_name, sizeof(file_name), "%d", i);
+-		edma_txcmpl_d = debugfs_create_file(file_name, 0400, edma_txcmpl_dir_d, (void *)(nss_ptr_t)i, &nss_edma_txcmplring_stats_ops);
++		edma_txcmpl_d = nss_debugfs_create_file_locked(file_name, 0400, edma_txcmpl_dir_d, (void *)(nss_ptr_t)i, &nss_edma_txcmplring_stats_ops);
+ 		if (unlikely(edma_txcmpl_d == NULL)) {
+ 			nss_warning("Failed to create qca-nss-drv/stats/edma/rings/txcmpl/%d file", i);
+ 			return;
+@@ -725,7 +725,7 @@
+ 	/*
+ 	 * edma rx fill ring stats
+ 	 */
+-	edma_rxfill_dir_d = debugfs_create_dir("rxfill", edma_rings_dir_d);
++	edma_rxfill_dir_d = nss_debugfs_create_dir_locked("rxfill", edma_rings_dir_d);
+ 	if (unlikely(edma_rxfill_dir_d == NULL)) {
+ 		nss_warning("Failed to create qca-nss-drv/stats/edma/rings/rxfill directory");
+ 		return;
+@@ -734,7 +734,7 @@
+ 	for (i = 0; i < NSS_EDMA_NUM_RXFILL_RING_MAX; i++) {
+ 		memset(file_name, 0, sizeof(file_name));
+ 		scnprintf(file_name, sizeof(file_name), "%d", i);
+-		edma_rxfill_d = debugfs_create_file(file_name, 0400, edma_rxfill_dir_d, (void *)(nss_ptr_t)i, &nss_edma_rxfillring_stats_ops);
++		edma_rxfill_d = nss_debugfs_create_file_locked(file_name, 0400, edma_rxfill_dir_d, (void *)(nss_ptr_t)i, &nss_edma_rxfillring_stats_ops);
+ 		if (unlikely(edma_rxfill_d == NULL)) {
+ 			nss_warning("Failed to create qca-nss-drv/stats/edma/rings/rxfill/%d file", i);
+ 			return;
+@@ -742,6 +742,14 @@
+ 	}
+ }
+ 
++void nss_edma_stats_dentry_create(void)
++{
++	if (!nss_debugfs_begin(NSS_DEBUGFS_STATS))
++		return;
++	nss_edma_stats_dentry_create_locked();
++	nss_debugfs_end();
++}
++
+ /*
+  * nss_edma_metadata_port_stats_sync()
+  *	Handle the syncing of EDMA port statistics.
+--- a/nss_edma_strings.c
++++ b/nss_edma_strings.c
+@@ -218,7 +218,7 @@
+  * nss_edma_strings_dentry_create()
+  *      Create EDMA statistics strings debug entry.
+  */
+-void nss_edma_strings_dentry_create(void)
++static void nss_edma_strings_dentry_create_locked(void)
+ {
+ 	struct dentry *edma_d;
+ 	struct dentry *edma_port_dir_d;
+@@ -234,7 +234,7 @@
+ 		return;
+ 	}
+ 
+-	edma_d = debugfs_create_dir("edma", nss_top_main.strings_dentry);
++	edma_d = nss_debugfs_create_dir_locked("edma", nss_top_main.strings_dentry);
+ 	if (!edma_d) {
+ 		nss_warning("Failed to create qca-nss-drv/strings/edma directory");
+ 		return;
+@@ -243,25 +243,25 @@
+ 	/*
+ 	 * EDMA port stats.
+ 	 */
+-	edma_port_dir_d = debugfs_create_dir("ports", edma_d);
++	edma_port_dir_d = nss_debugfs_create_dir_locked("ports", edma_d);
+ 	if (!edma_port_dir_d) {
+ 		nss_warning("Failed to create qca-nss-drv/strings/edma/ports directory");
+ 		goto fail;
+ 	}
+ 
+-	file_d = debugfs_create_file("common_stats_str", 0400, edma_port_dir_d, &nss_top_main, &nss_edma_common_stats_strings_ops);
++	file_d = nss_debugfs_create_file_locked("common_stats_str", 0400, edma_port_dir_d, &nss_top_main, &nss_edma_common_stats_strings_ops);
+ 	if (!file_d) {
+ 		nss_warning("Failed to create qca-nss-drv/strings/edma/ports/common_stats_str file");
+ 		goto fail;
+ 	}
+ 
+-	file_d = debugfs_create_file("type", 0400, edma_port_dir_d, &nss_top_main, &nss_edma_port_type_strings_ops);
++	file_d = nss_debugfs_create_file_locked("type", 0400, edma_port_dir_d, &nss_top_main, &nss_edma_port_type_strings_ops);
+ 	if (!file_d) {
+ 		nss_warning("Failed to create qca-nss-drv/strings/edma/ports/type file");
+ 		goto fail;
+ 	}
+ 
+-	file_d = debugfs_create_file("ring_map", 0400, edma_port_dir_d, &nss_top_main, &nss_edma_port_ring_map_strings_ops);
++	file_d = nss_debugfs_create_file_locked("ring_map", 0400, edma_port_dir_d, &nss_top_main, &nss_edma_port_ring_map_strings_ops);
+ 	if (!file_d) {
+ 		nss_warning("Failed to create qca-nss-drv/strings/edma/ports/ring_map file");
+ 		goto fail;
+@@ -270,7 +270,7 @@
+ 	/*
+ 	 *  edma error stats
+ 	 */
+-	file_d = debugfs_create_file("err_stats", 0400, edma_d, &nss_top_main, &nss_edma_err_strings_ops);
++	file_d = nss_debugfs_create_file_locked("err_stats", 0400, edma_d, &nss_top_main, &nss_edma_err_strings_ops);
+ 	if (!file_d) {
+ 		nss_warning("Failed to create qca-nss-drv/strings/edma/err_stats file");
+ 		goto fail;
+@@ -279,7 +279,7 @@
+ 	/*
+ 	 * edma ring stats
+ 	 */
+-	edma_rings_dir_d = debugfs_create_dir("rings", edma_d);
++	edma_rings_dir_d = nss_debugfs_create_dir_locked("rings", edma_d);
+ 	if (!edma_rings_dir_d) {
+ 		nss_warning("Failed to create qca-nss-drv/strings/edma/rings directory");
+ 		goto fail;
+@@ -288,13 +288,13 @@
+ 	/*
+ 	 * edma tx ring stats
+ 	 */
+-	edma_tx_dir_d = debugfs_create_dir("tx", edma_rings_dir_d);
++	edma_tx_dir_d = nss_debugfs_create_dir_locked("tx", edma_rings_dir_d);
+ 	if (!edma_tx_dir_d) {
+ 		nss_warning("Failed to create qca-nss-drv/strings/edma/rings/tx directory");
+ 		goto fail;
+ 	}
+ 
+-	file_d = debugfs_create_file("tx_str", 0400, edma_tx_dir_d, &nss_top_main, &nss_edma_txring_strings_ops);
++	file_d = nss_debugfs_create_file_locked("tx_str", 0400, edma_tx_dir_d, &nss_top_main, &nss_edma_txring_strings_ops);
+ 	if (!file_d) {
+ 		nss_warning("Failed to create qca-nss-drv/strings/edma/rings/tx file");
+ 		goto fail;
+@@ -303,13 +303,13 @@
+ 	/*
+ 	 * edma rx ring stats
+ 	 */
+-	edma_rx_dir_d = debugfs_create_dir("rx", edma_rings_dir_d);
++	edma_rx_dir_d = nss_debugfs_create_dir_locked("rx", edma_rings_dir_d);
+ 	if (!edma_rx_dir_d) {
+ 		nss_warning("Failed to create qca-nss-drv/strings/edma/rings/rx directory");
+ 		goto fail;
+ 	}
+ 
+-	file_d = debugfs_create_file("rx_str", 0400, edma_rx_dir_d, &nss_top_main, &nss_edma_rxring_strings_ops);
++	file_d = nss_debugfs_create_file_locked("rx_str", 0400, edma_rx_dir_d, &nss_top_main, &nss_edma_rxring_strings_ops);
+ 	if (!file_d) {
+ 		nss_warning("Failed to create qca-nss-drv/strings/edma/rings/rx file");
+ 		goto fail;
+@@ -318,13 +318,13 @@
+ 	/*
+ 	 * edma tx cmpl ring stats
+ 	 */
+-	edma_txcmpl_dir_d = debugfs_create_dir("txcmpl", edma_rings_dir_d);
++	edma_txcmpl_dir_d = nss_debugfs_create_dir_locked("txcmpl", edma_rings_dir_d);
+ 	if (!edma_txcmpl_dir_d) {
+ 		nss_warning("Failed to create qca-nss-drv/strings/edma/rings/txcmpl directory");
+ 		goto fail;
+ 	}
+ 
+-	file_d = debugfs_create_file("txcmpl_str", 0400, edma_txcmpl_dir_d, &nss_top_main, &nss_edma_txcmplring_strings_ops);
++	file_d = nss_debugfs_create_file_locked("txcmpl_str", 0400, edma_txcmpl_dir_d, &nss_top_main, &nss_edma_txcmplring_strings_ops);
+ 	if (!file_d) {
+ 		nss_warning("Failed to create qca-nss-drv/strings/edma/rings/txcmpl file");
+ 		goto fail;
+@@ -333,13 +333,13 @@
+ 	/*
+ 	 * edma rx fill ring stats
+ 	 */
+-	edma_rxfill_dir_d = debugfs_create_dir("rxfill", edma_rings_dir_d);
++	edma_rxfill_dir_d = nss_debugfs_create_dir_locked("rxfill", edma_rings_dir_d);
+ 	if (!edma_rxfill_dir_d) {
+ 		nss_warning("Failed to create qca-nss-drv/strings/edma/rings/rxfill directory");
+ 		goto fail;
+ 	}
+ 
+-	file_d = debugfs_create_file("rxfill_str", 0400, edma_rxfill_dir_d, &nss_top_main, &nss_edma_rxfillring_strings_ops);
++	file_d = nss_debugfs_create_file_locked("rxfill_str", 0400, edma_rxfill_dir_d, &nss_top_main, &nss_edma_rxfillring_strings_ops);
+ 	if (!file_d) {
+ 		nss_warning("Failed to create qca-nss-drv/strings/edma/rings/rxfill file");
+ 		goto fail;
+@@ -347,5 +347,13 @@
+ 
+ 	return;
+ fail:
+-	debugfs_remove_recursive(edma_d);
++	nss_debugfs_remove_locked(edma_d);
+ }
++
++void nss_edma_strings_dentry_create(void)
++{
++	if (!nss_debugfs_begin(NSS_DEBUGFS_STRINGS))
++		return;
++	nss_edma_strings_dentry_create_locked();
++	nss_debugfs_end();
++}
+--- a/nss_eth_rx_strings.c
++++ b/nss_eth_rx_strings.c
+@@ -74,7 +74,7 @@
+  * nss_eth_rx_strings_dentry_create()
+  *      Create Ethernet Rx statistics strings debug entry.
+  */
+-void nss_eth_rx_strings_dentry_create(void)
++static void nss_eth_rx_strings_dentry_create_locked(void)
+ {
+ 	struct dentry *eth_rx_d = NULL;
+ 	struct dentry *eth_rx_spcl_stats_d = NULL;
+@@ -85,23 +85,31 @@
+ 		return;
+ 	}
+ 
+-	eth_rx_d = debugfs_create_dir("eth_rx", nss_top_main.strings_dentry);
++	eth_rx_d = nss_debugfs_create_dir_locked("eth_rx", nss_top_main.strings_dentry);
+ 	if (!eth_rx_d) {
+ 		nss_warning("Failed to create qca-nss-drv/strings/eth_rx directory");
+ 		return;
+ 	}
+ 
+-	eth_rx_spcl_stats_d = debugfs_create_file("special_stats_str", 0400, eth_rx_d, &nss_top_main, &nss_eth_rx_special_stats_strings_ops);
++	eth_rx_spcl_stats_d = nss_debugfs_create_file_locked("special_stats_str", 0400, eth_rx_d, &nss_top_main, &nss_eth_rx_special_stats_strings_ops);
+ 	if (!eth_rx_spcl_stats_d) {
+ 		nss_warning("Failed to create qca-nss-drv/stats/eth_rx/special_stats_str file");
+-		debugfs_remove_recursive(eth_rx_d);
++		nss_debugfs_remove_locked(eth_rx_d);
+ 		return;
+ 	}
+ 
+-	eth_rx_excp_stats_d = debugfs_create_file("exception_stats_str", 0400, eth_rx_d, &nss_top_main, &nss_eth_rx_exception_stats_strings_ops);
++	eth_rx_excp_stats_d = nss_debugfs_create_file_locked("exception_stats_str", 0400, eth_rx_d, &nss_top_main, &nss_eth_rx_exception_stats_strings_ops);
+ 	if (!eth_rx_excp_stats_d) {
+ 		nss_warning("Failed to create qca-nss-drv/stats/eth_rx/exception_stats_str file");
+-		debugfs_remove_recursive(eth_rx_d);
++		nss_debugfs_remove_locked(eth_rx_d);
+ 		return;
+ 	}
+ }
++
++void nss_eth_rx_strings_dentry_create(void)
++{
++	if (!nss_debugfs_begin(NSS_DEBUGFS_STRINGS))
++		return;
++	nss_eth_rx_strings_dentry_create_locked();
++	nss_debugfs_end();
++}
+--- a/nss_freq.c
++++ b/nss_freq.c
+@@ -23,6 +23,7 @@
+ #include "nss_tx_rx_common.h"
+ #include "nss_freq_log.h"
+ #include "nss_freq_stats.h"
++#include "nss_freq_work.h"
+ 
+ #define NSS_ACK_STARTED 0
+ #define NSS_ACK_FINISHED 1
+@@ -43,9 +44,16 @@
+ struct nss_freq_cpu_usage nss_freq_cpu_status;
+ 
+ extern struct nss_runtime_sampling nss_runtime_samples;
+-extern struct workqueue_struct *nss_wq;
+-extern nss_work_t *nss_work;
+ 
++struct nss_freq_change_intent {
++	nss_freq_scales_t index;
++	uint32_t frequency;
++	bool auto_scale;
++};
++
++static bool nss_freq_sched_change_admitted(struct nss_freq_work_reader *reader,
++		nss_freq_scales_t index, bool auto_scale);
++
+ /*
+  * nss_freq_msg_init()
+  *	Initialize the freq message
+@@ -85,21 +93,17 @@
+ 
+ /*
+  * nss_freq_queue_work()
+- *	Queue Work to the NSS Workqueue based on Current index.
++ *	Queue an explicit target using the core-stats caller's admission.
+  */
+-static bool nss_freq_queue_work(void)
++static bool nss_freq_queue_work(struct nss_freq_work_reader *reader, nss_freq_scales_t index)
+ {
+-	nss_freq_scales_t index = nss_runtime_samples.freq_scale_index;
+-
+-	BUG_ON(!nss_wq);
+-
+ 	nss_info("frequency:%d index:%d sample count:%x\n", nss_runtime_samples.freq_scale[index].frequency,
+ 					index, nss_runtime_samples.average);
+ 
+ 	/*
+ 	 * schedule freq change with autoscale ON
+ 	 */
+-	return nss_freq_sched_change(index, true);
++	return nss_freq_sched_change_admitted(reader, index, true);
+ }
+ 
+ /*
+@@ -202,12 +206,14 @@
+  * nss_freq_scale_frequency()
+  * 	Frequency scaling algorithm to scale frequency.
+  */
+-static void nss_freq_scale_frequency(struct nss_ctx_instance *nss_ctx, uint32_t inst_cnt)
++static void nss_freq_scale_frequency(struct nss_freq_work_reader *reader,
++		struct nss_ctx_instance *nss_ctx, uint32_t inst_cnt)
+ {
+ 	uint32_t b_index;
+ 	uint32_t minimum;
+ 	uint32_t maximum;
+ 	uint32_t index = nss_runtime_samples.freq_scale_index;
++	nss_freq_scales_t target;
+ 
+ 	/*
+ 	 * Delete Current Index Value, Add New Value, Recalculate new Sum, Shift Index
+@@ -263,16 +269,9 @@
+ 	if (nss_runtime_samples.freq_scale_rate_limit_up++ >= NSS_FREQUENCY_SCALE_RATE_LIMIT_UP) {
+ 		maximum = nss_runtime_samples.freq_scale[index].maximum;
+ 		if ((nss_runtime_samples.average > maximum) && (index < (NSS_FREQ_MAX_SCALE - 1))) {
+-			nss_runtime_samples.freq_scale_index++;
+-			nss_runtime_samples.freq_scale_ready = 0;
+-
+-			/*
+-			 * If fail to increase frequency, decrease index
+-			 */
+-			nss_trace("frequency increase to %d inst:%x > maximum:%x\n", nss_runtime_samples.freq_scale[nss_runtime_samples.freq_scale_index].frequency, inst_cnt, maximum);
+-			if (!nss_freq_queue_work()) {
+-				nss_runtime_samples.freq_scale_index--;
+-			}
++			target = index + 1;
++			nss_trace("frequency increase to %d inst:%x > maximum:%x\n", nss_runtime_samples.freq_scale[target].frequency, inst_cnt, maximum);
++			nss_freq_queue_work(reader, target);
+ 		}
+ 
+ 		/*
+@@ -295,16 +294,9 @@
+ 		 * is not supported. So check if the next lower frequency is configured before shifting down
+ 		 */
+ 		if ((nss_runtime_samples.average < minimum) && (index > 0) && nss_runtime_samples.freq_scale[index - 1].maximum) {
+-			nss_runtime_samples.freq_scale_index--;
+-			nss_runtime_samples.freq_scale_ready = 0;
+-
+-			/*
+-			 * If fail to decrease frequency, increase index
+-			 */
+-			nss_trace("frequency decrease to %d inst:%x < minumum:%x\n", nss_runtime_samples.freq_scale[nss_runtime_samples.freq_scale_index].frequency, nss_runtime_samples.average, minimum);
+-			if (!nss_freq_queue_work()) {
+-				nss_runtime_samples.freq_scale_index++;
+-			}
++			target = index - 1;
++			nss_trace("frequency decrease to %d inst:%x < minumum:%x\n", nss_runtime_samples.freq_scale[target].frequency, nss_runtime_samples.average, minimum);
++			nss_freq_queue_work(reader, target);
+ 		}
+ 		nss_runtime_samples.freq_scale_rate_limit_down = 0;
+ 		return;
+@@ -317,8 +309,15 @@
+  */
+ static void nss_freq_handle_core_stats(struct nss_ctx_instance *nss_ctx, struct nss_core_stats *core_stats)
+ {
+-	uint32_t inst_cnt = core_stats->inst_cnt_total;
++	struct nss_freq_work_reader reader
++		__attribute__((cleanup(nss_freq_work_cleanup))) = {0};
++	uint32_t inst_cnt;
+ 
++	if (!nss_freq_work_begin(&reader))
++		return;
++
++	inst_cnt = core_stats->inst_cnt_total;
++
+ 	/*
+ 	 * compute CPU utilization by using the instruction count
+ 	 */
+@@ -327,7 +326,7 @@
+ 	/*
+ 	 * Perform frequency scaling
+ 	 */
+-	nss_freq_scale_frequency(nss_ctx, inst_cnt);
++	nss_freq_scale_frequency(&reader, nss_ctx, inst_cnt);
+ }
+ 
+ /*
+@@ -391,11 +390,28 @@
+ }
+ 
+ /*
+- * nss_freq_sched_change()
+- *	Schedule a frequency work.
++ * nss_freq_apply_change()
++ *	Publish only a successfully queued intent, before the run shim enters HAL.
+  */
+-bool nss_freq_sched_change(nss_freq_scales_t index, bool auto_scale)
++static void nss_freq_apply_change(void *data)
+ {
++	struct nss_freq_change_intent *intent = data;
++
++	nss_cmd_buf.current_freq = intent->frequency;
++	if (intent->auto_scale)
++		nss_runtime_samples.freq_scale_index = intent->index;
++	else
++		nss_cmd_buf.auto_scale = 0;
++	nss_runtime_samples.freq_scale_ready = 0;
++}
++
++/* Reuse the outer core-stats receipt; do not reacquire admission during close. */
++static bool nss_freq_sched_change_admitted(struct nss_freq_work_reader *reader,
++		nss_freq_scales_t index, bool auto_scale)
++{
++	struct nss_freq_change_intent intent;
++	nss_work_t *nss_work;
++
+ 	if (index >= NSS_FREQ_MAX_SCALE) {
+ 		nss_info("NSS freq scale beyond limit\n");
+ 		return false;
+@@ -407,24 +423,40 @@
+ 		return false;
+ 	}
+ 
+-	INIT_WORK((struct work_struct *)nss_work, nss_hal_wq_function);
++	INIT_WORK((struct work_struct *)nss_work, nss_freq_work_run);
+ 
+ 	nss_work->frequency = nss_runtime_samples.freq_scale[index].frequency;
++	intent.index = index;
++	intent.frequency = nss_work->frequency;
++	intent.auto_scale = auto_scale;
+ 
+-	if (!auto_scale) {
+-		nss_cmd_buf.auto_scale = 0;
+-		nss_runtime_samples.freq_scale_ready = 0;
+-	}
+-
+ 	/* Keep NSS core stats enabled even when fixed-frequency scaling is requested. */
+ 	nss_work->stats_enable = 1;
+-	nss_cmd_buf.current_freq = nss_work->frequency;
+-	queue_work(nss_wq, (struct work_struct *)nss_work);
++	if (!nss_freq_work_enqueue_commit(reader, (struct work_struct *)nss_work,
++			nss_freq_apply_change, &intent)) {
++		kfree(nss_work);
++		return false;
++	}
+ 
+ 	return true;
+ }
+ 
+ /*
++ * nss_freq_sched_change()
++ *	Schedule a frequency work for callers without a core-stats receipt.
++ */
++bool nss_freq_sched_change(nss_freq_scales_t index, bool auto_scale)
++{
++	struct nss_freq_work_reader reader
++		__attribute__((cleanup(nss_freq_work_cleanup))) = {0};
++
++	if (!nss_freq_work_begin(&reader))
++		return false;
++
++	return nss_freq_sched_change_admitted(&reader, index, auto_scale);
++}
++
++/*
+  * nss_freq_get_context()
+  *	Get NSS context instance for frequency.
+  */
+--- /dev/null
++++ b/nss_freq_work.h
+@@ -0,0 +1,59 @@
++/* SPDX-License-Identifier: ISC */
++#ifndef __NSS_FREQ_WORK_H
++#define __NSS_FREQ_WORK_H
++
++#include <linux/list.h>
++#include <linux/workqueue.h>
++
++struct task_struct;
++
++/* Original zero-initialized lexical token; do not copy or transfer tasks. */
++struct nss_freq_work_reader {
++	struct list_head node;
++	struct task_struct *task;
++	struct workqueue_struct *queue;
++};
++
++/*
++ * Non-NMI producers only. The original lexical token must remain live until
++ * end, with begin/enqueue/end on the same task; it is not a transferable ref.
++ * Close rejects new begin calls but permits admitted producers to enqueue.
++ */
++bool nss_freq_work_begin(struct nss_freq_work_reader *reader);
++void nss_freq_work_end(struct nss_freq_work_reader *reader);
++/*
++ * Submit only a fresh, initialized, caller-owned work item. True transfers it
++ * to the worker (which may run immediately); false leaves it with the caller.
++ */
++bool nss_freq_work_enqueue(struct nss_freq_work_reader *reader,
++		struct work_struct *work);
++/*
++ * Work must be initialized with nss_freq_work_run. Under the receipt gate,
++ * queue first, then invoke commit(data) synchronously only on success, before
++ * allowing the run shim into HAL. No config side effects on false. Commit may
++ * use call-local data but must not sleep, reenter this API, release its token
++ * or free the submitted work. This gate does not serialize RX/ACK state.
++ */
++bool nss_freq_work_enqueue_commit(struct nss_freq_work_reader *reader,
++		struct work_struct *work, void (*commit)(void *), void *data);
++/* Gate barrier only; always run the original HAL worker for accepted work. */
++void nss_freq_work_run(struct work_struct *work);
++/*
++ * Process lifecycle only, never inside a producer or this queue's worker and
++ * never under locks needed by those callbacks. Quiesce closes admission and
++ * joins producers, their final wake and queued host work while core/clock/PM
++ * resources remain live; exit releases the queue. Init returns -EBUSY for a
++ * live owner, including after quiesce; only exit permits another init.
++ * These scopes do not pin module text, join external callers or prove FW idle.
++ */
++int nss_freq_work_init(void);
++void nss_freq_work_quiesce(void);
++void nss_freq_work_exit(void);
++
++static inline void nss_freq_work_cleanup(struct nss_freq_work_reader *reader)
++{
++	if (reader->queue)
++		nss_freq_work_end(reader);
++}
++
++#endif
+--- a/nss_gre_redir.c
++++ b/nss_gre_redir.c
+@@ -655,7 +655,6 @@
+ 	gre_redir_dentry = nss_gre_redir_stats_dentry_create();
+ 	if (!gre_redir_dentry) {
+ 		nss_warning("%px: Not able to create debugfs entry\n", nss_ctx);
+-		return;
+ 	}
+ 
+ 	sema_init(&nss_gre_redir_pvt.sem, 1);
+@@ -663,7 +662,7 @@
+ 	memset(tun_stats, 0, sizeof(struct nss_gre_redir_tunnel_stats) * NSS_GRE_REDIR_MAX_INTERFACES);
+ 	status = nss_core_register_handler(nss_ctx, NSS_GRE_REDIR_INTERFACE, nss_gre_redir_msg_handler, NULL);
+ 	if (status != NSS_CORE_STATUS_SUCCESS) {
+-		debugfs_remove_recursive(gre_redir_dentry);
++		nss_debugfs_remove(&gre_redir_dentry);
+ 		gre_redir_dentry = NULL;
+ 		nss_warning("%px: Not able to register handler for gre_redir base interface with NSS core\n", nss_ctx);
+ 		return;
+--- a/nss_gre_redir_lag_ds.c
++++ b/nss_gre_redir_lag_ds.c
+@@ -393,7 +393,6 @@
+ {
+ 	if (!nss_gre_redir_lag_ds_stats_dentry_create()) {
+ 		nss_warning(" Unable to create debugfs entry for LAG DS node.\n");
+-		return;
+ 	}
+ 
+ 	nss_gre_redir_lag_ds_strings_dentry_create();
+--- a/nss_gre_redir_lag_ds_stats.c
++++ b/nss_gre_redir_lag_ds_stats.c
+@@ -120,19 +120,20 @@
+  * nss_gre_redir_lag_ds_stats_dentry_create()
+  *	Create debugfs directory entry.
+  */
+-struct dentry *nss_gre_redir_lag_ds_stats_dentry_create(void)
++static struct dentry *nss_gre_redir_lag_ds_stats_dentry_create_locked(void)
+ {
+ 	struct dentry *gre_redir;
+ 	struct dentry *cmn_stats;
+ 
+-	gre_redir = nss_gre_redir_get_dentry();
++	gre_redir = nss_debugfs_lookup_locked("gre_redir", nss_top_main.stats_dentry);
+ 	if (unlikely(!gre_redir)) {
+ 		nss_warning("Failed to retrieve directory entry qca-nss-drv/stats/gre_redir/\n");
+ 		return NULL;
+ 	}
+ 
+-	cmn_stats = debugfs_create_file("lag_ds_cmn_stats", 0400, gre_redir,
++	cmn_stats = nss_debugfs_create_file_locked("lag_ds_cmn_stats", 0400, gre_redir,
+ 			&nss_top_main, &nss_gre_redir_lag_ds_cmn_stats_ops);
++	dput(gre_redir);
+ 	if (unlikely(!cmn_stats)) {
+ 		nss_warning("Failed to create qca-nss-drv/stats/gre_redir/lag_ds_cmn_stats file\n");
+ 		return NULL;
+@@ -141,6 +142,16 @@
+ 	return cmn_stats;
+ }
+ 
++struct dentry *nss_gre_redir_lag_ds_stats_dentry_create(void)
++{
++	struct dentry *dentry;
++
++	if (!nss_debugfs_begin(NSS_DEBUGFS_STATS))
++		return NULL;
++	dentry = nss_gre_redir_lag_ds_stats_dentry_create_locked();
++	return nss_debugfs_end() ? dentry : NULL;
++}
++
+ /*
+  * nss_gre_redir_lag_ds_stats_sync()
+  *	Update synchonized statistics.
+--- a/nss_gre_redir_lag_us.c
++++ b/nss_gre_redir_lag_us.c
+@@ -646,12 +646,11 @@
+ 
+ 	if (!d_entry) {
+ 		nss_warning(" Unable to create debugfs entry for LAG US node.\n");
+-		return;
+ 	}
+ 
+ 	cmn_ctx.nss_gre_redir_lag_us_wq = create_singlethread_workqueue("nss_gre_redir_lag_us_workqueue");
+ 	if (!cmn_ctx.nss_gre_redir_lag_us_wq) {
+-		debugfs_remove_recursive(d_entry);
++		nss_debugfs_remove(&d_entry);
+ 		nss_warning("Unable to create workqueue for LAG US node.\n");
+ 		return;
+ 	}
+--- a/nss_gre_redir_lag_us_stats.c
++++ b/nss_gre_redir_lag_us_stats.c
+@@ -120,19 +120,20 @@
+  * nss_gre_redir_lag_us_stats_dentry_create()
+  *	Create debugfs directory for stats.
+  */
+-struct dentry *nss_gre_redir_lag_us_stats_dentry_create(void)
++static struct dentry *nss_gre_redir_lag_us_stats_dentry_create_locked(void)
+ {
+ 	struct dentry *gre_redir;
+ 	struct dentry *cmn_stats;
+ 
+-	gre_redir = nss_gre_redir_get_dentry();
++	gre_redir = nss_debugfs_lookup_locked("gre_redir", nss_top_main.stats_dentry);
+ 	if (unlikely(!gre_redir)) {
+ 		nss_warning("Failed to retrieve directory entry qca-nss-drv/stats/gre_redir/\n");
+ 		return NULL;
+ 	}
+ 
+-	cmn_stats = debugfs_create_file("lag_us_cmn_stats", 0400, gre_redir,
++	cmn_stats = nss_debugfs_create_file_locked("lag_us_cmn_stats", 0400, gre_redir,
+ 			&nss_top_main, &nss_gre_redir_lag_us_cmn_stats_ops);
++	dput(gre_redir);
+ 	if (unlikely(!cmn_stats)) {
+ 		nss_warning("Failed to create qca-nss-drv/stats/gre_redir/lag_us_cmn_stats file\n");
+ 		return NULL;
+@@ -141,6 +142,16 @@
+ 	return cmn_stats;
+ }
+ 
++struct dentry *nss_gre_redir_lag_us_stats_dentry_create(void)
++{
++	struct dentry *dentry;
++
++	if (!nss_debugfs_begin(NSS_DEBUGFS_STATS))
++		return NULL;
++	dentry = nss_gre_redir_lag_us_stats_dentry_create_locked();
++	return nss_debugfs_end() ? dentry : NULL;
++}
++
+ /*
+  * nss_gre_redir_lag_us_stats_sync()
+  *	Update synchonized statistics.
+--- a/nss_gre_redir_mark.c
++++ b/nss_gre_redir_mark.c
+@@ -323,7 +323,6 @@
+ 	gre_redir_mark_dentry = nss_gre_redir_mark_stats_dentry_create();
+ 	if (!gre_redir_mark_dentry) {
+ 		nss_warning("%px: Not able to create debugfs entry\n", nss_ctx);
+-		return;
+ 	}
+ 
+ 	nss_gre_redir_mark_strings_dentry_create();
+@@ -333,7 +332,7 @@
+ 	nss_info("nss_gre_redir_mark_register_handler\n");
+ 	status = nss_core_register_handler(nss_ctx, NSS_GRE_REDIR_MARK_INTERFACE, nss_gre_redir_mark_handler, NULL);
+ 	if (status != NSS_CORE_STATUS_SUCCESS) {
+-		debugfs_remove_recursive(gre_redir_mark_dentry);
++		nss_debugfs_remove(&gre_redir_mark_dentry);
+ 		gre_redir_mark_dentry = NULL;
+ 		nss_warning("%px: Not able to register handler for GRE redir mark with NSS core\n", nss_ctx);
+ 		return;
+--- a/nss_gre_redir_mark_stats.c
++++ b/nss_gre_redir_mark_stats.c
+@@ -124,11 +124,11 @@
+  * nss_gre_redir_mark_stats_dentry_create()
+  *	Create debugfs directory entry for stats.
+  */
+-struct dentry *nss_gre_redir_mark_stats_dentry_create(void)
++static struct dentry *nss_gre_redir_mark_stats_dentry_create_locked(void)
+ {
+ 	struct dentry *gre_redir_mark;
+ 
+-	gre_redir_mark = debugfs_create_file("gre_redir_mark", 0400, nss_top_main.stats_dentry,
++	gre_redir_mark = nss_debugfs_create_file_locked("gre_redir_mark", 0400, nss_top_main.stats_dentry,
+ 			&nss_top_main, &nss_gre_redir_mark_stats_ops);
+ 	if (unlikely(!gre_redir_mark)) {
+ 		nss_warning("Failed to create file entry qca-nss-drv/stats/gre_redir_mark/\n");
+@@ -138,6 +138,16 @@
+ 	return gre_redir_mark;
+ }
+ 
++struct dentry *nss_gre_redir_mark_stats_dentry_create(void)
++{
++	struct dentry *dentry;
++
++	if (!nss_debugfs_begin(NSS_DEBUGFS_STATS))
++		return NULL;
++	dentry = nss_gre_redir_mark_stats_dentry_create_locked();
++	return nss_debugfs_end() ? dentry : NULL;
++}
++
+ /*
+  * nss_gre_redir_mark_stats_sync()
+  *	Update GRE redir mark stats.
+--- a/nss_gre_redir_stats.c
++++ b/nss_gre_redir_stats.c
+@@ -198,26 +198,36 @@
+  * nss_gre_redir_stats_dentry_create()
+  *	Create debugfs directory entry for stats.
+  */
+-struct dentry *nss_gre_redir_stats_dentry_create(void)
++static struct dentry *nss_gre_redir_stats_dentry_create_locked(void)
+ {
+ 	struct dentry *gre_redir;
+ 	struct dentry *tun_stats;
+ 
+-	gre_redir = debugfs_create_dir("gre_redir", nss_top_main.stats_dentry);
++	gre_redir = nss_debugfs_create_dir_locked("gre_redir", nss_top_main.stats_dentry);
+ 	if (unlikely(!gre_redir)) {
+ 		nss_warning("Failed to create directory entry qca-nss-drv/stats/gre_redir/\n");
+ 		return NULL;
+ 	}
+ 
+-	tun_stats = debugfs_create_file("tun_stats", 0400, gre_redir,
++	tun_stats = nss_debugfs_create_file_locked("tun_stats", 0400, gre_redir,
+ 			&nss_top_main, &nss_gre_redir_stats_ops);
+ 	if (unlikely(!tun_stats)) {
+-		debugfs_remove_recursive(gre_redir);
++		nss_debugfs_remove_locked(gre_redir);
+ 		nss_warning("Failed to create file entry qca-nss-drv/stats/gre_redir/tun_stats\n");
+ 		return NULL;
+ 	}
+ 
+ 	return gre_redir;
++}
++
++struct dentry *nss_gre_redir_stats_dentry_create(void)
++{
++	struct dentry *dentry;
++
++	if (!nss_debugfs_begin(NSS_DEBUGFS_STATS))
++		return NULL;
++	dentry = nss_gre_redir_stats_dentry_create_locked();
++	return nss_debugfs_end() ? dentry : NULL;
+ }
+ 
+ /*
+--- a/nss_gre_strings.c
++++ b/nss_gre_strings.c
+@@ -95,7 +95,7 @@
+  * nss_gre_strings_dentry_create()
+  *	Create gre statistics strings debug entry.
+  */
+-void nss_gre_strings_dentry_create(void)
++static void nss_gre_strings_dentry_create_locked(void)
+ {
+ 	struct dentry *gre_d = NULL;
+ 
+@@ -104,21 +104,29 @@
+ 		return;
+ 	}
+ 
+-	gre_d = debugfs_create_dir("gre", nss_top_main.strings_dentry);
++	gre_d = nss_debugfs_create_dir_locked("gre", nss_top_main.strings_dentry);
+ 	if (!gre_d) {
+ 		nss_warning("Failed to create qca-nss-drv/strings/gre directory");
+ 		return;
+ 	}
+ 
+-	if (!debugfs_create_file("gre_base", 0400, gre_d, &nss_top_main, &nss_gre_base_strings_ops)) {
++	if (!nss_debugfs_create_file_locked("gre_base", 0400, gre_d, &nss_top_main, &nss_gre_base_strings_ops)) {
+ 		nss_warning("Failed to create qca-nss-drv/strings/gre/gre_base file");
+-		debugfs_remove_recursive(gre_d);
++		nss_debugfs_remove_locked(gre_d);
+ 		return;
+ 	}
+ 
+-	if (!debugfs_create_file("gre_session", 0400, gre_d, &nss_top_main, &nss_gre_session_strings_ops)) {
++	if (!nss_debugfs_create_file_locked("gre_session", 0400, gre_d, &nss_top_main, &nss_gre_session_strings_ops)) {
+ 		nss_warning("Failed to create qca-nss-drv/strings/gre/gre_session file");
+-		debugfs_remove_recursive(gre_d);
++		nss_debugfs_remove_locked(gre_d);
+ 		return;
+ 	}
+ }
++
++void nss_gre_strings_dentry_create(void)
++{
++	if (!nss_debugfs_begin(NSS_DEBUGFS_STRINGS))
++		return;
++	nss_gre_strings_dentry_create_locked();
++	nss_debugfs_end();
++}
+--- a/nss_hal/include/nss_hal.h
++++ b/nss_hal/include/nss_hal.h
+@@ -123,6 +123,9 @@
+  */
+ int nss_hal_remove(struct platform_device *nss_dev);
+ 
++/* Process-only: retire control publishers before core resource teardown. */
++void nss_hal_quiesce_control_group(void);
++
+ /*
+  * nss_hal_firmware_load()
+  */
+--- a/nss_hal/nss_hal.c
++++ b/nss_hal/nss_hal.c
+@@ -37,6 +37,9 @@
+ 
+ #include "nss_hal.h"
+ #include "nss_core.h"
++#include "nss_freq_work.h"
++#include "nss_coredump.h"
++#include "nss_sysctl.h"
+ #include "nss_tx_rx_common.h"
+ #ifdef NSS_DATA_PLANE_GENERIC_SUPPORT
+ #include "nss_data_plane.h"
+@@ -63,6 +66,7 @@
+ static DEFINE_MUTEX(nss_hal_receive_group_lock);
+ static bool nss_hal_receive_group_closing;
+ static bool nss_hal_receive_group_stopped;
++static bool nss_hal_control_group_stopped;
+ static bool nss_hal_core_removed[NSS_MAX_CORES];
+ #endif
+ 
+@@ -148,7 +152,7 @@
+ 	if (!load_mem) {
+ 		nss_info_always("%px: ioremap_nocache failed: %x", nss_ctx, npd->load_addr);
+ 		release_firmware(nss_fw);
+-		return rc;
++		return -ENOMEM;
+ 	}
+ 
+ 	if (nss_ctx->id == 0) {
+@@ -928,7 +932,40 @@
+ #endif
+ }
+ 
++/* Process context, never RTNL or a control/DP/NAPI callback being joined. */
++static void __nss_hal_quiesce_control_group(void)
++{
++#ifdef NSS_HAL_IPQ807x_SUPPORT
++	if (nss_hal_control_group_stopped)
++		return;
++	nss_hal_receive_group_closing = true;
++#ifdef NSS_DATA_PLANE_GENERIC_SUPPORT
++	/* Join registration work while its ACK RX and core resources are live. */
++	nss_data_plane_stop_registration();
++#endif
++#endif
++	/* Callbacks still have their ACK RX, mappings, log buffers and clocks. */
++	nss_root_controls_stop();
++	nss_freq_work_quiesce();
++	nss_coredump_quiesce();
+ #ifdef NSS_HAL_IPQ807x_SUPPORT
++	nss_hal_control_group_stopped = true;
++#endif
++}
++
++void nss_hal_quiesce_control_group(void)
++{
++#ifdef NSS_HAL_IPQ807x_SUPPORT
++	/* Serialize with probes before closing any root-control publication. */
++	mutex_lock(&nss_hal_receive_group_lock);
++#endif
++	__nss_hal_quiesce_control_group();
++#ifdef NSS_HAL_IPQ807x_SUPPORT
++	mutex_unlock(&nss_hal_receive_group_lock);
++#endif
++}
++
++#ifdef NSS_HAL_IPQ807x_SUPPORT
+ /* Caller holds the group mutex, never RTNL or an admitted DP/NAPI callback. */
+ static void nss_hal_quiesce_receive_group(void)
+ {
+@@ -937,10 +974,8 @@
+ 
+ 	if (nss_hal_receive_group_stopped)
+ 		return;
+-	nss_hal_receive_group_closing = true;
++	__nss_hal_quiesce_control_group();
+ #ifdef NSS_DATA_PLANE_GENERIC_SUPPORT
+-	/* An admitted worker may need RTNL and live ACK RX; cancel outside RTNL. */
+-	nss_data_plane_stop_registration();
+ 	rtnl_lock();
+ 	/* Host-only quarantine: no NSS close/deinit, no registry/ndpp clearing. */
+ 	nss_data_plane_quarantine_registered();
+@@ -996,8 +1031,6 @@
+ 	 * Clean up debugfs
+ 	 */
+ #ifdef NSS_HAL_IPQ807x_SUPPORT
+-	if (!nss_hal_receive_group_stopped)
+-		nss_stats_clean();
+ 	nss_hal_quiesce_receive_group();
+ #else
+ 	nss_stats_clean();
+--- a/nss_init.c
++++ b/nss_init.c
+@@ -23,6 +23,12 @@
+  *
+  */
+ #include "nss_core.h"
++#include "nss_freq_work.h"
++#include "nss_coredump.h"
++#include "nss_sysctl.h"
++#ifdef NSS_DRV_PPE_ENABLE
++#include "nss_ppe.h"
++#endif
+ #if (NSS_PM_SUPPORT == 1)
+ #include "nss_pm.h"
+ #endif
+@@ -59,6 +65,8 @@
+ #include <linux/sysctl.h>
+ #include <linux/regulator/consumer.h>
+ #include <linux/clk.h>
++#include <linux/sched.h>
++#include <linux/wait.h>
+ 
+ /*
+  * Global declarations
+@@ -101,13 +109,174 @@
+ struct nss_top_instance nss_top_main;
+ struct nss_cmd_buffer nss_cmd_buf;
+ struct nss_runtime_sampling nss_runtime_samples;
+-struct workqueue_struct *nss_wq;
++static struct workqueue_struct *nss_wq;
++static DEFINE_SPINLOCK(nss_freq_work_lock);
++static DEFINE_MUTEX(nss_freq_work_lifecycle_lock);
++static DECLARE_WAIT_QUEUE_HEAD(nss_freq_work_wait);
++static LIST_HEAD(nss_freq_work_readers);
++static unsigned int nss_freq_work_users;
++static bool nss_freq_work_closing = true;
++static bool nss_platform_registered;
++#ifdef NSS_DRV_PPE_ENABLE
++static u64 nss_root_ppe_owner;
+ 
+-/*
+- * Work Queue to handle messages to Kernel
+- */
+-nss_work_t *nss_work;
++static void nss_root_ppe_release(void)
++{
++	int ret;
+ 
++	if (!nss_root_ppe_owner)
++		return;
++	ret = nss_ppe_free_owned(nss_root_ppe_owner);
++	if (ret)
++		nss_warning("PPE diagnostic map retirement failed: %d\n", ret);
++	else
++		nss_root_ppe_owner = 0;
++}
++#endif
++
++static bool nss_freq_work_registered(struct nss_freq_work_reader *reader)
++{
++	struct nss_freq_work_reader *entry;
++
++	list_for_each_entry(entry, &nss_freq_work_readers, node)
++		if (entry == reader)
++			return entry->task == current && entry->queue == nss_wq;
++	return false;
++}
++
++bool nss_freq_work_begin(struct nss_freq_work_reader *reader)
++{
++	struct nss_freq_work_reader *entry;
++	unsigned long flags;
++	bool admitted = false;
++
++	if (!reader || in_nmi())
++		return false;
++	spin_lock_irqsave(&nss_freq_work_lock, flags);
++	list_for_each_entry(entry, &nss_freq_work_readers, node)
++		if (entry == reader)
++			goto out;
++	if (reader->queue || nss_freq_work_closing || !nss_wq)
++		goto out;
++	reader->task = current;
++	reader->queue = nss_wq;
++	list_add_tail(&reader->node, &nss_freq_work_readers);
++	nss_freq_work_users++;
++	admitted = true;
++out:
++	spin_unlock_irqrestore(&nss_freq_work_lock, flags);
++	return admitted;
++}
++
++void nss_freq_work_end(struct nss_freq_work_reader *reader)
++{
++	unsigned long flags;
++
++	spin_lock_irqsave(&nss_freq_work_lock, flags);
++	if (nss_freq_work_registered(reader)) {
++		list_del_init(&reader->node);
++		reader->queue = NULL;
++		reader->task = NULL;
++		if (!--nss_freq_work_users)
++			wake_up_all(&nss_freq_work_wait);
++	}
++	spin_unlock_irqrestore(&nss_freq_work_lock, flags);
++}
++
++bool nss_freq_work_enqueue_commit(struct nss_freq_work_reader *reader,
++		struct work_struct *work, void (*commit)(void *), void *data)
++{
++	unsigned long flags;
++	bool queued = false;
++
++	spin_lock_irqsave(&nss_freq_work_lock, flags);
++	if (work && nss_freq_work_registered(reader)) {
++		queued = queue_work(reader->queue, work);
++		if (queued && commit)
++			commit(data);
++	}
++	spin_unlock_irqrestore(&nss_freq_work_lock, flags);
++	return queued;
++}
++
++bool nss_freq_work_enqueue(struct nss_freq_work_reader *reader,
++		struct work_struct *work)
++{
++	return nss_freq_work_enqueue_commit(reader, work, NULL, NULL);
++}
++
++/* Pair with queue/commit before the HAL worker can consume the request. */
++void nss_freq_work_run(struct work_struct *work)
++{
++	unsigned long flags;
++
++	spin_lock_irqsave(&nss_freq_work_lock, flags);
++	spin_unlock_irqrestore(&nss_freq_work_lock, flags);
++	nss_hal_wq_function(work);
++}
++
++int nss_freq_work_init(void)
++{
++	struct workqueue_struct *queue;
++	unsigned long flags;
++	int rv = -EBUSY;
++
++	mutex_lock(&nss_freq_work_lifecycle_lock);
++	if (nss_wq || nss_freq_work_users)
++		goto out;
++	queue = create_workqueue("nss_freq_queue");
++	if (!queue) {
++		rv = -ENOMEM;
++		goto out;
++	}
++	spin_lock_irqsave(&nss_freq_work_lock, flags);
++	nss_wq = queue;
++	nss_freq_work_closing = false;
++	spin_unlock_irqrestore(&nss_freq_work_lock, flags);
++	rv = 0;
++out:
++	mutex_unlock(&nss_freq_work_lifecycle_lock);
++	return rv;
++}
++
++/* Process lifecycle caller only, never an admitted producer or this worker. */
++static void nss_freq_work_close_locked(void)
++{
++	unsigned long flags;
++
++	spin_lock_irqsave(&nss_freq_work_lock, flags);
++	nss_freq_work_closing = true;
++	spin_unlock_irqrestore(&nss_freq_work_lock, flags);
++	wait_event(nss_freq_work_wait, !READ_ONCE(nss_freq_work_users));
++	spin_lock_irqsave(&nss_freq_work_lock, flags);
++	spin_unlock_irqrestore(&nss_freq_work_lock, flags);
++	if (nss_wq)
++		flush_workqueue(nss_wq);
++}
++
++void nss_freq_work_quiesce(void)
++{
++	mutex_lock(&nss_freq_work_lifecycle_lock);
++	nss_freq_work_close_locked();
++	mutex_unlock(&nss_freq_work_lifecycle_lock);
++}
++
++void nss_freq_work_exit(void)
++{
++	struct workqueue_struct *queue;
++	unsigned long flags;
++
++	mutex_lock(&nss_freq_work_lifecycle_lock);
++	nss_freq_work_close_locked();
++	spin_lock_irqsave(&nss_freq_work_lock, flags);
++	queue = nss_wq;
++	nss_wq = NULL;
++	spin_unlock_irqrestore(&nss_freq_work_lock, flags);
++	if (queue)
++		destroy_workqueue(queue);
++	mutex_unlock(&nss_freq_work_lifecycle_lock);
++}
++
+ extern struct of_device_id nss_dt_ids[];
+ 
+ /*
+@@ -174,6 +343,38 @@
+ 	nss_runtime_samples.sample_count = 0;
+ 	nss_runtime_samples.message_rate_limit = 0;
+ 	nss_runtime_samples.freq_scale_rate_limit_down = 0;
++}
++
++enum nss_freq_control_mode {
++	NSS_FREQ_CONTROL_FIXED,
++	NSS_FREQ_CONTROL_DISABLE_AUTO,
++	NSS_FREQ_CONTROL_ENABLE_AUTO,
++};
++
++struct nss_freq_control_commit {
++	enum nss_freq_control_mode mode;
++	uint32_t frequency;
++	uint32_t index;
++};
++
++/* Queue-gate callback: no allocation, wait, recursive admission or HAL access. */
++static void nss_freq_control_apply(void *data)
++{
++	struct nss_freq_control_commit *control = data;
++
++	nss_cmd_buf.current_freq = control->frequency;
++	nss_runtime_samples.freq_scale_ready = 0;
++	if (control->mode == NSS_FREQ_CONTROL_ENABLE_AUTO) {
++		nss_runtime_samples.freq_scale_index = control->index;
++		nss_runtime_samples.sample_count = 0;
++		nss_runtime_samples.initialized = 0;
++		nss_cmd_buf.auto_scale = 1;
++		return;
++	}
++	nss_cmd_buf.auto_scale = 0;
++	if (control->mode == NSS_FREQ_CONTROL_FIXED)
++		nss_runtime_samples.freq_scale_index = control->index;
++	nss_reset_frequency_stats_samples();
+ }
+ 
+ /*
+@@ -182,62 +383,57 @@
+  */
+ static int nss_current_freq_handler(const struct ctl_table *ctl, int write, void __user *buffer, size_t *lenp, loff_t *ppos)
+ {
++	struct nss_freq_work_reader reader
++		__attribute__((cleanup(nss_freq_work_cleanup))) = {0};
++	struct ctl_table request = *ctl;
++	struct nss_freq_control_commit control;
++	uint32_t frequency = READ_ONCE(nss_cmd_buf.current_freq);
+ 	int ret, i;
++	nss_work_t *nss_work;
+ 
+-	ret = proc_dointvec(ctl, write, buffer, lenp, ppos);
++	if (!nss_freq_work_begin(&reader))
++		return -ESHUTDOWN;
++	if (write && !nss_sysctl_ctx_ready(&nss_top_main.nss[NSS_CORE_0]))
++		return -ENODEV;
++	request.data = &frequency;
++	ret = proc_dointvec(&request, write, buffer, lenp, ppos);
+ 
+ 	if (ret || !write || !*lenp)
+ 		return ret;
+ 
+-	if (!nss_wq)
+-		return ret;
+-
+-	printk("Frequency Set to %d\n", nss_cmd_buf.current_freq);
+-
+-	/* Delayed probe can expose this sysctl before the core is ready. */
+-	if (nss_top_main.nss[NSS_CORE_0].state != NSS_CORE_STATE_INITIALIZED)
+-		return ret;
+-
+ 	/*
+ 	 * Check if frequency exists in frequency Table
+ 	 */
+ 	i = 0;
+ 	while (i < NSS_FREQ_MAX_SCALE) {
+-		if (nss_runtime_samples.freq_scale[i].frequency == nss_cmd_buf.current_freq) {
++		if (nss_runtime_samples.freq_scale[i].frequency == frequency) {
+ 			break;
+ 		}
+ 		i++;
+ 	}
+ 	if (i == NSS_FREQ_MAX_SCALE) {
+ 		printk("Frequency not found. Please check Frequency Table\n");
+-		nss_cmd_buf.current_freq = nss_runtime_samples.freq_scale[nss_runtime_samples.freq_scale_index].frequency;
+-		return ret;
++		return -EINVAL;
+ 	}
+ 
+-	/*
+-	 * Turn off frequency scaling, but keep NSS core stats enabled so
+-	 * cpu_load_ubi keeps updating while running at a fixed frequency.
+-	*/
+-	nss_cmd_buf.auto_scale = 0;
+-	nss_runtime_samples.freq_scale_ready = 0;
+-	nss_runtime_samples.freq_scale_index = i;
+-
+ 	nss_work = (nss_work_t *)kmalloc(sizeof(nss_work_t), GFP_ATOMIC);
+ 	if (!nss_work) {
+ 		nss_info("NSS Freq WQ kmalloc fail");
+-		return ret;
++		return -ENOMEM;
+ 	}
+-	INIT_WORK((struct work_struct *)nss_work, nss_hal_wq_function);
+-	nss_work->frequency = nss_cmd_buf.current_freq;
++	INIT_WORK((struct work_struct *)nss_work, nss_freq_work_run);
++	nss_work->frequency = frequency;
+ 	nss_work->stats_enable = 1;
++	control.mode = NSS_FREQ_CONTROL_FIXED;
++	control.frequency = frequency;
++	control.index = i;
++	if (!nss_freq_work_enqueue_commit(&reader, (struct work_struct *)nss_work,
++			nss_freq_control_apply, &control)) {
++		kfree(nss_work);
++		return -EBUSY;
++	}
++	printk("Frequency Set to %u\n", frequency);
+ 
+-	/*
+-	 * Start the fixed-frequency stats window with a fresh sample set.
+-	 */
+-	nss_reset_frequency_stats_samples();
+-
+-	queue_work(nss_wq, (struct work_struct *)nss_work);
+-
+ 	return ret;
+ }
+ 
+@@ -247,75 +443,55 @@
+  */
+ static int nss_auto_scale_handler(const struct ctl_table *ctl, int write, void __user *buffer, size_t *lenp, loff_t *ppos)
+ {
++	struct nss_freq_work_reader reader
++		__attribute__((cleanup(nss_freq_work_cleanup))) = {0};
++	struct ctl_table request = *ctl;
++	struct nss_freq_control_commit control;
++	int auto_scale = READ_ONCE(nss_cmd_buf.auto_scale);
+ 	int ret;
++	nss_work_t *nss_work;
+ 
+-	ret = proc_dointvec(ctl, write, buffer, lenp, ppos);
++	if (!nss_freq_work_begin(&reader))
++		return -ESHUTDOWN;
++	if (write && !nss_sysctl_ctx_ready(&nss_top_main.nss[NSS_CORE_0]))
++		return -ENODEV;
++	request.data = &auto_scale;
++	ret = proc_dointvec(&request, write, buffer, lenp, ppos);
+ 
+-	if (!*lenp || (*ppos && !write)) {
++	if (ret || !write || !*lenp) {
+ 		return ret;
+ 	}
+ 
+-	if (!write) {
+-		return ret;
+-	}
+-
+-	if (!nss_wq) {
+-		return ret;
+-	}
+-
+-	if (nss_top_main.nss[NSS_CORE_0].state != NSS_CORE_STATE_INITIALIZED)
+-		return ret;
+-
+-	if (nss_cmd_buf.auto_scale != 1) {
++	if (auto_scale != 1) {
+ 		/*
+ 		 * Disable frequency scaling, but keep core stats reporting
+ 		 * enabled. HLOS gates scaling decisions with auto_scale; the
+ 		 * firmware stats stream is also used by cpu_load_ubi.
+ 		 */
+-		nss_cmd_buf.auto_scale = 0;
+-		nss_cmd_buf.current_freq = nss_runtime_samples.freq_scale[nss_runtime_samples.freq_scale_index].frequency;
+-
+-		nss_work = (nss_work_t *)kmalloc(sizeof(nss_work_t), GFP_ATOMIC);
+-		if (!nss_work) {
+-			nss_info("NSS Freq WQ kmalloc fail");
+-			return ret;
+-		}
+-
+-		INIT_WORK((struct work_struct *)nss_work, nss_hal_wq_function);
+-		nss_work->frequency = nss_cmd_buf.current_freq;
+-		nss_work->stats_enable = 1;
+-		queue_work(nss_wq, (struct work_struct *)nss_work);
+-		nss_runtime_samples.freq_scale_ready = 0;
+-
+-		/*
+-		 * Keep collecting fixed-frequency samples from a clean window.
+-		 */
+-		nss_reset_frequency_stats_samples();
+-
+-		return ret;
++		control.mode = NSS_FREQ_CONTROL_DISABLE_AUTO;
++		control.index = READ_ONCE(nss_runtime_samples.freq_scale_index);
++	} else {
++		control.mode = NSS_FREQ_CONTROL_ENABLE_AUTO;
++		control.index = NSS_FREQ_MID_SCALE;
+ 	}
++	if (control.index >= NSS_FREQ_MAX_SCALE)
++		return -EINVAL;
++	control.frequency = nss_runtime_samples.freq_scale[control.index].frequency;
+ 
+-	/*
+-	 * Setup default values - Middle of Freq Scale Band
+-	 */
+-	nss_runtime_samples.freq_scale_index = 1;
+-	nss_runtime_samples.sample_count = 0;
+-	nss_runtime_samples.initialized = 0;
+-	nss_runtime_samples.freq_scale_ready = 0;
+-	nss_cmd_buf.current_freq = nss_runtime_samples.freq_scale[nss_runtime_samples.freq_scale_index].frequency;
+-
+ 	nss_work = (nss_work_t *)kmalloc(sizeof(nss_work_t), GFP_ATOMIC);
+ 	if (!nss_work) {
+ 		nss_info("NSS Freq WQ kmalloc fail");
+-		return ret;
++		return -ENOMEM;
+ 	}
+-	INIT_WORK((struct work_struct *)nss_work, nss_hal_wq_function);
+-	nss_work->frequency = nss_cmd_buf.current_freq;
++	INIT_WORK((struct work_struct *)nss_work, nss_freq_work_run);
++	nss_work->frequency = control.frequency;
+ 	nss_work->stats_enable = 1;
+-	queue_work(nss_wq, (struct work_struct *)nss_work);
++	if (!nss_freq_work_enqueue_commit(&reader, (struct work_struct *)nss_work,
++			nss_freq_control_apply, &control)) {
++		kfree(nss_work);
++		return -EBUSY;
++	}
+ 
+-	nss_cmd_buf.auto_scale = 1;
+-
+ 	return ret;
+ }
+ 
+@@ -397,19 +573,22 @@
+ static int nss_coredump_handler(const struct ctl_table *ctl, int write, void __user *buffer, size_t *lenp, loff_t *ppos)
+ {
+ 	struct nss_ctx_instance *nss_ctx = &nss_top_main.nss[NSS_CORE_0];
++	struct ctl_table request = *ctl;
++	uint32_t coredump = READ_ONCE(nss_cmd_buf.coredump);
+ 	int ret;
+ 
+-	ret = proc_dointvec(ctl, write, buffer, lenp, ppos);
+-	if (!ret) {
+-		/*
+-		 * if nss_cmd_buf.coredump is not 0 or 1, panic will be disabled
+-		 * when NSS FW crashes, so OEM/ODM have a chance to use mdump
+-		 * to dump crash dump (coredump) and send dump to us for analysis.
+-		 */
+-		if ((write) && (nss_ctl_debug != 0) && nss_cmd_buf.coredump == 1) {
+-			printk("Coredumping to DDR\n");
+-			nss_hal_send_interrupt(nss_ctx, NSS_H2N_INTR_TRIGGER_COREDUMP);
+-		}
++	request.data = &coredump;
++	ret = proc_dointvec(&request, write, buffer, lenp, ppos);
++	if (ret || !write)
++		return ret;
++	if (nss_ctl_debug && coredump == 1 && !nss_sysctl_ctx_ready(nss_ctx))
++		return -ENODEV;
++	/* Preserve policy-only writes, including values that disable panic. */
++	WRITE_ONCE(nss_cmd_buf.coredump, coredump);
++	if (nss_ctl_debug && coredump == 1) {
++		printk("Coredumping to DDR\n");
++		if (!nss_coredump_request(nss_ctx))
++			return -ESHUTDOWN;
+ 	}
+ 
+ 	return ret;
+@@ -468,6 +647,12 @@
+ 	struct nss_ctx_instance *nss_ctx = NULL;
+ 	uint32_t core_id;
+ 
++	if (!nss_top_main.num_nss || nss_top_main.num_nss > NSS_MAX_CORES)
++		return -ENODEV;
++	for (core_id = 0; core_id < nss_top_main.num_nss; core_id++)
++		if (!nss_sysctl_ctx_ready(&nss_top_main.nss[core_id]))
++			return -ENODEV;
++
+ 	ret = proc_dointvec(ctl, write, buffer, lenp, ppos);
+ 	if (ret) {
+ 		return ret;
+@@ -475,7 +660,7 @@
+ 
+ 	printk("Min SKB reuse sizes - ");
+ 
+-	for (core_id = 0; core_id < NSS_CORE_MAX; core_id++) {
++	for (core_id = 0; core_id < nss_top_main.num_nss; core_id++) {
+ 		nss_ctx = (struct nss_ctx_instance *)&nss_top_main.nss[core_id];
+ 		pr_debug("core %d: %d ", core_id, nss_core_get_min_reuse(nss_ctx));
+ 	}
+@@ -655,17 +840,236 @@
+ 
+ static struct ctl_table_header *nss_dev_header;
+ #else
++#if (NSS_FREQ_SCALE_SUPPORT == 1)
+ static struct ctl_table_header *nss_clk_hdr;
++#endif
+ static struct ctl_table_header *nss_gen_hdr;
++#if (NSS_SKB_REUSE_SUPPORT == 1)
+ static struct ctl_table_header *nss_skb_hdr;
++#endif
++#endif
++
++enum nss_root_control_owner {
++	NSS_ROOT_DEBUGFS = BIT(0),
++	NSS_ROOT_IPV4 = BIT(1),
++	NSS_ROOT_IPV6 = BIT(2),
++	NSS_ROOT_N2H = BIT(3),
++	NSS_ROOT_RPS = BIT(4),
++	NSS_ROOT_STATS = BIT(5),
++	NSS_ROOT_PROJECT = BIT(6),
++	NSS_ROOT_PPPOE = BIT(7),
++	NSS_ROOT_DMA = BIT(8),
++	NSS_ROOT_C2C = BIT(9),
++	NSS_ROOT_LEGACY = BIT(10),
++	NSS_ROOT_CLOCK = BIT(11),
++	NSS_ROOT_GENERAL = BIT(12),
++	NSS_ROOT_SKB = BIT(13),
++};
++
++enum nss_root_control_state {
++	NSS_ROOT_COLD,
++	NSS_ROOT_STARTING,
++	NSS_ROOT_LIVE,
++	NSS_ROOT_STOPPED,
++};
++
++static DEFINE_MUTEX(nss_root_control_lock);
++static enum nss_root_control_state nss_root_control_state;
++static unsigned long nss_root_control_owners;
++
++/* No control callback acquires this process lifecycle lock. */
++static void nss_root_controls_stop_locked(void)
++{
++	struct ctl_table_header *header;
++
++	if (nss_root_control_state == NSS_ROOT_COLD ||
++			nss_root_control_state == NSS_ROOT_STOPPED)
++		return;
++	nss_root_control_state = NSS_ROOT_STOPPED;
++
++#ifdef NSS_DRV_DMA_ENABLE
++	if (nss_root_control_owners & NSS_ROOT_DMA)
++		nss_dma_unregister_sysctl();
+ #endif
++#ifdef NSS_DRV_PPPOE_ENABLE
++	if (nss_root_control_owners & NSS_ROOT_PPPOE)
++		nss_pppoe_unregister_sysctl();
++#endif
++	if (nss_root_control_owners & NSS_ROOT_PROJECT)
++		nss_project_unregister_sysctl();
++	if (nss_root_control_owners & NSS_ROOT_STATS)
++		nss_stats_unregister_sysctl();
++#ifdef NSS_DRV_C2C_ENABLE
++	if (nss_root_control_owners & NSS_ROOT_C2C)
++		nss_c2c_tx_unregister_sysctl();
++#endif
++	if (nss_root_control_owners & NSS_ROOT_RPS)
++		nss_rps_unregister_sysctl();
++	if (nss_root_control_owners & NSS_ROOT_N2H)
++		nss_n2h_unregister_sysctl();
++#ifdef NSS_DRV_IPV6_ENABLE
++	if (nss_root_control_owners & NSS_ROOT_IPV6)
++		nss_ipv6_unregister_sysctl();
++#endif
++#ifdef NSS_DRV_IPV4_ENABLE
++	if (nss_root_control_owners & NSS_ROOT_IPV4)
++		nss_ipv4_unregister_sysctl();
++#endif
+ 
++#if (LINUX_VERSION_CODE < KERNEL_VERSION(6, 6, 0))
++	if (nss_root_control_owners & NSS_ROOT_LEGACY) {
++		header = nss_dev_header;
++		nss_dev_header = NULL;
++		unregister_sysctl_table(header);
++	}
++#else
++#if (NSS_SKB_REUSE_SUPPORT == 1)
++	if (nss_root_control_owners & NSS_ROOT_SKB) {
++		header = nss_skb_hdr;
++		nss_skb_hdr = NULL;
++		unregister_sysctl_table(header);
++	}
++#endif
++	if (nss_root_control_owners & NSS_ROOT_GENERAL) {
++		header = nss_gen_hdr;
++		nss_gen_hdr = NULL;
++		unregister_sysctl_table(header);
++	}
++#if (NSS_FREQ_SCALE_SUPPORT == 1)
++	if (nss_root_control_owners & NSS_ROOT_CLOCK) {
++		header = nss_clk_hdr;
++		nss_clk_hdr = NULL;
++		unregister_sysctl_table(header);
++	}
++#endif
++#endif
++
++	if (nss_root_control_owners & NSS_ROOT_DEBUGFS)
++		nss_stats_clean();
++	nss_root_control_owners = 0;
++}
++
++void nss_root_controls_stop(void)
++{
++	mutex_lock(&nss_root_control_lock);
++	nss_root_controls_stop_locked();
++	mutex_unlock(&nss_root_control_lock);
++}
++
++static int nss_root_controls_start(void)
++{
++	int ret = -EBUSY;
++
++	mutex_lock(&nss_root_control_lock);
++	if (nss_root_control_state != NSS_ROOT_COLD)
++		goto out;
++	nss_root_control_state = NSS_ROOT_STARTING;
++
++	/* Log wait/callback state is mandatory even when debugfs is unavailable. */
++	nss_log_init();
++	ret = nss_stats_init_checked();
++	if (ret)
++		goto fail;
++	nss_root_control_owners |= NSS_ROOT_DEBUGFS;
++	nss_strings_init();
++
++#if (LINUX_VERSION_CODE < KERNEL_VERSION(6, 6, 0))
++	nss_dev_header = register_sysctl_table(nss_root);
++	if (!nss_dev_header) {
++		ret = -ENOMEM;
++		goto fail;
++	}
++	nss_root_control_owners |= NSS_ROOT_LEGACY;
++#else
++#if (NSS_FREQ_SCALE_SUPPORT == 1)
++	nss_clk_hdr = register_sysctl("dev/nss/clock", nss_freq_table);
++	if (!nss_clk_hdr) {
++		ret = -ENOMEM;
++		goto fail;
++	}
++	nss_root_control_owners |= NSS_ROOT_CLOCK;
++#endif
++	nss_gen_hdr = register_sysctl("dev/nss/general", nss_general_table);
++	if (!nss_gen_hdr) {
++		ret = -ENOMEM;
++		goto fail;
++	}
++	nss_root_control_owners |= NSS_ROOT_GENERAL;
++#if (NSS_SKB_REUSE_SUPPORT == 1)
++	nss_skb_hdr = register_sysctl("dev/nss/skb_reuse", nss_skb_reuse_table);
++	if (!nss_skb_hdr) {
++		ret = -ENOMEM;
++		goto fail;
++	}
++	nss_root_control_owners |= NSS_ROOT_SKB;
++#endif
++#endif
++
++#ifdef NSS_DRV_IPV4_ENABLE
++	ret = nss_ipv4_register_sysctl_checked();
++	if (ret)
++		goto fail;
++	nss_root_control_owners |= NSS_ROOT_IPV4;
++#endif
++#ifdef NSS_DRV_IPV6_ENABLE
++	ret = nss_ipv6_register_sysctl_checked();
++	if (ret)
++		goto fail;
++	nss_root_control_owners |= NSS_ROOT_IPV6;
++#endif
++	ret = nss_top_main.num_nss == 1 ?
++		nss_n2h_single_core_register_sysctl_checked() :
++		nss_n2h_multi_core_register_sysctl_checked();
++	if (ret)
++		goto fail;
++	nss_root_control_owners |= NSS_ROOT_N2H;
++	ret = nss_rps_register_sysctl_checked();
++	if (ret)
++		goto fail;
++	nss_root_control_owners |= NSS_ROOT_RPS;
++#ifdef NSS_DRV_C2C_ENABLE
++	ret = nss_c2c_tx_register_sysctl_checked();
++	if (ret)
++		goto fail;
++	nss_root_control_owners |= NSS_ROOT_C2C;
++#endif
++	ret = nss_stats_register_sysctl_checked();
++	if (ret)
++		goto fail;
++	nss_root_control_owners |= NSS_ROOT_STATS;
++	ret = nss_project_register_sysctl_checked();
++	if (ret)
++		goto fail;
++	nss_root_control_owners |= NSS_ROOT_PROJECT;
++#ifdef NSS_DRV_PPPOE_ENABLE
++	ret = nss_pppoe_register_sysctl_checked();
++	if (ret)
++		goto fail;
++	nss_root_control_owners |= NSS_ROOT_PPPOE;
++#endif
++#ifdef NSS_DRV_DMA_ENABLE
++	ret = nss_dma_register_sysctl_checked();
++	if (ret)
++		goto fail;
++	nss_root_control_owners |= NSS_ROOT_DMA;
++#endif
++	nss_root_control_state = NSS_ROOT_LIVE;
++	ret = 0;
++	goto out;
++fail:
++	nss_root_controls_stop_locked();
++out:
++	mutex_unlock(&nss_root_control_lock);
++	return ret;
++}
++
+ /*
+  * nss_init()
+  *	Registers nss driver
+  */
+ static int __init nss_init(void)
+ {
++	int ret;
+ #if defined(NSS_DRV_POINT_OFFLOAD)
+ 	struct device_node *pof = NULL;
+ #endif
+@@ -682,9 +1086,12 @@
+ 	pof = of_find_node_by_name(NULL, "reg-update");
+ #endif
+ 	if ((!pof) || (!of_property_read_bool(pof, "ubi_core_enable"))) {
++		if (pof)
++			of_node_put(pof);
+ 		nss_info_always("UBI is not enabled. Disable qca-nss-drv\n");
+ 		return 0;
+ 	}
++	of_node_put(pof);
+ #endif
+ 
+ nss_info("Init NSS driver");
+@@ -776,102 +1183,11 @@
+ 
+ #endif /* NSS_DT_SUPPORT */
+ 	nss_top_main.nss_hal_common_init_done = false;
+-
+-	/*
+-	 * Initialize data_plane workqueue
+-	 */
+-
+-#ifdef NSS_DATA_PLANE_GENERIC_SUPPORT
+-	if (nss_data_plane_init_delay_work()) {
+-		nss_warning("Error initializing nss_data_plane_workqueue\n");
+-		return -EFAULT;
+-	}
+-#endif
+-
+-#ifdef NSS_DATA_PLANE_LITE_SUPPORT
+-	if (nss_data_plane_lite_init_delay_work()){
+-		nss_warning("Error initializing nss_data_plane_lite_workqueue\n");
+-		return -EFAULT;
+-	}
+-#endif
+-	/*
+-	 * Enable spin locks
+-	 */
+ 	spin_lock_init(&(nss_top_main.lock));
+ 	spin_lock_init(&(nss_top_main.stats_lock));
+ 	mutex_init(&(nss_top_main.wq_lock));
+ 
+-	/*
+-	 * Enable NSS statistics
+-	 */
+-	nss_stats_init();
+-
+-	/*
+-	 * Enable NSS statistics names.
+-	 */
+-	nss_strings_init();
+-
+-#if (LINUX_VERSION_CODE < KERNEL_VERSION(6, 6, 0))
+-	/*
+-	 * Register sysctl table.
+-	 */
+-	nss_dev_header = register_sysctl_table(nss_root);
+-#else
+-	nss_clk_hdr = register_sysctl("dev/nss/clock", nss_freq_table);
+-	nss_gen_hdr = register_sysctl("dev/nss/general", nss_general_table);
+-	nss_skb_hdr = register_sysctl("dev/nss/skb_reuse", nss_skb_reuse_table);
+-#endif
+-	/*
+-	 * Registering sysctl for ipv4/6 specific config.
+-	 */
+-#ifdef NSS_DRV_IPV4_ENABLE
+-	nss_ipv4_register_sysctl();
+-#endif
+-#ifdef NSS_DRV_IPV6_ENABLE
+-	nss_ipv6_register_sysctl();
+-#endif
+-
+-	/*
+-	 * Registering sysctl for n2h specific config.
+-	 */
+-	if (nss_top_main.num_nss == 1) {
+-		nss_n2h_single_core_register_sysctl();
+-	} else {
+-		nss_n2h_multi_core_register_sysctl();
+-	}
+-
+-	/*
+-	 * Registering sysctl for rps specific config.
+-	 */
+-	nss_rps_register_sysctl();
+-
+-#ifdef NSS_DRV_C2C_ENABLE
+-	/*
+-	 * Registering sysctl for c2c_tx specific config.
+-	 */
+-	nss_c2c_tx_register_sysctl();
+-#endif
+-
+-	/*
+-	 * Registering sysctl for for printing non zero stats.
+-	 */
+-	nss_stats_register_sysctl();
+-
+-	/*
+-	 * Register sysctl for project config
+-	 */
+-	nss_project_register_sysctl();
+-
+-	/*
+-	 * Registering sysctl for pppoe specific config.
+-	 */
+-#ifdef NSS_DRV_PPPOE_ENABLE
+-	nss_pppoe_register_sysctl();
+-#endif
+-
+-	/*
+-	 * Setup Runtime Sample values
+-	 */
++	/* Prepare producer state and owned queues before publishing controls. */
+ 	nss_runtime_samples.freq_scale_index = 1;
+ 	nss_runtime_samples.freq_scale_ready = 0;
+ 	nss_runtime_samples.freq_scale_rate_limit_down = 0;
+@@ -881,14 +1197,38 @@
+ 	nss_runtime_samples.average = 0;
+ 	nss_runtime_samples.message_rate_limit = 0;
+ 	nss_runtime_samples.initialized = 0;
+-
+ 	nss_cmd_buf.current_freq = nss_runtime_samples.freq_scale[nss_runtime_samples.freq_scale_index].frequency;
++	ret = nss_freq_work_init();
++	if (ret)
++		return ret;
+ 
+ 	/*
+-	 * Initial Workqueue
++	 * Initialize data_plane workqueue
+ 	 */
+-	nss_wq = create_workqueue("nss_freq_queue");
+ 
++#ifdef NSS_DATA_PLANE_GENERIC_SUPPORT
++	ret = nss_data_plane_init_delay_work();
++	if (ret) {
++		nss_warning("Error initializing nss_data_plane_workqueue\n");
++		goto out_freq;
++	}
++#endif
++
++#ifdef NSS_DATA_PLANE_LITE_SUPPORT
++	ret = nss_data_plane_lite_init_delay_work();
++	if (ret) {
++		nss_warning("Error initializing nss_data_plane_lite_workqueue\n");
++		goto out_generic;
++	}
++#endif
++	ret = nss_coredump_init();
++	if (ret)
++		goto out_lite;
++
++	ret = nss_root_controls_start();
++	if (ret)
++		goto out_controls;
++
+ #if (NSS_PM_SUPPORT == 1)
+ 	/*
+ 	 * Initialize NSS Bus PM module
+@@ -909,12 +1249,6 @@
+ 	 */
+ 	nss_top_main.prev_mtu_sz = ETH_DATA_LEN;
+ 
+-	/*
+-	 * register panic handler and timeout control
+-	 */
+-	nss_coredump_notify_register();
+-	nss_coredump_init_delay_work();
+-
+ #ifdef NSS_DRV_CAPWAP_ENABLE
+ 	/*
+ 	 * Init capwap
+@@ -954,13 +1288,12 @@
+ 	 * INIT ppe on supported platform
+ 	 */
+ #ifdef NSS_DRV_PPE_ENABLE
+-	nss_ppe_init();
++	ret = nss_ppe_init_checked(&nss_root_ppe_owner);
++	/* Diagnostic MMIO remains optional; busy/invalid is not acquisition. */
++	if (ret && ret != -ENOMEM)
++		goto out_controls;
+ #endif
+ 
+-#ifdef NSS_DRV_DMA_ENABLE
+-	nss_dma_init();
+-#endif
+-
+ 	/*
+ 	 * Init Wi-Fi mesh
+ 	 */
+@@ -971,7 +1304,28 @@
+ 	/*
+ 	 * Register platform_driver
+ 	 */
+-	return platform_driver_register(&nss_driver);
++	ret = platform_driver_register(&nss_driver);
++	if (!ret) {
++		nss_platform_registered = true;
++		return 0;
++	}
++out_controls:
++	nss_hal_quiesce_control_group();
++#ifdef NSS_DRV_PPE_ENABLE
++	nss_root_ppe_release();
++#endif
++	nss_coredump_exit();
++out_lite:
++#ifdef NSS_DATA_PLANE_LITE_SUPPORT
++	nss_data_plane_lite_destroy_delay_work();
++out_generic:
++#endif
++#ifdef NSS_DATA_PLANE_GENERIC_SUPPORT
++	nss_data_plane_destroy_delay_work();
++out_freq:
++#endif
++	nss_freq_work_exit();
++	return ret;
+ }
+ 
+ /*
+@@ -981,59 +1335,22 @@
+ static void __exit nss_cleanup(void)
+ {
+ 	nss_info("Exit NSS driver");
++	if (!nss_platform_registered)
++		return;
++	/* Unpublish and join controls while core/clock resources and RX are live. */
++	nss_hal_quiesce_control_group();
+ 
+-#if (LINUX_VERSION_CODE < KERNEL_VERSION(6, 6, 0))
+-	if (nss_dev_header)
+-		unregister_sysctl_table(nss_dev_header);
+-#else
+-	if (nss_clk_hdr)
+-		unregister_sysctl_table(nss_clk_hdr);
+-
+-	if (nss_gen_hdr)
+-		unregister_sysctl_table(nss_gen_hdr);
+-
+-	if (nss_skb_hdr)
+-		unregister_sysctl_table(nss_skb_hdr);
+-#endif
+ 	/*
+-	 * Unregister n2h specific sysctl
+-	 */
+-	nss_n2h_unregister_sysctl();
+-
+-	/*
+-	 * Unregister rps specific sysctl
+-	 */
+-	nss_rps_unregister_sysctl();
+-
+-#ifdef NSS_DRV_C2C_ENABLE
+-	/*
+-	 * Unregister c2c_tx specific sysctl
+-	 */
+-	nss_c2c_tx_unregister_sysctl();
+-#endif
+-
+-	/*
+-	 * Unregister pppoe specific sysctl
+-	 */
+-#ifdef NSS_DRV_PPPOE_ENABLE
+-	nss_pppoe_unregister_sysctl();
+-#endif
+-
+-	/*
+ 	 * Unregister ipv4/6 specific sysctl and free allocated to connection tables
+ 	 */
+ #ifdef NSS_DRV_IPV4_ENABLE
+-	nss_ipv4_unregister_sysctl();
+ 	nss_ipv4_free_conn_tables();
+ #endif
+ 
+ #ifdef NSS_DRV_IPV6_ENABLE
+-	nss_ipv6_unregister_sysctl();
+ 	nss_ipv6_free_conn_tables();
+ #endif
+ 
+-	nss_project_unregister_sysctl();
+-
+ #ifdef NSS_DATA_PLANE_GENERIC_SUPPORT
+ 	nss_data_plane_destroy_delay_work();
+ #endif
+@@ -1046,10 +1363,13 @@
+ 	 * cleanup ppe on supported platform
+ 	 */
+ #ifdef NSS_DRV_PPE_ENABLE
+-	nss_ppe_free();
++	nss_root_ppe_release();
+ #endif
+ 
+ 	platform_driver_unregister(&nss_driver);
++	nss_platform_registered = false;
++	nss_coredump_exit();
++	nss_freq_work_exit();
+ }
+ 
+ module_init(nss_init);
+--- a/nss_ipv4.c
++++ b/nss_ipv4.c
+@@ -19,6 +19,8 @@
+  *	NSS IPv4 APIs
+  */
+ #include <linux/sysctl.h>
++#include <linux/mutex.h>
++#include "nss_sysctl.h"
+ #include "nss_dscp_map.h"
+ #include "nss_ipv4_stats.h"
+ #include "nss_ipv4_strings.h"
+@@ -608,6 +610,9 @@
+ 	nss_tx_status_t nss_tx_status;
+ 	int ret = NSS_FAILURE;
+ 	int current_value;
++
++	if (write && !nss_sysctl_ctx_ready(nss_ctx))
++		return -ENODEV;
+ 
+ 	/*
+ 	 * Take snap shot of current value
+@@ -656,6 +661,9 @@
+ 	if (!write) {
+ 		return nss_dscp_map_print(ctl, buffer, lenp, ppos, mapping);
+ 	}
++
++	if (!nss_sysctl_ctx_ready(nss_ctx))
++		return -ENODEV;
+ 
+ 	ret = nss_dscp_map_parse(ctl, buffer, lenp, ppos, &out);
+ 	if (ret) {
+@@ -712,13 +720,23 @@
+ };
+ 
+ static struct ctl_table_header *nss_ipv4_header;
++/* Readers must not take this lock: unregister waits for active handlers. */
++static DEFINE_MUTEX(nss_ipv4_sysctl_lock);
+ 
+ /*
+- * nss_ipv4_register_sysctl()
++ * nss_ipv4_register_sysctl_checked()
+  *	Register sysctl specific to ipv4
+  */
+-void nss_ipv4_register_sysctl(void)
++int nss_ipv4_register_sysctl_checked(void)
+ {
++	int ret = 0;
++
++	mutex_lock(&nss_ipv4_sysctl_lock);
++	if (nss_ipv4_header) {
++		mutex_unlock(&nss_ipv4_sysctl_lock);
++		return -EBUSY;
++	}
++
+ 	sema_init(&nss_ipv4_pvt.sem, 1);
+ 	init_completion(&nss_ipv4_pvt.complete);
+ 
+@@ -726,20 +744,36 @@
+ 	 * Register sysctl table.
+ 	 */
+ 	nss_ipv4_header = register_sysctl("dev/nss/ipv4cfg", nss_ipv4_table);
++	if (!nss_ipv4_header) {
++		ret = -ENOMEM;
++	}
++	mutex_unlock(&nss_ipv4_sysctl_lock);
++	return ret;
+ }
+ 
++void nss_ipv4_register_sysctl(void)
++{
++	(void)nss_ipv4_register_sysctl_checked();
++}
++
+ /*
+  * nss_ipv4_unregister_sysctl()
+  *	Unregister sysctl specific to ipv4
+  */
+ void nss_ipv4_unregister_sysctl(void)
+ {
++	struct ctl_table_header *header;
++
+ 	/*
+ 	 * Unregister sysctl table.
+ 	 */
+-	if (nss_ipv4_header) {
+-		unregister_sysctl_table(nss_ipv4_header);
++	mutex_lock(&nss_ipv4_sysctl_lock);
++	header = nss_ipv4_header;
++	nss_ipv4_header = NULL;
++	if (header) {
++		unregister_sysctl_table(header);
+ 	}
++	mutex_unlock(&nss_ipv4_sysctl_lock);
+ }
+ 
+ /*
+--- a/nss_ipv4_strings.c
++++ b/nss_ipv4_strings.c
+@@ -176,7 +176,7 @@
+  * nss_ipv4_strings_dentry_create()
+  *      Create IPv4 statistics strings debug entry.
+  */
+-void nss_ipv4_strings_dentry_create(void)
++static void nss_ipv4_strings_dentry_create_locked(void)
+ {
+ 	struct dentry *dir_d;
+ 	struct dentry *file_d;
+@@ -186,19 +186,19 @@
+ 		return;
+ 	}
+ 
+-	dir_d = debugfs_create_dir("ipv4", nss_top_main.strings_dentry);
++	dir_d = nss_debugfs_create_dir_locked("ipv4", nss_top_main.strings_dentry);
+ 	if (!dir_d) {
+ 		nss_warning("Failed to create qca-nss-drv/strings/ipv4 directory");
+ 		return;
+ 	}
+ 
+-	file_d = debugfs_create_file("special_stats_str", 0400, dir_d, &nss_top_main, &nss_ipv4_special_stats_strings_ops);
++	file_d = nss_debugfs_create_file_locked("special_stats_str", 0400, dir_d, &nss_top_main, &nss_ipv4_special_stats_strings_ops);
+ 	if (!file_d) {
+ 		nss_warning("Failed to create qca-nss-drv/stats/ipv4/special_stats_str file");
+ 		goto fail;
+ 	}
+ 
+-	file_d = debugfs_create_file("exception_stats_str", 0400, dir_d, &nss_top_main, &nss_ipv4_exception_stats_strings_ops);
++	file_d = nss_debugfs_create_file_locked("exception_stats_str", 0400, dir_d, &nss_top_main, &nss_ipv4_exception_stats_strings_ops);
+ 	if (!file_d) {
+ 		nss_warning("Failed to create qca-nss-drv/stats/ipv4/exception_stats_str file");
+ 		goto fail;
+@@ -206,5 +206,13 @@
+ 
+ 	return;
+ fail:
+-	debugfs_remove_recursive(dir_d);
++	nss_debugfs_remove_locked(dir_d);
+ }
++
++void nss_ipv4_strings_dentry_create(void)
++{
++	if (!nss_debugfs_begin(NSS_DEBUGFS_STRINGS))
++		return;
++	nss_ipv4_strings_dentry_create_locked();
++	nss_debugfs_end();
++}
+--- a/nss_ipv6.c
++++ b/nss_ipv6.c
+@@ -19,6 +19,8 @@
+  *	NSS IPv6 APIs
+  */
+ #include "linux/ipv6.h"
++#include <linux/mutex.h>
++#include "nss_sysctl.h"
+ #include <nss_core.h>
+ #include "nss_dscp_map.h"
+ #include "nss_ipv6_stats.h"
+@@ -604,6 +606,9 @@
+ 	nss_tx_status_t nss_tx_status;
+ 	int ret = NSS_FAILURE;
+ 	int current_value;
++
++	if (write && !nss_sysctl_ctx_ready(nss_ctx))
++		return -ENODEV;
+ 
+ 	/*
+ 	 * Take snap shot of current value
+@@ -652,6 +657,9 @@
+ 	if (!write) {
+ 		return nss_dscp_map_print(ctl, buffer, lenp, ppos, mapping);
+ 	}
++
++	if (!nss_sysctl_ctx_ready(nss_ctx))
++		return -ENODEV;
+ 
+ 	ret = nss_dscp_map_parse(ctl, buffer, lenp, ppos, &out);
+ 	if (ret) {
+@@ -707,13 +715,23 @@
+ };
+ 
+ static struct ctl_table_header *nss_ipv6_header;
++/* Readers must not take this lock: unregister waits for active handlers. */
++static DEFINE_MUTEX(nss_ipv6_sysctl_lock);
+ 
+ /*
+- * nss_ipv6_register_sysctl()
++ * nss_ipv6_register_sysctl_checked()
+  *	Register sysctl specific to ipv6
+  */
+-void nss_ipv6_register_sysctl(void)
++int nss_ipv6_register_sysctl_checked(void)
+ {
++	int ret = 0;
++
++	mutex_lock(&nss_ipv6_sysctl_lock);
++	if (nss_ipv6_header) {
++		mutex_unlock(&nss_ipv6_sysctl_lock);
++		return -EBUSY;
++	}
++
+ 	sema_init(&nss_ipv6_pvt.sem, 1);
+ 	init_completion(&nss_ipv6_pvt.complete);
+ 
+@@ -721,20 +739,36 @@
+ 	 * Register sysctl table.
+ 	 */
+ 	nss_ipv6_header = register_sysctl("dev/nss/ipv6cfg", nss_ipv6_table);
++	if (!nss_ipv6_header) {
++		ret = -ENOMEM;
++	}
++	mutex_unlock(&nss_ipv6_sysctl_lock);
++	return ret;
+ }
+ 
++void nss_ipv6_register_sysctl(void)
++{
++	(void)nss_ipv6_register_sysctl_checked();
++}
++
+ /*
+  * nss_ipv6_unregister_sysctl()
+  *	Unregister sysctl specific to ipv6
+  */
+ void nss_ipv6_unregister_sysctl(void)
+ {
++	struct ctl_table_header *header;
++
+ 	/*
+ 	 * Unregister sysctl table.
+ 	 */
+-	if (nss_ipv6_header) {
+-		unregister_sysctl_table(nss_ipv6_header);
++	mutex_lock(&nss_ipv6_sysctl_lock);
++	header = nss_ipv6_header;
++	nss_ipv6_header = NULL;
++	if (header) {
++		unregister_sysctl_table(header);
+ 	}
++	mutex_unlock(&nss_ipv6_sysctl_lock);
+ }
+ 
+ /*
+--- a/nss_ipv6_strings.c
++++ b/nss_ipv6_strings.c
+@@ -154,7 +154,7 @@
+  * nss_ipv6_strings_dentry_create()
+  *      Create IPv6 statistics strings debug entry.
+  */
+-void nss_ipv6_strings_dentry_create(void)
++static void nss_ipv6_strings_dentry_create_locked(void)
+ {
+ 	struct dentry *ipv6_d = NULL;
+ 	struct dentry *ipv6_spcl_stats_d = NULL;
+@@ -165,23 +165,31 @@
+ 		return;
+ 	}
+ 
+-	ipv6_d = debugfs_create_dir("ipv6", nss_top_main.strings_dentry);
++	ipv6_d = nss_debugfs_create_dir_locked("ipv6", nss_top_main.strings_dentry);
+ 	if (!ipv6_d) {
+ 		nss_warning("Failed to create qca-nss-drv/strings/ipv6 directory");
+ 		return;
+ 	}
+ 
+-	ipv6_spcl_stats_d = debugfs_create_file("special_stats_str", 0400, ipv6_d, &nss_top_main, &nss_ipv6_special_stats_strings_ops);
++	ipv6_spcl_stats_d = nss_debugfs_create_file_locked("special_stats_str", 0400, ipv6_d, &nss_top_main, &nss_ipv6_special_stats_strings_ops);
+ 	if (!ipv6_spcl_stats_d) {
+ 		nss_warning("Failed to create qca-nss-drv/stats/ipv6/special_stats_str file");
+-		debugfs_remove_recursive(ipv6_d);
++		nss_debugfs_remove_locked(ipv6_d);
+ 		return;
+ 	}
+ 
+-	ipv6_excp_stats_d = debugfs_create_file("exception_stats_str", 0400, ipv6_d, &nss_top_main, &nss_ipv6_exception_stats_strings_ops);
++	ipv6_excp_stats_d = nss_debugfs_create_file_locked("exception_stats_str", 0400, ipv6_d, &nss_top_main, &nss_ipv6_exception_stats_strings_ops);
+ 	if (!ipv6_excp_stats_d) {
+ 		nss_warning("Failed to create qca-nss-drv/stats/ipv6/exception_stats_str file");
+-		debugfs_remove_recursive(ipv6_d);
++		nss_debugfs_remove_locked(ipv6_d);
+ 		return;
+ 	}
+ }
++
++void nss_ipv6_strings_dentry_create(void)
++{
++	if (!nss_debugfs_begin(NSS_DEBUGFS_STRINGS))
++		return;
++	nss_ipv6_strings_dentry_create_locked();
++	nss_debugfs_end();
++}
+--- a/nss_log.c
++++ b/nss_log.c
+@@ -34,6 +34,7 @@
+ #include <nss_hal.h>
+ #include "nss_core.h"
+ #include "nss_log.h"
++#include "nss_sysctl.h"
+ 
+ /*
+  * Private data for each device file open instance
+@@ -51,11 +52,12 @@
+ struct nss_log_ring_buffer_addr nss_rbe[NSS_MAX_CORES];
+ 
+ static DEFINE_MUTEX(nss_log_mutex);
+-static wait_queue_head_t nss_log_wq;
++static DECLARE_WAIT_QUEUE_HEAD(nss_log_wq);
++static bool nss_log_initialized;
+ static nss_log_msg_callback_t nss_debug_interface_cb;
+ static void *nss_debug_interface_app_data = NULL;
+ 
+-static wait_queue_head_t msg_wq;
++static DECLARE_WAIT_QUEUE_HEAD(msg_wq);
+ enum nss_cmn_response msg_response;
+ static bool msg_event;
+ 
+@@ -93,7 +95,11 @@
+ 	struct nss_top_instance *nss_top;
+ 	struct nss_ctx_instance *nss_ctx;
+ 	int nss_id;
++	int ret = nss_debugfs_open_allowed();
+ 
++	if (ret)
++		return ret;
++
+ 	/*
+ 	 * i_private is passed to us by debug_fs_create()
+ 	 */
+@@ -530,6 +536,13 @@
+ 	int core_status;
+ 	int i;
+ 
++	if (write) {
++		for (i = 0; i < nss_top_main.num_nss; i++) {
++			if (!nss_sysctl_ctx_ready(&nss_top_main.nss[i]))
++				return -ENODEV;
++		}
++	}
++
+ 	ret = proc_dointvec(ctl, write, buffer, lenp, ppos);
+ 	if (ret)  {
+ 		return ret;
+@@ -563,23 +576,19 @@
+ }
+ 
+ /*
+- * nss_log_init()
+- *	Initializes NSS FW logs retrieval logic from /sys
++ * nss_log_debugfs_init_locked()
++ *	Publish optional FW log diagnostics without resetting live log state.
+  */
+-void nss_log_init(void)
++static void nss_log_debugfs_init_locked(void)
+ {
+ 	int i;
+ 	struct dentry *logs_dentry;
+ 	struct dentry *core_log_dentry;
+ 
+-	memset(nss_rbe, 0, sizeof(nss_rbe));
+-	init_waitqueue_head(&nss_log_wq);
+-	init_waitqueue_head(&msg_wq);
+-
+ 	/*
+ 	 * Create directory for obtaining NSS FW logs from each core
+ 	 */
+-	logs_dentry = debugfs_create_dir("logs", nss_top_main.top_dentry);
++	logs_dentry = nss_debugfs_create_dir_locked("logs", nss_top_main.top_dentry);
+ 	if (unlikely(!logs_dentry)) {
+ 		nss_warning("Failed to create qca-nss-drv/logs directory in debugfs");
+ 		return;
+@@ -590,7 +599,7 @@
+ 		extern struct file_operations nss_logs_core_ops;
+ 
+ 		snprintf(file, sizeof(file), "core%d", i);
+-		core_log_dentry = debugfs_create_file(file, 0400,
++		core_log_dentry = nss_debugfs_create_file_locked(file, 0400,
+ 						logs_dentry, (void *)(nss_ptr_t)i, &nss_logs_core_ops);
+ 		if (unlikely(!core_log_dentry)) {
+ 			nss_warning("Failed to create qca-nss-drv/logs/%s file in debugfs", file);
+@@ -598,5 +607,23 @@
+ 		}
+ 	}
+ 
+-	nss_debug_interface_set_callback(nss_debug_interface_event, NULL);
+ }
++
++void nss_log_debugfs_init(void)
++{
++	if (!nss_debugfs_begin(NSS_DEBUGFS_TOP))
++		return;
++	nss_log_debugfs_init_locked();
++	nss_debugfs_end();
++}
++
++void nss_log_init(void)
++{
++	/* Queues and rings have static initialization; never reset active FD state. */
++	mutex_lock(&nss_log_mutex);
++	if (!nss_log_initialized) {
++		nss_debug_interface_set_callback(nss_debug_interface_event, NULL);
++		nss_log_initialized = true;
++	}
++	mutex_unlock(&nss_log_mutex);
++}
+--- a/nss_log.h
++++ b/nss_log.h
+@@ -21,6 +21,8 @@
+ #ifndef __NSS_LOG_H
+ #define __NSS_LOG_H
+ 
++void nss_log_debugfs_init(void);
++
+ #define NSS_DEBUG_LOG_VERSION		0x1
+ 
+ /**
+--- a/nss_meminfo.c
++++ b/nss_meminfo.c
+@@ -743,6 +743,10 @@
+  */
+ static int nss_meminfo_debugfs_file_open(struct inode *inode, struct file *file)
+ {
++	int ret = nss_debugfs_open_allowed();
++
++	if (ret)
++		return ret;
+ 	return single_open(file, nss_meminfo_config_show, inode->i_private);
+ }
+ 
+@@ -764,6 +768,8 @@
+ 	struct dentry *meminfo_main_dentry;
+ 	struct dentry *meminfo_core_dentries[NSS_MAX_CORES];
+ 
++	if (!nss_debugfs_begin(NSS_DEBUGFS_TOP))
++		return;
+ 	mutex_lock(&nss_meminfo_debugfs_lock);
+ 	if (nss_meminfo_debugfs_exist)
+ 		goto out;
+@@ -771,7 +777,7 @@
+ 	/*
+ 	 * Create directory for showing meminfo configuration of each core.
+ 	 */
+-	meminfo_main_dentry = debugfs_create_dir("meminfo", nss_top_main.top_dentry);
++	meminfo_main_dentry = nss_debugfs_create_dir_locked("meminfo", nss_top_main.top_dentry);
+ 	if (IS_ERR_OR_NULL(meminfo_main_dentry)) {
+ 		nss_warning("Failed to create qca-nss-drv/meminfo directory in debugfs\n");
+ 		goto out;
+@@ -780,13 +786,10 @@
+ 	for (i = 0; i < nss_top_main.num_nss; i++) {
+ 		char file[10];
+ 		snprintf(file, sizeof(file), "core%d", i);
+-		meminfo_core_dentries[i] = debugfs_create_file(file, 0400, meminfo_main_dentry,
++		meminfo_core_dentries[i] = nss_debugfs_create_file_locked(file, 0400, meminfo_main_dentry,
+ 						(void *)(nss_ptr_t)i, &nss_meminfo_debugfs_ops);
+ 		if (IS_ERR_OR_NULL(meminfo_core_dentries[i])) {
+-			int j;
+-			for (j = 0; j < i; j++)
+-				debugfs_remove(meminfo_core_dentries[j]);
+-			debugfs_remove(meminfo_main_dentry);
++			nss_debugfs_remove_locked(meminfo_main_dentry);
+ 			nss_warning("Failed to create qca-nss-drv/meminfo/%s file in debugfs", file);
+ 			goto out;
+ 		}
+@@ -796,6 +799,7 @@
+ 	nss_info("nss meminfo user config: %s\n", nss_meminfo_user_config);
+ out:
+ 	mutex_unlock(&nss_meminfo_debugfs_lock);
++	nss_debugfs_end();
+ }
+ 
+ /*
+--- a/nss_n2h.c
++++ b/nss_n2h.c
+@@ -23,6 +23,8 @@
+  */
+ 
+ #include "nss_tx_rx_common.h"
++#include <linux/mutex.h>
++#include "nss_sysctl.h"
+ #include "nss_n2h_stats.h"
+ #include "nss_n2h_strings.h"
+ #include "nss_drv_strings.h"
+@@ -369,6 +371,9 @@
+ 	nss_tx_status_t nss_tx_status;
+ 	int ret = NSS_FAILURE;
+ 
++	if (!nss_sysctl_ctx_ready(nss_ctx))
++		return -ENODEV;
++
+ 	/*
+ 	 * Acquiring semaphore
+ 	 */
+@@ -470,6 +475,9 @@
+ 	struct nss_n2h_empty_pool_buf *nneppbcm;
+ 	nss_tx_status_t nss_tx_status;
+ 	int ret = NSS_FAILURE;
++
++	if (!nss_sysctl_ctx_ready(nss_ctx))
++		return -ENODEV;
+ 
+ 	/*
+ 	 * Acquiring semaphore
+@@ -573,6 +581,9 @@
+ 	nss_tx_status_t nss_tx_status;
+ 	int ret = NSS_FAILURE;
+ 
++	if (!nss_sysctl_ctx_ready(nss_ctx))
++		return -ENODEV;
++
+ 	/*
+ 	 * Acquiring semaphore
+ 	 */
+@@ -687,6 +698,9 @@
+ 	nss_tx_status_t nss_tx_status;
+ 	int ret = NSS_FAILURE;
+ 
++	if (!nss_sysctl_ctx_ready(nss_ctx))
++		return -ENODEV;
++
+ 	/*
+ 	 * Acquiring semaphore
+ 	 */
+@@ -801,6 +815,9 @@
+ 	nss_tx_status_t nss_tx_status;
+ 	int ret = NSS_FAILURE;
+ 
++	if (write && !nss_sysctl_ctx_ready(nss_ctx))
++		return -ENODEV;
++
+ 	/*
+ 	 * Acquiring semaphore
+ 	 */
+@@ -1304,6 +1321,9 @@
+ 	struct nss_ctx_instance *nss_ctx = &nss_top->nss[NSS_CORE_0];
+ 	int ret;
+ 
++	if (write && !nss_sysctl_ctx_ready(nss_ctx))
++		return -ENODEV;
++
+ 	ret = proc_dointvec(ctl, write, buffer, lenp, ppos);
+ 	if (ret) {
+ 		return ret;
+@@ -1335,6 +1355,9 @@
+ 	struct nss_ctx_instance *nss_ctx = &nss_top->nss[NSS_CORE_1];
+ 	int ret;
+ 
++	if (write && !nss_sysctl_ctx_ready(nss_ctx))
++		return -ENODEV;
++
+ 	ret = proc_dointvec(ctl, write, buffer, lenp, ppos);
+ 	if (ret) {
+ 		return ret;
+@@ -1366,6 +1389,9 @@
+ 	struct nss_ctx_instance *nss_ctx = &nss_top->nss[NSS_CORE_0];
+ 	int ret;
+ 
++	if (write && !nss_sysctl_ctx_ready(nss_ctx))
++		return -ENODEV;
++
+ 	ret = proc_dointvec(ctl, write, buffer, lenp, ppos);
+ 	if (ret) {
+ 		return ret;
+@@ -1408,6 +1434,9 @@
+ 	struct nss_top_instance *nss_top = &nss_top_main;
+ 	struct nss_ctx_instance *nss_ctx = &nss_top->nss[NSS_CORE_1];
+ 	int ret;
++
++	if (write && !nss_sysctl_ctx_ready(nss_ctx))
++		return -ENODEV;
+ 
+ 	ret = proc_dointvec(ctl, write, buffer, lenp, ppos);
+ 	if (ret) {
+@@ -1470,6 +1499,9 @@
+ 	int ret, current_val;
+ 	nss_tx_status_t nss_tx_status;
+ 
++	if (write && !nss_sysctl_ctx_ready(nss_ctx))
++		return -ENODEV;
++
+ 	/*
+ 	 * Take a snap shot of current value
+ 	 */
+@@ -1633,6 +1665,10 @@
+ 	struct nss_top_instance *nss_top = &nss_top_main;
+ 	struct nss_ctx_instance *nss_ctx = &nss_top->nss[core_id];
+ 	int ret, ret_bp, current_state;
++
++	if (write && !nss_sysctl_ctx_ready(nss_ctx))
++		return -ENODEV;
++
+ 	current_state = nss_n2h_host_bp_config[core_id];
+ 	ret = proc_dointvec(ctl, write, buffer, lenp, ppos);
+ 
+@@ -1960,6 +1996,8 @@
+ #endif
+ 
+ static struct ctl_table_header *nss_n2h_header;
++/* Both core profiles share one owner; readers never take this lock. */
++static DEFINE_MUTEX(nss_n2h_sysctl_lock);
+ /*
+  * nss_n2h_cfg_empty_pool_size()
+  *	Config empty buffer pool
+@@ -2260,10 +2298,18 @@
+ }
+ 
+ /*
+- * nss_n2h_single_core_register_sysctl()
++ * nss_n2h_single_core_register_sysctl_checked()
+  */
+-void nss_n2h_single_core_register_sysctl(void)
++int nss_n2h_single_core_register_sysctl_checked(void)
+ {
++	int ret = 0;
++
++	mutex_lock(&nss_n2h_sysctl_lock);
++	if (nss_n2h_header) {
++		mutex_unlock(&nss_n2h_sysctl_lock);
++		return -EBUSY;
++	}
++
+ 	/*
+ 	 * RPS sema init
+ 	 */
+@@ -2329,13 +2375,31 @@
+ #else
+ 	nss_n2h_header = register_sysctl("dev/nss/n2hcfg", nss_n2h_table_single_core);
+ #endif
++	if (!nss_n2h_header) {
++		ret = -ENOMEM;
++	}
++	mutex_unlock(&nss_n2h_sysctl_lock);
++	return ret;
+ }
+ 
++void nss_n2h_single_core_register_sysctl(void)
++{
++	(void)nss_n2h_single_core_register_sysctl_checked();
++}
++
+ /*
+- * nss_n2h_multi_core_register_sysctl()
++ * nss_n2h_multi_core_register_sysctl_checked()
+  */
+-void nss_n2h_multi_core_register_sysctl(void)
++int nss_n2h_multi_core_register_sysctl_checked(void)
+ {
++	int ret = 0;
++
++	mutex_lock(&nss_n2h_sysctl_lock);
++	if (nss_n2h_header) {
++		mutex_unlock(&nss_n2h_sysctl_lock);
++		return -EBUSY;
++	}
++
+ 	/*
+ 	 * RPS sema init
+ 	 */
+@@ -2428,24 +2492,41 @@
+ 	 */
+ 
+ #if (LINUX_VERSION_CODE < KERNEL_VERSION(6, 6, 0))
++	nss_n2h_dir[0].child = nss_n2h_table_multi_core;
+ 	nss_n2h_header = register_sysctl_table(nss_n2h_root);
+ #else
+ 	nss_n2h_header = register_sysctl("dev/nss/n2hcfg", nss_n2h_table_multi_core);
+ #endif
++	if (!nss_n2h_header) {
++		ret = -ENOMEM;
++	}
++	mutex_unlock(&nss_n2h_sysctl_lock);
++	return ret;
+ }
+ 
++void nss_n2h_multi_core_register_sysctl(void)
++{
++	(void)nss_n2h_multi_core_register_sysctl_checked();
++}
++
+ /*
+  * nss_n2h_unregister_sysctl()
+  *	Unregister sysctl specific to n2h
+  */
+ void nss_n2h_unregister_sysctl(void)
+ {
++	struct ctl_table_header *header;
++
+ 	/*
+ 	 * Unregister sysctl table.
+ 	 */
+-	if (nss_n2h_header) {
+-		unregister_sysctl_table(nss_n2h_header);
++	mutex_lock(&nss_n2h_sysctl_lock);
++	header = nss_n2h_header;
++	nss_n2h_header = NULL;
++	if (header) {
++		unregister_sysctl_table(header);
+ 	}
++	mutex_unlock(&nss_n2h_sysctl_lock);
+ }
+ 
+ EXPORT_SYMBOL(nss_n2h_notify_register);
+--- a/nss_ppe.c
++++ b/nss_ppe.c
+@@ -14,6 +14,8 @@
+  **************************************************************************
+  */
+ 
++#include <linux/errno.h>
++#include <linux/mutex.h>
+ #include "nss_ppe.h"
+ #include "nss_ppe_stats.h"
+ #include "nss_ppe_strings.h"
+@@ -21,8 +23,17 @@
+ DEFINE_SPINLOCK(nss_ppe_stats_lock);
+ 
+ struct nss_ppe_stats_debug nss_ppe_debug_stats;
+-struct nss_ppe_pvt ppe_pvt;
++struct nss_ppe_pvt ppe_pvt = {
++	.sem = __SEMAPHORE_INITIALIZER(ppe_pvt.sem, 1),
++	.complete = COMPLETION_INITIALIZER(ppe_pvt.complete),
++};
+ 
++/* Map ownership is independent of firmware synchronous message state. */
++static DEFINE_MUTEX(nss_ppe_map_lock);
++static u64 nss_ppe_map_generation;
++static u64 nss_ppe_map_owner;
++static u64 nss_ppe_legacy_owner;
++
+ /*
+  * nss_ppe_verify_ifnum()
+  *	Verify PPE interface number.
+@@ -306,69 +317,141 @@
+ void nss_ppe_register_handler(void)
+ {
+ 	struct nss_ctx_instance *nss_ctx = nss_ppe_get_context();
++	bool valid;
+ 
+ 	nss_core_register_handler(nss_ctx, NSS_PPE_INTERFACE, nss_ppe_handler, NULL);
+ 
+-	if (nss_ppe_debug_stats.valid) {
++	spin_lock_bh(&nss_ppe_stats_lock);
++	valid = nss_ppe_debug_stats.valid;
++	spin_unlock_bh(&nss_ppe_stats_lock);
++	if (valid) {
+ 		nss_ppe_stats_dentry_create();
+ 		nss_ppe_strings_dentry_create();
+ 	}
+ }
+ 
+ /*
+- * nss_ppe_free()
+- *	Uninitialize PPE base
++ * nss_ppe_acquire_locked()
++ *	Acquire only a new diagnostic map, never adopt an existing owner.
+  */
+-void nss_ppe_free(void)
++static int nss_ppe_acquire_locked(u64 *owner)
+ {
+-	/*
+-	 * Check if PPE base is already uninitialized.
+-	 */
+-	if (!ppe_pvt.ppe_base) {
+-		return;
++	void __iomem *base;
++
++	lockdep_assert_held(&nss_ppe_map_lock);
++	if (ppe_pvt.ppe_base) {
++		return -EBUSY;
+ 	}
+ 
+-	/*
+-	 * Unmap PPE base address
+-	 */
+-	iounmap(ppe_pvt.ppe_base);
+-	ppe_pvt.ppe_base = NULL;
++	if (nss_ppe_map_generation == ~(u64)0) {
++		return -EOVERFLOW;
++	}
+ 
++	base = nss_ioremap(PPE_BASE_ADDR, PPE_REG_SIZE);
++	if (!base) {
++		nss_warning("DRV can't get PPE base address\n");
++		return -ENOMEM;
++	}
++
++	nss_ppe_map_owner = ++nss_ppe_map_generation;
++	/*
++	 * Publish together with validity while excluding every MMIO reader.
++	 */
+ 	spin_lock_bh(&nss_ppe_stats_lock);
+-	nss_ppe_debug_stats.valid = false;
++	ppe_pvt.ppe_base = base;
+ 	nss_ppe_debug_stats.if_num = 0;
+ 	nss_ppe_debug_stats.if_index = 0;
++	nss_ppe_debug_stats.valid = true;
+ 	spin_unlock_bh(&nss_ppe_stats_lock);
++	*owner = nss_ppe_map_owner;
++	return 0;
+ }
+ 
+ /*
+- * nss_ppe_init()
+- *	Initialize PPE base
++ * nss_ppe_release_locked()
++ *	Detach after existing MMIO readers, then unmap outside the spinlock.
+  */
+-void nss_ppe_init(void)
++static int nss_ppe_release_locked(u64 owner)
+ {
+-	/*
+-	 * Check if PPE base is already initialized.
+-	 */
+-	if (ppe_pvt.ppe_base) {
+-		return;
++	void __iomem *base;
++
++	lockdep_assert_held(&nss_ppe_map_lock);
++	if (!owner) {
++		return -EINVAL;
+ 	}
+ 
+-	/*
+-	 * Get the PPE base address
+-	 */
+-	ppe_pvt.ppe_base = nss_ioremap(PPE_BASE_ADDR, PPE_REG_SIZE);
+-	if (!ppe_pvt.ppe_base) {
+-		nss_warning("DRV can't get PPE base address\n");
+-		return;
++	if (owner != nss_ppe_map_owner || !ppe_pvt.ppe_base) {
++		return -ESTALE;
+ 	}
+ 
+ 	spin_lock_bh(&nss_ppe_stats_lock);
+-	nss_ppe_debug_stats.valid = true;
++	base = ppe_pvt.ppe_base;
++	ppe_pvt.ppe_base = NULL;
++	nss_ppe_debug_stats.valid = false;
+ 	nss_ppe_debug_stats.if_num = 0;
+ 	nss_ppe_debug_stats.if_index = 0;
+ 	spin_unlock_bh(&nss_ppe_stats_lock);
++	nss_ppe_map_owner = 0;
++	iounmap(base);
++	return 0;
++}
+ 
+-	sema_init(&ppe_pvt.sem, 1);
+-	init_completion(&ppe_pvt.complete);
++/*
++ * nss_ppe_init_checked()
++ *	Report the optional map result and issue a receipt only on fresh acquire.
++ */
++int nss_ppe_init_checked(u64 *owner)
++{
++	int ret;
++
++	if (!owner || *owner) {
++		return -EINVAL;
++	}
++
++	mutex_lock(&nss_ppe_map_lock);
++	ret = nss_ppe_acquire_locked(owner);
++	mutex_unlock(&nss_ppe_map_lock);
++	return ret;
+ }
++
++/*
++ * nss_ppe_free_owned()
++ *	Release this receipt's host mapping, not firmware or device ownership.
++ */
++int nss_ppe_free_owned(u64 owner)
++{
++	int ret;
++
++	mutex_lock(&nss_ppe_map_lock);
++	ret = nss_ppe_release_locked(owner);
++	mutex_unlock(&nss_ppe_map_lock);
++	return ret;
++}
++
++/*
++ * nss_ppe_init()
++ *	Legacy optional acquisition; retain only the legacy caller's receipt.
++ */
++void nss_ppe_init(void)
++{
++	u64 owner = 0;
++
++	mutex_lock(&nss_ppe_map_lock);
++	if (!nss_ppe_acquire_locked(&owner)) {
++		nss_ppe_legacy_owner = owner;
++	}
++	mutex_unlock(&nss_ppe_map_lock);
++}
++
++/*
++ * nss_ppe_free()
++ *	Legacy cleanup cannot clear a checked or otherwise foreign owner.
++ */
++void nss_ppe_free(void)
++{
++	mutex_lock(&nss_ppe_map_lock);
++	if (nss_ppe_legacy_owner && !nss_ppe_release_locked(nss_ppe_legacy_owner)) {
++		nss_ppe_legacy_owner = 0;
++	}
++	mutex_unlock(&nss_ppe_map_lock);
++}
+--- a/nss_ppe.h
++++ b/nss_ppe.h
+@@ -19,6 +19,9 @@
+  *      NSS PPE header file
+  */
+ 
++#include <linux/completion.h>
++#include <linux/lockdep.h>
++#include <linux/semaphore.h>
+ #include <net/sock.h>
+ #include "nss_tx_rx_common.h"
+ 
+@@ -96,6 +99,17 @@
+  * Data structure to store to PPE private context
+  */
+ extern struct nss_ppe_pvt ppe_pvt;
++
++/*
++ * Optional diagnostic map, sleepable context only. A zero caller-owned receipt
++ * becomes nonzero only on fresh acquisition. -EBUSY never adopts an existing
++ * map; other errors also leave the receipt unchanged. The parent chooses
++ * whether mapping failure is fatal. A receipt is not a device or firmware lease.
++ * free_owned accepts only the current receipt; zero/stale receipts do nothing
++ * and return -EINVAL/-ESTALE. Callers must not share receipt storage concurrently.
++ */
++int nss_ppe_init_checked(u64 *owner);
++int nss_ppe_free_owned(u64 owner);
+ 
+ /**
+  * nss_ppe_message_types
+@@ -394,7 +408,8 @@
+  */
+ static inline void nss_ppe_reg_read(u32 reg, u32 *val)
+ {
+-	*val = readl((ppe_pvt.ppe_base + reg));
++	lockdep_assert_held(&nss_ppe_stats_lock);
++	*val = ppe_pvt.ppe_base ? readl(ppe_pvt.ppe_base + reg) : 0;
+ }
+ 
+ /*
+@@ -402,7 +417,10 @@
+  */
+ static inline void nss_ppe_reg_write(u32 reg, u32 val)
+ {
+-	writel(val, (ppe_pvt.ppe_base + reg));
++	lockdep_assert_held(&nss_ppe_stats_lock);
++	if (ppe_pvt.ppe_base) {
++		writel(val, ppe_pvt.ppe_base + reg);
++	}
+ }
+ 
+ /*
+--- a/nss_ppe_stats.c
++++ b/nss_ppe_stats.c
+@@ -864,7 +864,7 @@
+  * nss_ppe_stats_dentry_create()
+  *	Create PPE statistics debug entry.
+  */
+-void nss_ppe_stats_dentry_create(void)
++static void nss_ppe_stats_dentry_create_locked(void)
+ {
+ 	int i;
+ 	struct dentry *ppe_dentry = NULL;
+@@ -873,64 +873,64 @@
+ 	struct dentry *ppe_cpu_d = NULL;
+ 	char file_name[10];
+ 
+-	ppe_dentry = debugfs_create_dir("ppe", nss_top_main.stats_dentry);
++	ppe_dentry = nss_debugfs_create_dir_locked("ppe", nss_top_main.stats_dentry);
+ 	if (!ppe_dentry) {
+ 		nss_warning("Failed to create qca-nss-drv/stats/ppe directory");
+ 		return;
+ 	}
+ 
+-	if (!debugfs_create_file("connection", 0400, ppe_dentry, &nss_top_main, &nss_ppe_conn_stats_ops)) {
++	if (!nss_debugfs_create_file_locked("connection", 0400, ppe_dentry, &nss_top_main, &nss_ppe_conn_stats_ops)) {
+ 		nss_warning("Failed to create qca-nss-drv/stats/ppe/connection file");
+-		debugfs_remove_recursive(ppe_dentry);
++		nss_debugfs_remove_locked(ppe_dentry);
+ 		return;
+ 	}
+ 
+-	if (!debugfs_create_file("sc_stats", 0400, ppe_dentry, &nss_top_main, &nss_ppe_sc_stats_ops)) {
++	if (!nss_debugfs_create_file_locked("sc_stats", 0400, ppe_dentry, &nss_top_main, &nss_ppe_sc_stats_ops)) {
+ 		nss_warning("Failed to create qca-nss-drv/stats/ppe/sc_stats file");
+-		debugfs_remove_recursive(ppe_dentry);
++		nss_debugfs_remove_locked(ppe_dentry);
+ 		return;
+ 	}
+ 
+-	if (!debugfs_create_file("l3", 0400, ppe_dentry, &nss_top_main, &nss_ppe_l3_stats_ops)) {
++	if (!nss_debugfs_create_file_locked("l3", 0400, ppe_dentry, &nss_top_main, &nss_ppe_l3_stats_ops)) {
+ 		nss_warning("Failed to create qca-nss-drv/stats/ppe/l3 file");
+-		debugfs_remove_recursive(ppe_dentry);
++		nss_debugfs_remove_locked(ppe_dentry);
+ 		return;
+ 	}
+ 
+-	if (!debugfs_create_file("ppe_code", 0400, ppe_dentry, &nss_top_main, &nss_ppe_code_stats_ops)) {
++	if (!nss_debugfs_create_file_locked("ppe_code", 0400, ppe_dentry, &nss_top_main, &nss_ppe_code_stats_ops)) {
+ 		nss_warning("Failed to create qca-nss-drv/stats/ppe/ppe_code file");
+-		debugfs_remove_recursive(ppe_dentry);
++		nss_debugfs_remove_locked(ppe_dentry);
+ 		return;
+ 	}
+ 
+ 	/*
+ 	 * ppe exception and drop code stats
+ 	 */
+-	ppe_code_d = debugfs_create_dir("code", ppe_dentry);
++	ppe_code_d = nss_debugfs_create_dir_locked("code", ppe_dentry);
+ 	if (!ppe_code_d) {
+ 		nss_warning("Failed to create qca-nss-drv/stats/ppe/code directory");
+ 		return;
+ 	}
+ 
+-	ppe_cpu_d = debugfs_create_dir("cpu", ppe_code_d);
++	ppe_cpu_d = nss_debugfs_create_dir_locked("cpu", ppe_code_d);
+ 	if (!ppe_cpu_d) {
+ 		nss_warning("Failed to create qca-nss-drv/stats/ppe/code/cpu directory");
+ 		return;
+ 	}
+ 
+-	if (!debugfs_create_file("exception", 0400, ppe_cpu_d, &nss_top_main, &nss_ppe_exception_cc_stats_ops)) {
++	if (!nss_debugfs_create_file_locked("exception", 0400, ppe_cpu_d, &nss_top_main, &nss_ppe_exception_cc_stats_ops)) {
+ 		nss_warning("Failed to create qca-nss-drv/stats/ppe/code/exception file");
+-		debugfs_remove_recursive(ppe_cpu_d);
++		nss_debugfs_remove_locked(ppe_cpu_d);
+ 		return;
+ 	}
+ 
+-	if (!debugfs_create_file("non-exception", 0400, ppe_cpu_d, &nss_top_main, &nss_ppe_nonexception_cc_stats_ops)) {
++	if (!nss_debugfs_create_file_locked("non-exception", 0400, ppe_cpu_d, &nss_top_main, &nss_ppe_nonexception_cc_stats_ops)) {
+ 		nss_warning("Failed to create qca-nss-drv/stats/ppe/code/non-exception file");
+-		debugfs_remove_recursive(ppe_cpu_d);
++		nss_debugfs_remove_locked(ppe_cpu_d);
+ 		return;
+ 	}
+ 
+-	ppe_drop_d = debugfs_create_dir("drop", ppe_code_d);
++	ppe_drop_d = nss_debugfs_create_dir_locked("drop", ppe_code_d);
+ 	if (!ppe_drop_d) {
+ 		nss_warning("Failed to create qca-nss-drv/stats/ppe/code/drop directory");
+ 		return;
+@@ -942,15 +942,23 @@
+ 			snprintf(file_name, sizeof(file_name), "%d", i);
+ 		}
+ 
+-		if (!debugfs_create_file((i == 0) ? "cpu" : file_name, 0400, ppe_drop_d,
++		if (!nss_debugfs_create_file_locked((i == 0) ? "cpu" : file_name, 0400, ppe_drop_d,
+ 			(void *)(nss_ptr_t)i, &nss_ppe_port_dc_stats_ops)) {
+ 			nss_warning("Failed to create qca-nss-drv/stats/ppe/code/drop/%d file", i);
+-			debugfs_remove_recursive(ppe_drop_d);
++			nss_debugfs_remove_locked(ppe_drop_d);
+ 			return;
+ 		}
+ 	}
+ }
+ 
++void nss_ppe_stats_dentry_create(void)
++{
++	if (!nss_debugfs_begin(NSS_DEBUGFS_STATS))
++		return;
++	nss_ppe_stats_dentry_create_locked();
++	nss_debugfs_end();
++}
++
+ /*
+  * nss_ppe_stats_notify()
+  *	Sends notifications to all the registered modules.
+--- a/nss_ppe_strings.c
++++ b/nss_ppe_strings.c
+@@ -479,7 +479,7 @@
+  * nss_ppe_strings_dentry_create()
+  *	Create ppe statistics strings debug entry.
+  */
+-void nss_ppe_strings_dentry_create(void)
++static void nss_ppe_strings_dentry_create_locked(void)
+ {
+ 	struct dentry *ppe_d = NULL;
+ 
+@@ -488,45 +488,53 @@
+ 		return;
+ 	}
+ 
+-	ppe_d = debugfs_create_dir("ppe", nss_top_main.strings_dentry);
++	ppe_d = nss_debugfs_create_dir_locked("ppe", nss_top_main.strings_dentry);
+ 	if (!ppe_d) {
+ 		nss_warning("Failed to create qca-nss-drv/strings/ppe directory");
+ 		return;
+ 	}
+ 
+-	if (!debugfs_create_file("stats_str_conn", 0400, ppe_d, &nss_top_main, &nss_ppe_stats_str_conn_strings_ops)) {
++	if (!nss_debugfs_create_file_locked("stats_str_conn", 0400, ppe_d, &nss_top_main, &nss_ppe_stats_str_conn_strings_ops)) {
+ 		nss_warning("Failed to create qca-nss-drv/strings/ppe/stats_str_conn file");
+-		debugfs_remove_recursive(ppe_d);
++		nss_debugfs_remove_locked(ppe_d);
+ 		return;
+ 	}
+ 
+-	if (!debugfs_create_file("stats_str_sc", 0400, ppe_d, &nss_top_main, &nss_ppe_stats_str_sc_strings_ops)) {
++	if (!nss_debugfs_create_file_locked("stats_str_sc", 0400, ppe_d, &nss_top_main, &nss_ppe_stats_str_sc_strings_ops)) {
+ 		nss_warning("Failed to create qca-nss-drv/strings/ppe/stats_str_sc file");
+-		debugfs_remove_recursive(ppe_d);
++		nss_debugfs_remove_locked(ppe_d);
+ 		return;
+ 	}
+ 
+-	if (!debugfs_create_file("stats_str_l3", 0400, ppe_d, &nss_top_main, &nss_ppe_stats_str_l3_strings_ops)) {
++	if (!nss_debugfs_create_file_locked("stats_str_l3", 0400, ppe_d, &nss_top_main, &nss_ppe_stats_str_l3_strings_ops)) {
+ 		nss_warning("Failed to create qca-nss-drv/strings/ppe/stats_str_l3 file");
+-		debugfs_remove_recursive(ppe_d);
++		nss_debugfs_remove_locked(ppe_d);
+ 		return;
+ 	}
+ 
+-	if (!debugfs_create_file("stats_str_code", 0400, ppe_d, &nss_top_main, &nss_ppe_stats_str_code_strings_ops)) {
++	if (!nss_debugfs_create_file_locked("stats_str_code", 0400, ppe_d, &nss_top_main, &nss_ppe_stats_str_code_strings_ops)) {
+ 		nss_warning("Failed to create qca-nss-drv/strings/ppe/stats_str_code file");
+-		debugfs_remove_recursive(ppe_d);
++		nss_debugfs_remove_locked(ppe_d);
+ 		return;
+ 	}
+ 
+-	if (!debugfs_create_file("stats_str_dc", 0400, ppe_d, &nss_top_main, &nss_ppe_stats_str_dc_strings_ops)) {
++	if (!nss_debugfs_create_file_locked("stats_str_dc", 0400, ppe_d, &nss_top_main, &nss_ppe_stats_str_dc_strings_ops)) {
+ 		nss_warning("Failed to create qca-nss-drv/strings/ppe/stats_str_dc file");
+-		debugfs_remove_recursive(ppe_d);
++		nss_debugfs_remove_locked(ppe_d);
+ 		return;
+ 	}
+ 
+-	if (!debugfs_create_file("stats_str_cc", 0400, ppe_d, &nss_top_main, &nss_ppe_stats_str_cc_strings_ops)) {
++	if (!nss_debugfs_create_file_locked("stats_str_cc", 0400, ppe_d, &nss_top_main, &nss_ppe_stats_str_cc_strings_ops)) {
+ 		nss_warning("Failed to create qca-nss-drv/strings/ppe/stats_str_cc file");
+-		debugfs_remove_recursive(ppe_d);
++		nss_debugfs_remove_locked(ppe_d);
+ 		return;
+ 	}
+ }
++
++void nss_ppe_strings_dentry_create(void)
++{
++	if (!nss_debugfs_begin(NSS_DEBUGFS_STRINGS))
++		return;
++	nss_ppe_strings_dentry_create_locked();
++	nss_debugfs_end();
++}
+--- a/nss_ppe_vp.c
++++ b/nss_ppe_vp.c
+@@ -835,7 +835,6 @@
+ 	nss_ppe_vp_dentry = nss_ppe_vp_stats_dentry_create();
+ 	if (nss_ppe_vp_dentry == NULL) {
+ 		nss_warning("%px: Not able to create debugfs entry", nss_ctx);
+-		return;
+ 	}
+ 
+ 	nss_core_register_handler(nss_ctx, NSS_PPE_VP_INTERFACE, nss_ppe_vp_handler, NULL);
+@@ -853,7 +852,7 @@
+ {
+ 	struct nss_ctx_instance *nss_ctx = nss_ppe_vp_get_context();
+ 
+-	debugfs_remove_recursive(nss_ppe_vp_dentry);
++	nss_debugfs_remove(&nss_ppe_vp_dentry);
+ 	nss_ppe_vp_procfs_unregister();
+ 	nss_core_unregister_handler(nss_ctx, NSS_PPE_VP_INTERFACE);
+ }
+--- a/nss_ppe_vp_stats.c
++++ b/nss_ppe_vp_stats.c
+@@ -240,9 +240,9 @@
+  * nss_ppe_vp_stats_dentry_create()
+  *	Create PPE statistics debug entry.
+  */
+-struct dentry *nss_ppe_vp_stats_dentry_create(void)
++static struct dentry *nss_ppe_vp_stats_dentry_create_locked(void)
+ {
+-	struct dentry *ppe_vp_d = debugfs_create_file("ppe_vp", 0400, nss_top_main.stats_dentry,
++	struct dentry *ppe_vp_d = nss_debugfs_create_file_locked("ppe_vp", 0400, nss_top_main.stats_dentry,
+ 					&nss_top_main, &nss_ppe_vp_stats_ops);
+ 	if (unlikely(ppe_vp_d == NULL)) {
+ 		nss_warning("Failed to create qca-nss-drv/stats/ppe_vp file");
+@@ -250,4 +250,14 @@
+ 	}
+ 
+ 	return ppe_vp_d;
++}
++
++struct dentry *nss_ppe_vp_stats_dentry_create(void)
++{
++	struct dentry *dentry;
++
++	if (!nss_debugfs_begin(NSS_DEBUGFS_STATS))
++		return NULL;
++	dentry = nss_ppe_vp_stats_dentry_create_locked();
++	return nss_debugfs_end() ? dentry : NULL;
+ }
+--- a/nss_pppoe.c
++++ b/nss_pppoe.c
+@@ -20,6 +20,10 @@
+  */
+ 
+ #include "nss_tx_rx_common.h"
++#include <linux/completion.h>
++#include <linux/mutex.h>
++#include <linux/semaphore.h>
++#include "nss_sysctl.h"
+ #include "nss_pppoe_stats.h"
+ #include "nss_pppoe_log.h"
+ #include "nss_pppoe_strings.h"
+@@ -37,8 +41,19 @@
+ 	int response;
+ 	void *cb;
+ 	void *app_data;
+-} pppoe_pvt;
++} pppoe_pvt = {
++	.sem = __SEMAPHORE_INITIALIZER(pppoe_pvt.sem, 1),
++	.complete = COMPLETION_INITIALIZER(pppoe_pvt.complete),
++};
+ 
++/* Reject cold contexts before helpers that assert their magic. */
++static bool nss_pppoe_ctx_ready(struct nss_ctx_instance *nss_ctx)
++{
++	return nss_ctx &&
++		(READ_ONCE(nss_ctx->state) == NSS_CORE_STATE_INITIALIZED) &&
++		(READ_ONCE(nss_ctx->magic) == NSS_CTX_MAGIC);
++}
++
+ /*
+  * nss_pppoe_br_help()
+  *	Usage information for pppoe bride accel mode
+@@ -68,8 +83,13 @@
+ static nss_tx_status_t nss_pppoe_tx_msg(struct nss_ctx_instance *nss_ctx, struct nss_pppoe_msg *msg)
+ {
+ 	struct nss_cmn_msg *ncm = &msg->cm;
++	struct nss_ctx_instance *lookup_ctx = nss_pppoe_get_context();
+ 	enum nss_dynamic_interface_type type;
+ 
++	if (!nss_pppoe_ctx_ready(nss_ctx) || !nss_pppoe_ctx_ready(lookup_ctx)) {
++		return NSS_TX_FAILURE_NOT_READY;
++	}
++
+ 	/*
+ 	 * Trace Messages
+ 	 */
+@@ -78,7 +98,7 @@
+ 	/*
+ 	 * Sanity check the message
+ 	 */
+-	type = nss_dynamic_interface_get_type(nss_pppoe_get_context(), ncm->interface);
++	type = nss_dynamic_interface_get_type(lookup_ctx, ncm->interface);
+ 	if ((ncm->interface != NSS_PPPOE_INTERFACE) && (type != NSS_DYNAMIC_INTERFACE_TYPE_PPPOE)) {
+ 		nss_warning("%px: tx request for not PPPoE interface: %d type: %d\n",
+ 				nss_ctx, ncm->interface, type);
+@@ -268,8 +288,17 @@
+ {
+ 	nss_tx_status_t status;
+ 	int ret = 0;
++
++	if (!nss_pppoe_ctx_ready(nss_ctx)) {
++		return NSS_TX_FAILURE_NOT_READY;
++	}
+ 
+ 	down(&pppoe_pvt.sem);
++	if (!nss_pppoe_ctx_ready(nss_ctx)) {
++		up(&pppoe_pvt.sem);
++		return NSS_TX_FAILURE_NOT_READY;
++	}
++
+ 	pppoe_pvt.cb = (void *)msg->cm.cb;
+ 	pppoe_pvt.app_data = (void *)msg->cm.app_data;
+ 
+@@ -353,31 +382,57 @@
+ };
+ 
+ static struct ctl_table_header *nss_pppoe_header;
++/* Readers must not take this lock: unregister waits for active handlers. */
++static DEFINE_MUTEX(nss_pppoe_sysctl_lock);
+ 
+ /*
+- * nss_pppoe_register_sysctl()
++ * nss_pppoe_register_sysctl_checked()
+  *	Register sysctl specific to pppoe
+  */
+-void nss_pppoe_register_sysctl(void)
++int nss_pppoe_register_sysctl_checked(void)
+ {
++	int ret = 0;
++
++	mutex_lock(&nss_pppoe_sysctl_lock);
++	if (nss_pppoe_header) {
++		mutex_unlock(&nss_pppoe_sysctl_lock);
++		return -EBUSY;
++	}
++
+ 	/*
+ 	 * Register sysctl table.
+ 	 */
+ 	nss_pppoe_header = register_sysctl("dev/nss/pppoe", nss_pppoe_table);
++	if (!nss_pppoe_header) {
++		ret = -ENOMEM;
++	}
++	mutex_unlock(&nss_pppoe_sysctl_lock);
++	return ret;
+ }
+ 
++void nss_pppoe_register_sysctl(void)
++{
++	(void)nss_pppoe_register_sysctl_checked();
++}
++
+ /*
+  * nss_pppoe_unregister_sysctl()
+  *	Unregister sysctl specific to pppoe
+  */
+ void nss_pppoe_unregister_sysctl(void)
+ {
++	struct ctl_table_header *header;
++
+ 	/*
+ 	 * Unregister sysctl table.
+ 	 */
+-	if (nss_pppoe_header) {
+-		unregister_sysctl_table(nss_pppoe_header);
++	mutex_lock(&nss_pppoe_sysctl_lock);
++	header = nss_pppoe_header;
++	nss_pppoe_header = NULL;
++	if (header) {
++		unregister_sysctl_table(header);
+ 	}
++	mutex_unlock(&nss_pppoe_sysctl_lock);
+ }
+ 
+ /*
+@@ -388,9 +443,6 @@
+ 	nss_info("nss_pppoe_register_handler\n");
+ 	nss_core_register_handler(nss_pppoe_get_context(), NSS_PPPOE_INTERFACE, nss_pppoe_handler, NULL);
+ 
+-	sema_init(&pppoe_pvt.sem, 1);
+-	init_completion(&pppoe_pvt.complete);
+-
+ 	nss_pppoe_stats_dentry_create();
+ 	nss_pppoe_strings_dentry_create();
+ }
+--- a/nss_pppoe_strings.c
++++ b/nss_pppoe_strings.c
+@@ -89,7 +89,7 @@
+  * nss_pppoe_strings_dentry_create()
+  *	Create PPPoE statistics strings debug entry.
+  */
+-void nss_pppoe_strings_dentry_create(void)
++static void nss_pppoe_strings_dentry_create_locked(void)
+ {
+ 	struct dentry *pppoe_d = NULL;
+ 	struct dentry *pppoe_session_stats_d = NULL;
+@@ -100,23 +100,31 @@
+ 		return;
+ 	}
+ 
+-	pppoe_d = debugfs_create_dir("pppoe", nss_top_main.strings_dentry);
++	pppoe_d = nss_debugfs_create_dir_locked("pppoe", nss_top_main.strings_dentry);
+ 	if (!pppoe_d) {
+ 		nss_warning("Failed to create qca-nss-drv/strings/pppoe directory");
+ 		return;
+ 	}
+ 
+-	pppoe_session_stats_d = debugfs_create_file("session_stats_str", 0400, pppoe_d, &nss_top_main, &nss_pppoe_session_stats_strings_ops);
++	pppoe_session_stats_d = nss_debugfs_create_file_locked("session_stats_str", 0400, pppoe_d, &nss_top_main, &nss_pppoe_session_stats_strings_ops);
+ 	if (!pppoe_session_stats_d) {
+ 		nss_warning("Failed to create qca-nss-drv/stats/pppoe/session_stats_str file");
+-		debugfs_remove_recursive(pppoe_d);
++		nss_debugfs_remove_locked(pppoe_d);
+ 		return;
+ 	}
+ 
+-	pppoe_base_stats_d = debugfs_create_file("base_stats_str", 0400, pppoe_d, &nss_top_main, &nss_pppoe_base_stats_strings_ops);
++	pppoe_base_stats_d = nss_debugfs_create_file_locked("base_stats_str", 0400, pppoe_d, &nss_top_main, &nss_pppoe_base_stats_strings_ops);
+ 	if (!pppoe_base_stats_d) {
+ 		nss_warning("Failed to create qca-nss-drv/stats/pppoe/base_stats_str file");
+-		debugfs_remove_recursive(pppoe_d);
++		nss_debugfs_remove_locked(pppoe_d);
+ 		return;
+ 	}
+ }
++
++void nss_pppoe_strings_dentry_create(void)
++{
++	if (!nss_debugfs_begin(NSS_DEBUGFS_STRINGS))
++		return;
++	nss_pppoe_strings_dentry_create_locked();
++	nss_debugfs_end();
++}
+--- a/nss_project.c
++++ b/nss_project.c
+@@ -22,6 +22,8 @@
+  *	NSS project APIs.
+  */
+ #include "nss_tx_rx_common.h"
++#include <linux/mutex.h>
++#include "nss_sysctl.h"
+ 
+ static int nss_project_wt_stats_enable;
+ static uint8_t nss_project_pri_mq_map[NSS_PROJECT_PRI_MQ_MAP_MAX_SIZE] = {0, 1, 2, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3};
+@@ -241,6 +243,13 @@
+ 	int ret;
+ 	int i;
+ 
++	if (write) {
++		for (i = 0; i < nss_top_main.num_nss; i++) {
++			if (!nss_sysctl_ctx_ready(&nss_top_main.nss[i]))
++				return -ENODEV;
++		}
++	}
++
+ 	ret = proc_dointvec(ctl, write, buffer, lenp, ppos);
+ 
+ 	/*
+@@ -365,29 +374,55 @@
+ #endif
+ 
+ static struct ctl_table_header *nss_project_header;
++/* Readers must not take this lock: unregister waits for active handlers. */
++static DEFINE_MUTEX(nss_project_sysctl_lock);
+ 
+ /*
+- * nss_project_register_sysctl()
++ * nss_project_register_sysctl_checked()
+  *	Registers any sysctl handlers for the project.
+  */
+-void nss_project_register_sysctl(void)
++int nss_project_register_sysctl_checked(void)
+ {
++	int ret = 0;
++
++	mutex_lock(&nss_project_sysctl_lock);
++	if (nss_project_header) {
++		mutex_unlock(&nss_project_sysctl_lock);
++		return -EBUSY;
++	}
++
+ #if (LINUX_VERSION_CODE < KERNEL_VERSION(6, 6, 0))
+ 	nss_project_header = register_sysctl_table(nss_project_root);
+ #else
+ 	nss_project_header = register_sysctl("dev/nss/project", nss_project_table);
+ #endif
++	if (!nss_project_header) {
++		ret = -ENOMEM;
++	}
++	mutex_unlock(&nss_project_sysctl_lock);
++	return ret;
+ }
+ 
++void nss_project_register_sysctl(void)
++{
++	(void)nss_project_register_sysctl_checked();
++}
++
+ /*
+  * nss_project_unregister_sysctl()
+  *	De-registers any sysctl handlers for the project.
+  */
+ void nss_project_unregister_sysctl(void)
+ {
+-	if (nss_project_header) {
+-		unregister_sysctl_table(nss_project_header);
++	struct ctl_table_header *header;
++
++	mutex_lock(&nss_project_sysctl_lock);
++	header = nss_project_header;
++	nss_project_header = NULL;
++	if (header) {
++		unregister_sysctl_table(header);
+ 	}
++	mutex_unlock(&nss_project_sysctl_lock);
+ }
+ 
+ /*
+--- a/nss_rps.c
++++ b/nss_rps.c
+@@ -23,6 +23,8 @@
+  */
+ 
+ #include "nss_tx_rx_common.h"
++#include <linux/mutex.h>
++#include "nss_sysctl.h"
+ 
+ #define NSS_RPS_MAX_CORE_HASH_BITMAP  ((1 << (NSS_HOST_CORES)) - 1)
+ 			/**< Maximum value that when all cores are available. */
+@@ -410,6 +412,14 @@
+ 	struct nss_top_instance *nss_top = &nss_top_main;
+ 	struct nss_ctx_instance *nss_ctx;
+ 	int ret, ret_rps, current_state, i;
++
++	if (write) {
++		for (i = 0; i < nss_top_main.num_nss; i++) {
++			if (!nss_sysctl_ctx_ready(&nss_top->nss[i]))
++				return -ENODEV;
++		}
++	}
++
+ 	current_state = nss_rps_config;
+ 	ret = proc_dointvec(ctl, write, buffer, lenp, ppos);
+ 
+@@ -461,6 +471,11 @@
+ 	struct nss_top_instance *nss_top = &nss_top_main;
+ 	struct nss_ctx_instance *nss_ctx __attribute__((unused)) = &nss_top->nss[0];
+ 	int ret, current_state;
++
++#if defined(NSS_DRV_IPV4_ENABLE) && defined(NSS_DRV_IPV6_ENABLE)
++	if (write && !nss_sysctl_ctx_ready(nss_ctx))
++		return -ENODEV;
++#endif
+ 
+ 	current_state = nss_rps_hash_bitmap;
+ 	ret = proc_dointvec(ctl, write, buffer, lenp, ppos);
+@@ -530,6 +545,9 @@
+ 		return nss_rps_pri_map_print(buffer, lenp, ppos, nss_rps_pri_map);
+ 	}
+ 
++	if (!nss_sysctl_ctx_ready(nss_ctx))
++		return -ENODEV;
++
+ 	ret = nss_rps_pri_map_parse(buffer, lenp, &out);
+ 
+ 	if (ret != NSS_SUCCESS) {
+@@ -605,6 +623,8 @@
+ #endif
+ 
+ static struct ctl_table_header *nss_rps_header;
++/* Readers must not take this lock: unregister waits for active handlers. */
++static DEFINE_MUTEX(nss_rps_sysctl_lock);
+ 
+ /*
+  * nss_rps_pri_map_init_handler()
+@@ -624,11 +644,18 @@
+ }
+ 
+ /*
+- * nss_rps_register_sysctl()
++ * nss_rps_register_sysctl_checked()
+  */
+-void nss_rps_register_sysctl(void)
++int nss_rps_register_sysctl_checked(void)
+ {
++	int ret = 0;
+ 
++	mutex_lock(&nss_rps_sysctl_lock);
++	if (nss_rps_header) {
++		mutex_unlock(&nss_rps_sysctl_lock);
++		return -EBUSY;
++	}
++
+ 	/*
+ 	 * rps sema init.
+ 	 */
+@@ -645,18 +672,34 @@
+ #else
+ 	nss_rps_header = register_sysctl("dev/nss/rps", nss_rps_table);
+ #endif
++	if (!nss_rps_header) {
++		ret = -ENOMEM;
++	}
++	mutex_unlock(&nss_rps_sysctl_lock);
++	return ret;
+ }
+ 
++void nss_rps_register_sysctl(void)
++{
++	(void)nss_rps_register_sysctl_checked();
++}
++
+ /*
+  * nss_rps_unregister_sysctl()
+  *      Unregister sysctl specific to rps
+  */
+ void nss_rps_unregister_sysctl(void)
+ {
++	struct ctl_table_header *header;
++
+ 	/*
+ 	 * Unregister sysctl table.
+ 	 */
+-	if (nss_rps_header) {
+-		unregister_sysctl_table(nss_rps_header);
++	mutex_lock(&nss_rps_sysctl_lock);
++	header = nss_rps_header;
++	nss_rps_header = NULL;
++	if (header) {
++		unregister_sysctl_table(header);
+ 	}
++	mutex_unlock(&nss_rps_sysctl_lock);
+ }
+--- a/nss_stats.c
++++ b/nss_stats.c
+@@ -20,7 +20,181 @@
+ #include "nss_core.h"
+ #include "nss_strings.h"
+ #include "nss_drv_stats.h"
++#include <linux/mutex.h>
++#include <linux/module.h>
++#include "nss_log.h"
++#include "nss_sysctl.h"
+ 
++bool nss_sysctl_ctx_ready(struct nss_ctx_instance *nss_ctx)
++{
++	return nss_ctx &&
++		(READ_ONCE(nss_ctx->state) == NSS_CORE_STATE_INITIALIZED) &&
++		(READ_ONCE(nss_ctx->magic) == NSS_CTX_MAGIC);
++}
++
++enum nss_debugfs_state {
++	NSS_DEBUGFS_COLD,
++	NSS_DEBUGFS_READY,
++	NSS_DEBUGFS_CLOSED,
++};
++
++static DEFINE_MUTEX(nss_debugfs_lock);
++static DEFINE_MUTEX(nss_debugfs_stop_lock);
++static DECLARE_WAIT_QUEUE_HEAD(nss_debugfs_waitq);
++static enum nss_debugfs_state nss_debugfs_state;
++static bool nss_debugfs_removing;
++static struct dentry *nss_debugfs_rollback;
++static struct dentry *nss_debugfs_prefix;
++static int nss_debugfs_error;
++
++static struct dentry *nss_debugfs_result_locked(struct dentry *dentry, const char *name)
++{
++	lockdep_assert_held(&nss_debugfs_lock);
++	if (!IS_ERR_OR_NULL(dentry)) {
++		if (!nss_debugfs_prefix)
++			nss_debugfs_prefix = dentry;
++		return dentry;
++	}
++	nss_debugfs_remove_locked(nss_debugfs_prefix);
++	if (!nss_debugfs_error)
++		nss_debugfs_error = dentry ? PTR_ERR(dentry) : -ENOMEM;
++	nss_warning("debugfs %s unavailable: %ld\n", name,
++			dentry ? PTR_ERR(dentry) : (long)-ENOMEM);
++	return NULL;
++}
++
++bool nss_debugfs_begin(enum nss_debugfs_parent parent)
++{
++	struct dentry *dentry;
++
++	for (;;) {
++		mutex_lock(&nss_debugfs_lock);
++		if (nss_debugfs_state != NSS_DEBUGFS_READY)
++			break;
++		if (nss_debugfs_removing) {
++			mutex_unlock(&nss_debugfs_lock);
++			wait_event(nss_debugfs_waitq, !READ_ONCE(nss_debugfs_removing) ||
++					READ_ONCE(nss_debugfs_state) == NSS_DEBUGFS_CLOSED);
++			continue;
++		}
++		switch (parent) {
++		case NSS_DEBUGFS_TOP: dentry = nss_top_main.top_dentry; break;
++		case NSS_DEBUGFS_STATS: dentry = nss_top_main.stats_dentry; break;
++		case NSS_DEBUGFS_STRINGS: dentry = nss_top_main.strings_dentry; break;
++		case NSS_DEBUGFS_PROJECT: dentry = nss_top_main.project_dentry; break;
++		default: dentry = NULL; break;
++		}
++		if (!IS_ERR_OR_NULL(dentry))
++			return true;
++		break;
++	}
++	mutex_unlock(&nss_debugfs_lock);
++	return false;
++}
++
++/* Rollback must finish before another creator or root remover uses this tree. */
++bool nss_debugfs_end(void)
++{
++	struct dentry *rollback;
++
++	lockdep_assert_held(&nss_debugfs_lock);
++	rollback = nss_debugfs_rollback;
++	nss_debugfs_rollback = NULL;
++	nss_debugfs_prefix = NULL;
++	if (rollback)
++		WRITE_ONCE(nss_debugfs_removing, true);
++	mutex_unlock(&nss_debugfs_lock);
++	if (!rollback)
++		return true;
++	debugfs_remove_recursive(rollback);
++	mutex_lock(&nss_debugfs_lock);
++	WRITE_ONCE(nss_debugfs_removing, false);
++	mutex_unlock(&nss_debugfs_lock);
++	wake_up_all(&nss_debugfs_waitq);
++	return false;
++}
++
++static bool nss_debugfs_parent_locked(struct dentry *parent)
++{
++	struct dentry *dentry = parent;
++	bool within_prefix = !nss_debugfs_prefix;
++
++	lockdep_assert_held(&nss_debugfs_lock);
++	if (nss_debugfs_state != NSS_DEBUGFS_READY || IS_ERR_OR_NULL(parent) ||
++			IS_ERR_OR_NULL(nss_top_main.top_dentry) || !d_is_dir(parent))
++		return false;
++	for (;;) {
++		if (dentry == nss_debugfs_prefix)
++			within_prefix = true;
++		if (dentry == nss_top_main.top_dentry)
++			return within_prefix;
++		if (IS_ROOT(dentry))
++			return false;
++		dentry = dentry->d_parent;
++	}
++}
++
++struct dentry *nss_debugfs_create_dir_locked(const char *name, struct dentry *parent)
++{
++	if (!nss_debugfs_parent_locked(parent))
++		return nss_debugfs_result_locked(ERR_PTR(-EINVAL), name);
++	return nss_debugfs_result_locked(debugfs_create_dir(name, parent), name);
++}
++
++struct dentry *nss_debugfs_create_file_locked(const char *name, umode_t mode,
++		struct dentry *parent, void *data, const struct file_operations *ops)
++{
++	if (!nss_debugfs_parent_locked(parent))
++		return nss_debugfs_result_locked(ERR_PTR(-EINVAL), name);
++	return nss_debugfs_result_locked(debugfs_create_file(name, mode, parent, data, ops), name);
++}
++
++struct dentry *nss_debugfs_lookup_locked(const char *name, struct dentry *parent)
++{
++	struct dentry *dentry;
++
++	if (!nss_debugfs_parent_locked(parent))
++		return NULL;
++	dentry = debugfs_lookup(name, parent);
++	return IS_ERR(dentry) ? NULL : dentry;
++}
++
++void nss_debugfs_remove_locked(struct dentry *dentry)
++{
++	lockdep_assert_held(&nss_debugfs_lock);
++	if (IS_ERR_OR_NULL(dentry))
++		return;
++	if (nss_debugfs_prefix)
++		dentry = nss_debugfs_prefix;
++	/* Each transaction rolls back one owned subtree, never its children first. */
++	if (WARN_ON(nss_debugfs_rollback && nss_debugfs_rollback != dentry))
++		return;
++	nss_debugfs_rollback = dentry;
++}
++
++void nss_debugfs_remove(struct dentry **slot)
++{
++	struct dentry *dentry;
++
++	if (!nss_debugfs_begin(NSS_DEBUGFS_TOP)) {
++		WRITE_ONCE(*slot, NULL);
++		return;
++	}
++	dentry = *slot;
++	*slot = NULL;
++	nss_debugfs_remove_locked(dentry);
++	nss_debugfs_end();
++}
++
++int nss_debugfs_open_allowed(void)
++{
++#ifdef MODULE
++	if (READ_ONCE(THIS_MODULE->state) != MODULE_STATE_LIVE)
++		return -ENODEV;
++#endif
++	return READ_ONCE(nss_debugfs_state) == NSS_DEBUGFS_READY ? 0 : -ENODEV;
++}
++
+ /*
+  * Maximum banner length:
+  */
+@@ -117,13 +291,23 @@
+ #endif
+ 
+ static struct ctl_table_header *nss_stats_header;
++/* Readers must not take this lock: unregister waits for active handlers. */
++static DEFINE_MUTEX(nss_stats_sysctl_lock);
+ 
+ /*
+- * nss_stats_register_sysctl()
++ * nss_stats_register_sysctl_checked()
+  *	Register a sysctl table for stats.
+  */
+-void nss_stats_register_sysctl(void)
++int nss_stats_register_sysctl_checked(void)
+ {
++	int ret = 0;
++
++	mutex_lock(&nss_stats_sysctl_lock);
++	if (nss_stats_header) {
++		mutex_unlock(&nss_stats_sysctl_lock);
++		return -EBUSY;
++	}
++
+ 	/*
+ 	 * Register sysctl table.
+ 	 */
+@@ -132,8 +316,31 @@
+ #else
+ 	nss_stats_header = register_sysctl("dev/nss/stats", nss_stats_table);
+ #endif
++	if (!nss_stats_header) {
++		ret = -ENOMEM;
++	}
++	mutex_unlock(&nss_stats_sysctl_lock);
++	return ret;
+ }
+ 
++void nss_stats_register_sysctl(void)
++{
++	(void)nss_stats_register_sysctl_checked();
++}
++
++void nss_stats_unregister_sysctl(void)
++{
++	struct ctl_table_header *header;
++
++	mutex_lock(&nss_stats_sysctl_lock);
++	header = nss_stats_header;
++	nss_stats_header = NULL;
++	if (header) {
++		unregister_sysctl_table(header);
++	}
++	mutex_unlock(&nss_stats_sysctl_lock);
++}
++
+ /*
+  * nss_stats_open()
+  *	Opens stats file.
+@@ -141,7 +348,11 @@
+ int nss_stats_open(struct inode *inode, struct file *filp)
+ {
+ 	struct nss_stats_data *data = NULL;
++	int ret = nss_debugfs_open_allowed();
+ 
++	if (ret)
++		return ret;
++
+ 	data = kzalloc(sizeof(struct nss_stats_data), GFP_KERNEL);
+ 	if (!data) {
+ 		return -ENOMEM;
+@@ -186,13 +397,21 @@
+  */
+ void nss_stats_clean(void)
+ {
+-	/*
+-	 * Remove debugfs tree
+-	 */
+-	if (likely(nss_top_main.top_dentry != NULL)) {
+-		debugfs_remove_recursive(nss_top_main.top_dentry);
+-		nss_top_main.top_dentry = NULL;
+-	}
++	struct dentry *top;
++
++	mutex_lock(&nss_debugfs_stop_lock);
++	mutex_lock(&nss_debugfs_lock);
++	WRITE_ONCE(nss_debugfs_state, NSS_DEBUGFS_CLOSED);
++	top = nss_top_main.top_dentry;
++	nss_top_main.top_dentry = NULL;
++	nss_top_main.stats_dentry = NULL;
++	nss_top_main.project_dentry = NULL;
++	nss_top_main.strings_dentry = NULL;
++	mutex_unlock(&nss_debugfs_lock);
++	wake_up_all(&nss_debugfs_waitq);
++	wait_event(nss_debugfs_waitq, !READ_ONCE(nss_debugfs_removing));
++	debugfs_remove_recursive(top);
++	mutex_unlock(&nss_debugfs_stop_lock);
+ }
+ 
+ /*
+@@ -394,10 +613,16 @@
+  */
+ void nss_stats_create_dentry(char *name, const struct file_operations *ops)
+ {
+-	if (!debugfs_lookup(name, nss_top_main.stats_dentry))
+-	  if (!debugfs_create_file(name, 0400, nss_top_main.stats_dentry, &nss_top_main, ops)) {
+-	    nss_warning("Failed to create debug entry for subsystem %s\n", name);
+-	}
++	struct dentry *existing;
++
++	if (!nss_debugfs_begin(NSS_DEBUGFS_STATS))
++		return;
++	existing = nss_debugfs_lookup_locked(name, nss_top_main.stats_dentry);
++	if (existing)
++		dput(existing);
++	else
++		nss_debugfs_create_file_locked(name, 0400, nss_top_main.stats_dentry, &nss_top_main, ops);
++	nss_debugfs_end();
+ }
+ 
+ /*
+@@ -417,7 +642,7 @@
+  * nss_stats_init()
+  *	Enable NSS statistics.
+  */
+-void nss_stats_init(void)
++static void nss_stats_init_locked(void)
+ {
+ 	struct dentry *core_dentry = NULL;
+ 	struct dentry *wt_dentry = NULL;
+@@ -427,7 +652,7 @@
+ 	/*
+ 	 * NSS driver entry
+ 	 */
+-	nss_top_main.top_dentry = debugfs_create_dir("qca-nss-drv", NULL);
++	nss_top_main.top_dentry = nss_debugfs_result_locked(debugfs_create_dir("qca-nss-drv", NULL), "qca-nss-drv");
+ 	if (unlikely(nss_top_main.top_dentry == NULL)) {
+ 		nss_warning("Failed to create qca-nss-drv directory in debugfs");
+ 
+@@ -438,7 +663,7 @@
+ 		return;
+ 	}
+ 
+-	nss_top_main.stats_dentry = debugfs_create_dir("stats", nss_top_main.top_dentry);
++	nss_top_main.stats_dentry = nss_debugfs_create_dir_locked("stats", nss_top_main.top_dentry);
+ 	if (unlikely(nss_top_main.stats_dentry == NULL)) {
+ 		nss_warning("Failed to create qca-nss-drv directory in debugfs");
+ 
+@@ -456,7 +681,6 @@
+ 	/*
+ 	 * drv_stats
+ 	 */
+-	nss_drv_stats_dentry_create();
+ 
+ 	/*
+ 	 * gmac_stats
+@@ -465,7 +689,7 @@
+ 	/*
+ 	 * Per-project stats
+ 	 */
+-	nss_top_main.project_dentry = debugfs_create_dir("project",
++	nss_top_main.project_dentry = nss_debugfs_create_dir_locked("project",
+ 						nss_top_main.stats_dentry);
+ 	if (unlikely(nss_top_main.project_dentry == NULL)) {
+ 		nss_warning("Failed to create qca-nss-drv/stats/project directory in debugfs");
+@@ -475,14 +699,14 @@
+ 	for (i = 0; i < nss_top_main.num_nss; ++i) {
+ 		memset(file_name, 0, sizeof(file_name));
+ 		scnprintf(file_name, sizeof(file_name), "core%d", i);
+-		core_dentry = debugfs_create_dir(file_name,
++		core_dentry = nss_debugfs_create_dir_locked(file_name,
+ 						nss_top_main.project_dentry);
+ 		if (unlikely(core_dentry == NULL)) {
+ 			nss_warning("Failed to create qca-nss-drv/stats/project/core%d directory in debugfs", i);
+ 			return;
+ 		}
+ 
+-		wt_dentry = debugfs_create_file("worker_threads",
++		wt_dentry = nss_debugfs_create_file_locked("worker_threads",
+ 						0400,
+ 						core_dentry,
+ 						&(nss_top_main.nss[i]),
+@@ -493,5 +717,32 @@
+ 		}
+ 	}
+ 
++}
++
++int nss_stats_init_checked(void)
++{
++	mutex_lock(&nss_debugfs_lock);
++	if (nss_debugfs_state != NSS_DEBUGFS_COLD) {
++		int ret = nss_debugfs_state == NSS_DEBUGFS_CLOSED ? -ESHUTDOWN : -EBUSY;
++		mutex_unlock(&nss_debugfs_lock);
++		return ret;
++	}
++	WRITE_ONCE(nss_debugfs_state, NSS_DEBUGFS_READY);
++	nss_stats_init_locked();
++	if (nss_debugfs_error) {
++		nss_debugfs_remove_locked(nss_top_main.top_dentry);
++		nss_top_main.top_dentry = NULL;
++		nss_top_main.stats_dentry = NULL;
++		nss_top_main.project_dentry = NULL;
++	}
++	nss_debugfs_end();
++	nss_drv_stats_dentry_create();
++	nss_log_debugfs_init();
++	return 0;
++}
++
++void nss_stats_init(void)
++{
+ 	nss_log_init();
++	(void)nss_stats_init_checked();
+ }
+--- a/nss_stats.h
++++ b/nss_stats.h
+@@ -25,9 +25,11 @@
+ #ifndef __NSS_STATS_PRINT_H
+ #define __NSS_STATS_PRINT_H
+ #include <linux/ctype.h>
++#include <linux/module.h>
+ #include <nss_drv_stats.h>
+ #include <nss_def.h>
+ #include <nss_stats_public.h>
++#include "nss_debugfs.h"
+ 
+ /*
+  * Defines to be used by single instance/core packages.
+@@ -42,6 +44,7 @@
+ 
+ #define NSS_STATS_DECLARE_FILE_OPERATIONS(name) \
+ static struct file_operations nss_##name##_stats_ops = { \
++	.owner = THIS_MODULE, \
+ 	.open = nss_stats_open, \
+ 	.read = nss_##name##_stats_read, \
+ 	.write = nss_##name##_stats_write, \
+@@ -69,6 +72,8 @@
+ };
+ 
+ extern void nss_stats_register_sysctl(void);
++int nss_stats_register_sysctl_checked(void);
++void nss_stats_unregister_sysctl(void);
+ void nss_stats_init(void);
+ extern int nss_stats_release(struct inode *inode, struct file *filp);
+ extern int nss_stats_open(struct inode *inode, struct file *filp);
+--- a/nss_strings.c
++++ b/nss_strings.c
+@@ -78,9 +78,12 @@
+  */
+ void nss_strings_create_dentry(char *name, const struct file_operations *ops)
+ {
+-	if (!nss_top_main.strings_dentry || !debugfs_create_file(name, 0400, nss_top_main.strings_dentry, &nss_top_main, ops)) {
++	if (!nss_debugfs_begin(NSS_DEBUGFS_STRINGS))
++		return;
++	if (!nss_debugfs_create_file_locked(name, 0400, nss_top_main.strings_dentry, &nss_top_main, ops)) {
+ 		nss_warning("Failed to create debug entry for subsystem %s\n", name);
+ 	}
++	nss_debugfs_end();
+ }
+ 
+ /*
+@@ -89,7 +92,11 @@
+ int nss_strings_open(struct inode *inode, struct file *filp)
+ {
+ 	struct nss_strings_data *data = NULL;
++	int ret = nss_debugfs_open_allowed();
+ 
++	if (ret)
++		return ret;
++
+ 	data = kzalloc(sizeof(struct nss_strings_data), GFP_KERNEL);
+ 	if (!data) {
+ 		return -ENOMEM;
+@@ -135,14 +142,24 @@
+  */
+ void nss_strings_init(void)
+ {
+-	nss_top_main.strings_dentry = debugfs_create_dir("strings", nss_top_main.top_dentry);
++	if (!nss_debugfs_begin(NSS_DEBUGFS_TOP))
++		return;
++	if (nss_top_main.strings_dentry) {
++		nss_debugfs_end();
++		return;
++	}
++	nss_top_main.strings_dentry = nss_debugfs_create_dir_locked("strings", nss_top_main.top_dentry);
+ 	if (unlikely(nss_top_main.strings_dentry == NULL)) {
+ 		nss_warning("Failed to create strings directory in debugfs/qca-nss-drv");
++		nss_debugfs_end();
+ 		return;
+ 	}
+ 
+ 	/*
+ 	 * Common node statistics
+ 	 */
+-	nss_strings_create_dentry("common_node_stats", &nss_common_node_stats_strings_ops);
++	if (!nss_debugfs_create_file_locked("common_node_stats", 0400,
++			nss_top_main.strings_dentry, &nss_top_main, &nss_common_node_stats_strings_ops))
++		nss_top_main.strings_dentry = NULL;
++	nss_debugfs_end();
+ }
+--- a/nss_strings.h
++++ b/nss_strings.h
+@@ -27,6 +27,7 @@
+ 
+ #define NSS_STRINGS_DECLARE_FILE_OPERATIONS(name) \
+ static const struct file_operations nss_##name##_strings_ops = { \
++	.owner = THIS_MODULE, \
+ 	.open = nss_strings_open, \
+ 	.read = nss_##name##_strings_read, \
+ 	.llseek = generic_file_llseek, \
+--- /dev/null
++++ b/nss_sysctl.h
+@@ -0,0 +1,28 @@
++/* SPDX-License-Identifier: ISC */
++#ifndef __NSS_SYSCTL_H
++#define __NSS_SYSCTL_H
++
++#include <linux/types.h>
++
++struct nss_ctx_instance;
++
++/* Cold sysctl admission only, not a context reference or a teardown join. */
++bool nss_sysctl_ctx_ready(struct nss_ctx_instance *nss_ctx);
++
++/* Private module-root acquisitions; legacy public void entry points remain. */
++int nss_ipv4_register_sysctl_checked(void);
++int nss_ipv6_register_sysctl_checked(void);
++int nss_n2h_single_core_register_sysctl_checked(void);
++int nss_n2h_multi_core_register_sysctl_checked(void);
++int nss_rps_register_sysctl_checked(void);
++int nss_project_register_sysctl_checked(void);
++int nss_pppoe_register_sysctl_checked(void);
++int nss_c2c_tx_register_sysctl_checked(void);
++int nss_dma_register_sysctl_checked(void);
++int nss_stats_register_sysctl_checked(void);
++void nss_stats_unregister_sysctl(void);
++
++/* Process-only terminal unpublication; never frees core/FW/DMA resources. */
++void nss_root_controls_stop(void);
++
++#endif
+--- a/nss_udp_st_strings.c
++++ b/nss_udp_st_strings.c
+@@ -141,7 +141,7 @@
+  * nss_udp_st_strings_dentry_create()
+  *      Create udp_st statistics strings debug entry.
+  */
+-void nss_udp_st_strings_dentry_create(void)
++static void nss_udp_st_strings_dentry_create_locked(void)
+ {
+ 	struct dentry *dir_d;
+ 	struct dentry *file_d;
+@@ -151,36 +151,44 @@
+ 		return;
+ 	}
+ 
+-	dir_d = debugfs_create_dir("udp_st", nss_top_main.strings_dentry);
++	dir_d = nss_debugfs_create_dir_locked("udp_st", nss_top_main.strings_dentry);
+ 	if (!dir_d) {
+ 		nss_warning("Failed to create qca-nss-drv/strings/udp_st directory");
+ 		return;
+ 	}
+ 
+-	file_d = debugfs_create_file("error_stats_str", 0400, dir_d, &nss_top_main, &nss_udp_st_error_stats_strings_ops);
++	file_d = nss_debugfs_create_file_locked("error_stats_str", 0400, dir_d, &nss_top_main, &nss_udp_st_error_stats_strings_ops);
+ 	if (!file_d) {
+ 		nss_warning("Failed to create qca-nss-drv/stats/udp_st/error_stats_str file");
+ 		goto fail;
+ 	}
+ 
+-	file_d = debugfs_create_file("rx_time_stats_str", 0400, dir_d, &nss_top_main, &nss_udp_st_rx_time_stats_strings_ops);
++	file_d = nss_debugfs_create_file_locked("rx_time_stats_str", 0400, dir_d, &nss_top_main, &nss_udp_st_rx_time_stats_strings_ops);
+ 	if (!file_d) {
+ 		nss_warning("Failed to create qca-nss-drv/stats/udp_st/rx_time_stats_str file");
+ 		goto fail;
+ 	}
+ 
+-	file_d = debugfs_create_file("tx_time_stats_str", 0400, dir_d, &nss_top_main, &nss_udp_st_tx_time_stats_strings_ops);
++	file_d = nss_debugfs_create_file_locked("tx_time_stats_str", 0400, dir_d, &nss_top_main, &nss_udp_st_tx_time_stats_strings_ops);
+ 	if (!file_d) {
+ 		nss_warning("Failed to create qca-nss-drv/stats/udp_st/tx_time_stats_str file");
+ 		goto fail;
+ 	}
+ 
+-	file_d = debugfs_create_file("timestamp_stats_str", 0400, dir_d, &nss_top_main, &nss_udp_st_timestamp_stats_strings_ops);
++	file_d = nss_debugfs_create_file_locked("timestamp_stats_str", 0400, dir_d, &nss_top_main, &nss_udp_st_timestamp_stats_strings_ops);
+ 	if (!file_d) {
+ 		nss_warning("Failed to create qca-nss-drv/stats/udp_st/timestamp_stats_str file");
+ 		goto fail;
+ 	}
+ 	return;
+ fail:
+-	debugfs_remove_recursive(dir_d);
++	nss_debugfs_remove_locked(dir_d);
+ }
++
++void nss_udp_st_strings_dentry_create(void)
++{
++	if (!nss_debugfs_begin(NSS_DEBUGFS_STRINGS))
++		return;
++	nss_udp_st_strings_dentry_create_locked();
++	nss_debugfs_end();
++}
+--- a/nss_wifi_mesh_stats.c
++++ b/nss_wifi_mesh_stats.c
+@@ -635,7 +635,7 @@
+  * nss_wifi_mesh_stats_dentry_create()
+  *	Create Wi-Fi Mesh statistics debug entry
+  */
+-struct dentry *nss_wifi_mesh_stats_dentry_create(void)
++static struct dentry *nss_wifi_mesh_stats_dentry_create_locked(void)
+ {
+ 	struct dentry *stats_dentry_dir;
+ 	struct dentry *stats_file;
+@@ -648,46 +648,56 @@
+ 
+ 	snprintf(dir_name, sizeof(dir_name), "wifi_mesh");
+ 
+-	stats_dentry_dir = debugfs_create_dir(dir_name,  nss_top_main.stats_dentry);
++	stats_dentry_dir = nss_debugfs_create_dir_locked(dir_name,  nss_top_main.stats_dentry);
+ 	if (!stats_dentry_dir) {
+ 		nss_warning("Failed to create qca-nss-drv/stats/wifi_mesh directory\n");
+ 		return NULL;
+ 	}
+ 
+-	stats_file = debugfs_create_file("encap_stats", 0400, stats_dentry_dir, &nss_top_main, &nss_wifi_mesh_encap_stats_ops);
++	stats_file = nss_debugfs_create_file_locked("encap_stats", 0400, stats_dentry_dir, &nss_top_main, &nss_wifi_mesh_encap_stats_ops);
+ 	if (!stats_file) {
+ 		nss_warning("Failed to create qca-nss-drv/stats/wifi_mesh/encap_stats file\n");
+ 		goto fail;
+ 	}
+ 
+-	stats_file = debugfs_create_file("decap_stats", 0400, stats_dentry_dir, &nss_top_main, &nss_wifi_mesh_decap_stats_ops);
++	stats_file = nss_debugfs_create_file_locked("decap_stats", 0400, stats_dentry_dir, &nss_top_main, &nss_wifi_mesh_decap_stats_ops);
+ 	if (!stats_file) {
+ 		nss_warning("Failed to create qca-nss-drv/stats/wifi_mesh/decap_stats file\n");
+ 		goto fail;
+ 	}
+ 
+-	stats_file = debugfs_create_file("path_stats", 0400, stats_dentry_dir, &nss_top_main, &nss_wifi_mesh_path_stats_ops);
++	stats_file = nss_debugfs_create_file_locked("path_stats", 0400, stats_dentry_dir, &nss_top_main, &nss_wifi_mesh_path_stats_ops);
+ 	if (!stats_file) {
+ 		nss_warning("Failed to create qca-nss-drv/stats/wifi_mesh/path_stats file\n");
+ 		goto fail;
+ 	}
+ 
+-	stats_file = debugfs_create_file("proxy_path_stats", 0400, stats_dentry_dir, &nss_top_main, &nss_wifi_mesh_proxy_path_stats_ops);
++	stats_file = nss_debugfs_create_file_locked("proxy_path_stats", 0400, stats_dentry_dir, &nss_top_main, &nss_wifi_mesh_proxy_path_stats_ops);
+ 	if (!stats_file) {
+ 		nss_warning("Failed to create qca-nss-drv/stats/wifi_mesh/proxy_path_stats file\n");
+ 		goto fail;
+ 	}
+-	stats_file = debugfs_create_file("exception_stats", 0400, stats_dentry_dir, &nss_top_main, &nss_wifi_mesh_exception_stats_ops);
++	stats_file = nss_debugfs_create_file_locked("exception_stats", 0400, stats_dentry_dir, &nss_top_main, &nss_wifi_mesh_exception_stats_ops);
+ 	if (!stats_file) {
+ 		nss_warning("Failed to create qca-nss-drv/stats/wifi_mesh/exception_stats file\n");
+ 		goto fail;
+ 	}
+ 	return stats_dentry_dir;
+ fail:
+-	debugfs_remove_recursive(stats_dentry_dir);
++	nss_debugfs_remove_locked(stats_dentry_dir);
+ 	return NULL;
+ }
+ 
++struct dentry *nss_wifi_mesh_stats_dentry_create(void)
++{
++	struct dentry *dentry;
++
++	if (!nss_debugfs_begin(NSS_DEBUGFS_STATS))
++		return NULL;
++	dentry = nss_wifi_mesh_stats_dentry_create_locked();
++	return nss_debugfs_end() ? dentry : NULL;
++}
++
+ /**
+  * nss_wifi_mesh_stats_register_notifier()
+  *	Registers statistics notifier.
+--- a/nss_wifi_mesh_strings.c
++++ b/nss_wifi_mesh_strings.c
+@@ -231,7 +231,7 @@
+  * nss_wifi_mesh_strings_dentry_create()
+  *	Create Wi-Fi mesh statistics strings debug entry.
+  */
+-struct dentry *nss_wifi_mesh_strings_dentry_create(void)
++static struct dentry *nss_wifi_mesh_strings_dentry_create_locked(void)
+ {
+ 	struct dentry *str_dentry_dir;
+ 	struct dentry *str_file;
+@@ -241,37 +241,37 @@
+ 		return NULL;
+ 	}
+ 
+-	str_dentry_dir = debugfs_create_dir("wifi_mesh", nss_top_main.strings_dentry);
++	str_dentry_dir = nss_debugfs_create_dir_locked("wifi_mesh", nss_top_main.strings_dentry);
+ 	if (!str_dentry_dir) {
+ 		nss_warning("Failed to create qca-nss-drv/string/wifi_mesh directory\n");
+ 		return NULL;
+ 	}
+ 
+-	str_file = debugfs_create_file("encap_stats", 0400, str_dentry_dir, &nss_top_main, &nss_wifi_mesh_encap_stats_strings_ops);
++	str_file = nss_debugfs_create_file_locked("encap_stats", 0400, str_dentry_dir, &nss_top_main, &nss_wifi_mesh_encap_stats_strings_ops);
+ 	if (!str_file) {
+ 		nss_warning("Failed to create qca-nss-drv/string/wifi_mesh/encap_stats file\n");
+ 		goto fail;
+ 	}
+ 
+-	str_file = debugfs_create_file("decap_stats", 0400, str_dentry_dir, &nss_top_main, &nss_wifi_mesh_decap_stats_strings_ops);
++	str_file = nss_debugfs_create_file_locked("decap_stats", 0400, str_dentry_dir, &nss_top_main, &nss_wifi_mesh_decap_stats_strings_ops);
+ 	if (!str_file) {
+ 		nss_warning("Failed to create qca-nss-drv/string/wifi_mesh/decap_stats file\n");
+ 		goto fail;
+ 	}
+ 
+-	str_file = debugfs_create_file("path_stats", 0400, str_dentry_dir, &nss_top_main, &nss_wifi_mesh_path_stats_strings_ops);
++	str_file = nss_debugfs_create_file_locked("path_stats", 0400, str_dentry_dir, &nss_top_main, &nss_wifi_mesh_path_stats_strings_ops);
+ 	if (!str_file) {
+ 		nss_warning("Failed to create qca-nss-drv/string/wifi_mesh/path_stats file\n");
+ 		goto fail;
+ 	}
+ 
+-	str_file = debugfs_create_file("proxy_path_stats", 0400, str_dentry_dir, &nss_top_main, &nss_wifi_mesh_proxy_path_stats_strings_ops);
++	str_file = nss_debugfs_create_file_locked("proxy_path_stats", 0400, str_dentry_dir, &nss_top_main, &nss_wifi_mesh_proxy_path_stats_strings_ops);
+ 	if (!str_file) {
+ 		nss_warning("Failed to create qca-nss-drv/string/wifi_mesh/proxy_path_stats file\n");
+ 		goto fail;
+ 	}
+ 
+-	str_file = debugfs_create_file("exception_stats", 0400, str_dentry_dir, &nss_top_main, &nss_wifi_mesh_exception_stats_strings_ops);
++	str_file = nss_debugfs_create_file_locked("exception_stats", 0400, str_dentry_dir, &nss_top_main, &nss_wifi_mesh_exception_stats_strings_ops);
+ 	if (!str_file) {
+ 		nss_warning("Failed to create qca-nss-drv/string/wifi_mesh/exception_stats file\n");
+ 		goto fail;
+@@ -279,6 +279,16 @@
+ 
+ 	return str_dentry_dir;
+ fail:
+-	debugfs_remove_recursive(str_dentry_dir);
++	nss_debugfs_remove_locked(str_dentry_dir);
+ 	return NULL;
+ }
++
++struct dentry *nss_wifi_mesh_strings_dentry_create(void)
++{
++	struct dentry *dentry;
++
++	if (!nss_debugfs_begin(NSS_DEBUGFS_STRINGS))
++		return NULL;
++	dentry = nss_wifi_mesh_strings_dentry_create_locked();
++	return nss_debugfs_end() ? dentry : NULL;
++}
+--- a/nss_wifili_strings.c
++++ b/nss_wifili_strings.c
+@@ -279,7 +279,7 @@
+  * nss_wifili_strings_dentry_create()
+  *	Create wifili statistics strings debug entry.
+  */
+-void nss_wifili_strings_dentry_create(void)
++static void nss_wifili_strings_dentry_create_locked(void)
+ {
+ 	struct dentry *wifili_d = NULL;
+ 	struct dentry *wifili_txrx_d = NULL;
+@@ -297,72 +297,80 @@
+ 		return;
+ 	}
+ 
+-	wifili_d = debugfs_create_dir("wifili", nss_top_main.strings_dentry);
++	wifili_d = nss_debugfs_create_dir_locked("wifili", nss_top_main.strings_dentry);
+ 	if (!wifili_d) {
+ 		nss_warning("Failed to create qca-nss-drv/strings/wifili directory");
+ 		return;
+ 	}
+ 
+-	wifili_txrx_d = debugfs_create_file("txrx_str", 0400, wifili_d, &nss_top_main, &nss_wifili_txrx_strings_ops);
++	wifili_txrx_d = nss_debugfs_create_file_locked("txrx_str", 0400, wifili_d, &nss_top_main, &nss_wifili_txrx_strings_ops);
+ 	if (!wifili_txrx_d) {
+ 		nss_warning("Failed to create qca-nss-drv/strings/wifili/txrx_str file");
+-		debugfs_remove_recursive(wifili_d);
++		nss_debugfs_remove_locked(wifili_d);
+ 		return;
+ 	}
+ 
+-	wifili_tcl_ring_d = debugfs_create_file("tcl_ring_str", 0400, wifili_d, &nss_top_main, &nss_wifili_tcl_ring_strings_ops);
++	wifili_tcl_ring_d = nss_debugfs_create_file_locked("tcl_ring_str", 0400, wifili_d, &nss_top_main, &nss_wifili_tcl_ring_strings_ops);
+ 	if (!wifili_tcl_ring_d) {
+ 		nss_warning("Failed to create qca-nss-drv/strings/wifili/tcl_ring_str file");
+-		debugfs_remove_recursive(wifili_d);
++		nss_debugfs_remove_locked(wifili_d);
+ 		return;
+ 	}
+ 
+-	wifili_tcl_comp_d = debugfs_create_file("tcl_comp_str", 0400, wifili_d, &nss_top_main, &nss_wifili_tcl_comp_strings_ops);
++	wifili_tcl_comp_d = nss_debugfs_create_file_locked("tcl_comp_str", 0400, wifili_d, &nss_top_main, &nss_wifili_tcl_comp_strings_ops);
+ 	if (!wifili_tcl_comp_d) {
+ 		nss_warning("Failed to create qca-nss-drv/strings/wifili/tcl_comp_str file");
+-		debugfs_remove_recursive(wifili_d);
++		nss_debugfs_remove_locked(wifili_d);
+ 		return;
+ 	}
+ 
+-	wifili_reo_ring_d = debugfs_create_file("reo_ring_str", 0400, wifili_d, &nss_top_main, &nss_wifili_reo_ring_strings_ops);
++	wifili_reo_ring_d = nss_debugfs_create_file_locked("reo_ring_str", 0400, wifili_d, &nss_top_main, &nss_wifili_reo_ring_strings_ops);
+ 	if (!wifili_reo_ring_d) {
+ 		nss_warning("Failed to create qca-nss-drv/strings/wifili/reo_ring_str file");
+-		debugfs_remove_recursive(wifili_d);
++		nss_debugfs_remove_locked(wifili_d);
+ 		return;
+ 	}
+ 
+-	wifili_tx_sw_d = debugfs_create_file("tx_sw_str", 0400, wifili_d, &nss_top_main, &nss_wifili_tx_sw_strings_ops);
++	wifili_tx_sw_d = nss_debugfs_create_file_locked("tx_sw_str", 0400, wifili_d, &nss_top_main, &nss_wifili_tx_sw_strings_ops);
+ 	if (!wifili_tx_sw_d) {
+ 		nss_warning("Failed to create qca-nss-drv/strings/wifili/tx_sw_str file");
+-		debugfs_remove_recursive(wifili_d);
++		nss_debugfs_remove_locked(wifili_d);
+ 		return;
+ 	}
+ 
+-	wifili_tx_ext_sw_d = debugfs_create_file("tx_ext_sw_str", 0400, wifili_d, &nss_top_main, &nss_wifili_tx_ext_sw_strings_ops);
++	wifili_tx_ext_sw_d = nss_debugfs_create_file_locked("tx_ext_sw_str", 0400, wifili_d, &nss_top_main, &nss_wifili_tx_ext_sw_strings_ops);
+ 	if (!wifili_tx_ext_sw_d) {
+ 		nss_warning("Failed to create qca-nss-drv/strings/wifili/tx_ext_sw_str file");
+-		debugfs_remove_recursive(wifili_d);
++		nss_debugfs_remove_locked(wifili_d);
+ 		return;
+ 	}
+ 
+-	wifili_rx_dma_pool_d = debugfs_create_file("rx_dma_pool_str", 0400, wifili_d, &nss_top_main, &nss_wifili_rx_dma_pool_strings_ops);
++	wifili_rx_dma_pool_d = nss_debugfs_create_file_locked("rx_dma_pool_str", 0400, wifili_d, &nss_top_main, &nss_wifili_rx_dma_pool_strings_ops);
+ 	if (!wifili_rx_dma_pool_d) {
+ 		nss_warning("Failed to create qca-nss-drv/strings/wifili/rx_dma_pool_str file");
+-		debugfs_remove_recursive(wifili_d);
++		nss_debugfs_remove_locked(wifili_d);
+ 		return;
+ 	}
+ 
+-	wifili_rx_dma_ring_d = debugfs_create_file("rx_dma_ring_str", 0400, wifili_d, &nss_top_main, &nss_wifili_rx_dma_ring_strings_ops);
++	wifili_rx_dma_ring_d = nss_debugfs_create_file_locked("rx_dma_ring_str", 0400, wifili_d, &nss_top_main, &nss_wifili_rx_dma_ring_strings_ops);
+ 	if (!wifili_rx_dma_ring_d) {
+ 		nss_warning("Failed to create qca-nss-drv/strings/wifili/rx_dma_ring_str file");
+-		debugfs_remove_recursive(wifili_d);
++		nss_debugfs_remove_locked(wifili_d);
+ 		return;
+ 	}
+ 
+-	wifili_wbm_ring_d = debugfs_create_file("wbm_ring_str", 0400, wifili_d, &nss_top_main, &nss_wifili_wbm_ring_strings_ops);
++	wifili_wbm_ring_d = nss_debugfs_create_file_locked("wbm_ring_str", 0400, wifili_d, &nss_top_main, &nss_wifili_wbm_ring_strings_ops);
+ 	if (!wifili_wbm_ring_d) {
+ 		nss_warning("Failed to create qca-nss-drv/strings/wifili/wbm_ring_str file");
+-		debugfs_remove_recursive(wifili_d);
++		nss_debugfs_remove_locked(wifili_d);
+ 		return;
+ 	}
+ }
++
++void nss_wifili_strings_dentry_create(void)
++{
++	if (!nss_debugfs_begin(NSS_DEBUGFS_STRINGS))
++		return;
++	nss_wifili_strings_dentry_create_locked();
++	nss_debugfs_end();
++}

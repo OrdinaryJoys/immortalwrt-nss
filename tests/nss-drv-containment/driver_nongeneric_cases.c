@@ -1,14 +1,22 @@
 /* Actual exact-IPQ HAL functions compiled without GENERIC. Generic callbacks
  * must not run, and these cases do not assert generic registry retirement. */
 static void nongeneric_setup(void) {
-    setup(); nss_hal_receive_group_closing=nss_hal_receive_group_stopped=false;
+    setup(); nss_hal_receive_group_closing=nss_hal_receive_group_stopped=nss_hal_control_group_stopped=false;
     memset(nss_hal_core_removed,0,sizeof(nss_hal_core_removed));
 }
 int main(void) {
     struct platform_device dev0={.id=0},dev1={.id=1};
-    nongeneric_setup(); assert(nss_hal_remove(&dev0)==0);
+    nongeneric_setup();
+    for(int gate=0;gate<HOST_CONTROL_COUNT;gate++) assert(host_control_begin(gate));
+    pthread_t writer; assert(pthread_create(&writer,NULL,host_controls_stop_thread,NULL)==0);
+    for(int gate=0;gate<HOST_CONTROL_COUNT;gate++) host_controls_release_held(gate);
+    assert(pthread_join(writer,NULL)==0); host_controls_assert_drained();
+    host_controls_assert_receive_live(); int control_events=event_count;
+    nss_hal_quiesce_control_group(); assert(event_count==control_events);
+    assert(nss_hal_remove(&dev0)==0);
     for(int core=0;core<NSS_MAX_CORES;core++) assert(!nss_top_main.nss[core].int_ctx[0].irq && nss_top_main.nss[core].int_ctx[0].napi.deleted);
     assert(nss_hal_receive_group_stopped && override_calls==0 && restore_calls==0 && hal_unregister_calls==0 && event_index(HOST_CANCEL_WAIT,-1)<0);
+    host_controls_assert_drained(); host_controls_assert_before_receive();
     passed("candidate_nongeneric_all_core_receive_cleanup_without_generic_callbacks");
     assert(nss_hal_remove(&dev1)==0); int before=event_count; unsigned stats=stats_clean_calls;
     assert(nss_hal_remove(&dev0)==0 && nss_hal_remove(&dev1)==0 && event_count==before && stats_clean_calls==stats);

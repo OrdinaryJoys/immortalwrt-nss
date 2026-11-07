@@ -52,6 +52,9 @@ static int nss_n2h_update_queue_config_sync(struct nss_ctx_instance *ctx,bool en
 static int nss_project_pri_mq_map_configure(struct nss_ctx_instance *ctx) { assert(ctx==&nss_top_main.nss[0]); return NSS_TX_SUCCESS; }
 static bool initialized;
 static void setup(void) {
+#ifdef HOST_CONTROL_GROUP
+    host_control_reset();
+#endif
     if(initialized) for(int core=0;core<NSS_MAX_CORES;core++) for(int i=0;i<NSS_MAX_IRQ_PER_CORE;i++) {
         struct napi_struct *napi=&nss_top_main.nss[core].int_ctx[i].napi;
         assert(!napi->active && !napi->tail_active);
@@ -74,6 +77,6 @@ static void setup(void) {
     hold_notify=notify_entered=release_notify=false; notify_calls=host_napi_complete_calls=host_irq_rearm_calls=0;
     override_result=0; host_create_fail=false; initialized=true;
 }
-static void passed(const char *name) { printf("PASS %s\n",name); }
+static void passed(const char *name) { printf("PASS %s\n",name); assert(fflush(stdout)==0); }
 static int event_index(enum host_api_event event,int core) { for(int i=0;i<event_count;i++) if(events[i]==(int)event && event_core[i]==core) return i; return -1; }
 HOST_EXTRACTED_FUNCTIONS

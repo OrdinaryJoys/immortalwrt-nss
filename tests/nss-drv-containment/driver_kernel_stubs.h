@@ -62,7 +62,7 @@ static void rtnl_unlock(void) { host_holds_rtnl=false; assert(pthread_mutex_unlo
 static bool rtnl_is_locked(void) { return host_holds_rtnl; }
 #define ASSERT_RTNL() assert(rtnl_is_locked())
 
-enum host_api_event { HOST_CANCEL_WAIT, HOST_DESTROY_WAIT, HOST_NAPI_WAIT, HOST_NAPI_GRACE, HOST_IRQ_FREE, HOST_NAPI_DELETE, HOST_NDEV_FREE, HOST_NOTIFY_RETURN, HOST_NAPI_COMPLETE };
+enum host_api_event { HOST_CANCEL_WAIT, HOST_DESTROY_WAIT, HOST_NAPI_WAIT, HOST_NAPI_GRACE, HOST_IRQ_FREE, HOST_NAPI_DELETE, HOST_NDEV_FREE, HOST_NOTIFY_RETURN, HOST_NAPI_COMPLETE, HOST_CONTROL_CLOSE, HOST_CONTROL_DRAINED };
 static void host_observe(enum host_api_event event,int core);
 
 struct workqueue_struct;

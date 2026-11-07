@@ -5,7 +5,7 @@ static void candidate_setup(void) {
     nss_data_plane_workqueue=NULL;
     nss_data_plane_registration_closing=false; nss_data_plane_work_initialized=false;
     nss_data_plane_ops_prepared=false; memset(nss_data_plane_hal_registered,0,sizeof(nss_data_plane_hal_registered));
-    nss_hal_receive_group_closing=nss_hal_receive_group_stopped=false; memset(nss_hal_core_removed,0,sizeof(nss_hal_core_removed));
+    nss_hal_receive_group_closing=nss_hal_receive_group_stopped=nss_hal_control_group_stopped=false; memset(nss_hal_core_removed,0,sizeof(nss_hal_core_removed));
 }
 static bool register_port(int core) { rtnl_lock(); bool result=nss_data_plane_register_to_nss_dp(&nss_top_main.nss[core],1); rtnl_unlock(); return result; }
 static void all_tables_present(void) {
@@ -14,6 +14,7 @@ static void all_tables_present(void) {
 }
 static void all_receive_retired(void) {
     assert(nss_hal_receive_group_stopped && nss_data_plane_registration_stopped());
+    host_controls_assert_drained();
     for(int core=0;core<NSS_MAX_CORES;core++) {
         for(int i=0;i<NSS_MAX_IRQ_PER_CORE;i++) assert(!nss_top_main.nss[core].int_ctx[i].irq);
         struct nss_subsystem_dataplane_register *reg=&nss_top_main.nss[core].subsys_dp_register[1];
@@ -83,8 +84,13 @@ int main(void) {
     assert(pthread_join(worker,NULL)==0); assert(pthread_join(writer,NULL)==0); assert(!host_queue.running && override_calls==0);
     all_receive_retired(); nss_data_plane_destroy_delay_work(); passed("candidate_running_registration_ack_finishes_before_receive_cleanup_and_new_enqueue_refused");
     candidate_setup(); assert(register_port(0));
+    for(int gate=0;gate<HOST_CONTROL_COUNT;gate++) assert(host_control_begin(gate));
     for(int core=0;core<NSS_MAX_CORES;core++) { struct napi_struct *napi=&nss_top_main.nss[core].int_ctx[0].napi; napi->active=napi->tail_active=true; }
     assert(pthread_create(&writer,NULL,remove_thread,(void *)(intptr_t)0)==0);
+    for(int gate=0;gate<HOST_CONTROL_COUNT;gate++) {
+        wait_event_seen(HOST_CONTROL_CLOSE,gate); all_tables_present();
+        host_controls_release_held(gate);
+    }
     for(int core=0;core<NSS_MAX_CORES;core++) {
         wait_event_seen(HOST_NAPI_WAIT,core); all_tables_present(); assert(restore_calls==1);
         release_poll_phase(core,false); wait_event_seen(HOST_NAPI_GRACE,core); all_tables_present();
@@ -92,13 +98,21 @@ int main(void) {
         release_poll_phase(core,true);
     }
     assert(pthread_join(writer,NULL)==0); all_receive_retired();
+    host_controls_assert_before_receive();
     for(int core=0;core<NSS_MAX_CORES;core++) assert(event_index(HOST_IRQ_FREE,core)>event_index(HOST_NAPI_GRACE,core));
     passed("candidate_all_mock_core_poll_and_tail_readers_drain_before_registry_clear_irq_retained_until_grace");
-    candidate_setup(); assert(register_port(0)); assert(nss_hal_remove(&dev0)==0); assert(nss_hal_remove(&dev1)==0);
+    candidate_setup(); assert(register_port(0));
+    nss_hal_quiesce_control_group(); host_controls_assert_drained();
+    all_tables_present(); host_controls_assert_receive_live();
+    int control_events=event_count;
+    nss_hal_quiesce_control_group(); assert(event_count==control_events);
+    assert(nss_hal_probe(&dev1)==-ESHUTDOWN && probe_calls==0);
+    assert(nss_hal_remove(&dev0)==0); assert(nss_hal_remove(&dev1)==0);
     unsigned restores=restore_calls,stats=stats_clean_calls; int event_total=event_count;
     assert(nss_hal_remove(&dev0)==0 && nss_hal_remove(&dev1)==0);
     assert(restore_calls==restores && stats_clean_calls==stats && event_count==event_total && napi_devices[0].host_frees==1 && napi_devices[1].host_frees==1);
-    all_receive_retired(); passed("candidate_repeated_both_core_remove_idempotent_no_double_resource_retirement");
+    all_receive_retired(); host_controls_assert_before_receive();
+    passed("candidate_repeated_both_core_remove_idempotent_no_double_resource_retirement");
     candidate_setup(); struct platform_device invalid={.id=-1}; assert(nss_hal_remove(&invalid)==-EINVAL); invalid.id=NSS_MAX_CORES;
     assert(nss_hal_remove(&invalid)==-EINVAL && event_count==0 && stats_clean_calls==0);
     passed("candidate_remove_invalid_core_refused_before_resource_mutation");

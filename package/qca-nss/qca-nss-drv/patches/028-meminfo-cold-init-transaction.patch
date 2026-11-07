@@ -1,0 +1,746 @@
+Subject: [PATCH] Stage cold meminfo resources and roll back only local acquisitions
+
+--- a/nss_meminfo.c
++++ b/nss_meminfo.c
+@@ -21,6 +21,8 @@
+  */
+ 
+ #include <linux/seq_file_net.h>
++#include <linux/mutex.h>
++#include <linux/err.h>
+ #include "nss_tx_rx_common.h"
+ #include "nss_core.h"
+ #include "nss_arch.h"
+@@ -35,6 +37,8 @@
+ MODULE_PARM_DESC(nss_meminfo_user_config, "meminfo user configuration");
+ 
+ static bool nss_meminfo_debugfs_exist;
++static DEFINE_MUTEX(nss_meminfo_lock);
++static DEFINE_MUTEX(nss_meminfo_debugfs_lock);
+ 
+ /*
+  * Name table of memory type presented to user.
+@@ -70,7 +74,7 @@
+ 	/*
+ 	 * Unmap it since every SDRAM memory had been mapped.
+ 	 */
+-	dma_unmap_single(nss_ctx->dev, dma_addr, size, DMA_FROM_DEVICE);
++	dma_unmap_single(nss_ctx->dev, dma_addr, size, DMA_TO_DEVICE);
+ 	kfree(kern_addr);
+ }
+ 
+@@ -78,13 +82,15 @@
+  * nss_meminfo_alloc_imem()
+  *	Allocate an IMEM block in a sequential way.
+  */
+-static uint32_t nss_meminfo_alloc_imem(struct nss_ctx_instance *nss_ctx, uint32_t size, int alignment)
++static uint32_t nss_meminfo_alloc_imem(struct nss_ctx_instance *nss_ctx,
++		struct nss_meminfo_ctx *mem_ctx, uint32_t size, int alignment)
+ {
+-	struct nss_meminfo_ctx *mem_ctx = &nss_ctx->meminfo_ctx;
+ 	uint32_t new_tail;
+ 	uint32_t addr = 0;
+ 	int mask;
+ 
++	if (alignment <= 0 || (alignment & (alignment - 1)))
++		return 0;
+ 	mask = alignment - 1;
+ 
+ 	/*
+@@ -97,10 +103,12 @@
+ 	/*
+ 	 * Align up the address if it not aligned.
+ 	 */
++	if ((new_tail & mask) && (uint32_t)mask > ~0U - new_tail)
++		return 0;
+ 	if (new_tail & mask)
+ 		new_tail = (new_tail + mask) & ~mask;
+ 
+-	if (size > (mem_ctx->imem_end - new_tail)) {
++	if (new_tail > mem_ctx->imem_end || size > mem_ctx->imem_end - new_tail) {
+ 		nss_info_always("%px: failed to alloc an IMEM block of size %u\n", nss_ctx, size);
+ 		return addr;
+ 	}
+@@ -115,9 +123,9 @@
+  * nss_meminfo_free_imem()
+  *	Free an IMEM block. Ignore the padding bytes for alignment requirement.
+  */
+-static void nss_meminfo_free_imem(struct nss_ctx_instance *nss_ctx, uint32_t addr, uint32_t size)
++static void nss_meminfo_free_imem(struct nss_ctx_instance *nss_ctx,
++		struct nss_meminfo_ctx *mem_ctx, uint32_t addr, uint32_t size)
+ {
+-	struct nss_meminfo_ctx *mem_ctx = &nss_ctx->meminfo_ctx;
+ 	mem_ctx->imem_tail -= size;
+ }
+ 
+@@ -125,13 +133,15 @@
+  * nss_meminfo_alloc_utcm_shared()
+  *	Allocate an UTCM_SHARED block in a sequential way.
+  */
+-static uint32_t nss_meminfo_alloc_utcm_shared(struct nss_ctx_instance *nss_ctx, uint32_t size, int alignment)
++static uint32_t nss_meminfo_alloc_utcm_shared(struct nss_ctx_instance *nss_ctx,
++		struct nss_meminfo_ctx *mem_ctx, uint32_t size, int alignment)
+ {
+-	struct nss_meminfo_ctx *mem_ctx = &nss_ctx->meminfo_ctx;
+ 	uint32_t new_tail;
+ 	uint32_t addr = 0;
+ 	int mask;
+ 
++	if (alignment <= 0 || (alignment & (alignment - 1)))
++		return 0;
+ 	mask = alignment - 1;
+ 
+ 	/*
+@@ -144,10 +154,12 @@
+ 	/*
+ 	 * Align up the address if it not aligned.
+ 	 */
++	if ((new_tail & mask) && (uint32_t)mask > ~0U - new_tail)
++		return 0;
+ 	if (new_tail & mask)
+ 		new_tail = (new_tail + mask) & ~mask;
+ 
+-	if (size > (mem_ctx->utcm_shared_end - new_tail)) {
++	if (new_tail > mem_ctx->utcm_shared_end || size > mem_ctx->utcm_shared_end - new_tail) {
+ 		nss_info_always("%px: failed to alloc an UTCM_SHARED block of size %u\n", nss_ctx, size);
+ 		return addr;
+ 	}
+@@ -162,9 +174,9 @@
+  * nss_meminfo_free_utcm_shared()
+  *	Free an UTCM_SHARED block. Ignore the padding bytes for alignment requirement.
+  */
+-static void nss_meminfo_free_utcm_shared(struct nss_ctx_instance *nss_ctx, uint32_t addr, uint32_t size)
++static void nss_meminfo_free_utcm_shared(struct nss_ctx_instance *nss_ctx,
++		struct nss_meminfo_ctx *mem_ctx, uint32_t addr, uint32_t size)
+ {
+-	struct nss_meminfo_ctx *mem_ctx = &nss_ctx->meminfo_ctx;
+ 	mem_ctx->utcm_shared_tail -= size;
+ }
+ 
+@@ -206,7 +218,7 @@
+ 	user_choice[i] = '\0';
+ 
+ 	for (i = 0; i < NSS_MEMINFO_MEMTYPE_MAX; i++)
+-		if (!strcmp(mtype_table[i], user_choice))
++		if (mtype_table[i] && !strcmp(mtype_table[i], user_choice))
+ 			return i;
+ 
+ 	return -1;
+@@ -216,17 +228,19 @@
+  * nss_meminfo_free_block_lists()
+  *	Free block node and memory associated with each each memory object.
+  */
+-static void nss_meminfo_free_block_lists(struct nss_ctx_instance *nss_ctx)
++static void nss_meminfo_free_block_lists(struct nss_ctx_instance *nss_ctx,
++		struct nss_meminfo_ctx *mem_ctx)
+ {
+-	struct nss_meminfo_ctx *mem_ctx;
+ 	struct nss_meminfo_block_list *l;
+ 	int i;
+ 
+-	mem_ctx = &nss_ctx->meminfo_ctx;
+ 	for (i = 0; i < NSS_MEMINFO_MEMTYPE_MAX; i++) {
+ 		struct nss_meminfo_block *b;
+ 		l = &mem_ctx->block_lists[i];
+ 		b = l->head;
++		l->head = NULL;
++		l->num_blks = 0;
++		l->total_size = 0;
+ 		while (b) {
+ 			struct nss_meminfo_block *tmp;
+ 			/*
+@@ -234,13 +248,13 @@
+ 			 */
+ 			switch (i) {
+ 			case NSS_MEMINFO_MEMTYPE_IMEM:
+-				nss_meminfo_free_imem(nss_ctx, b->dma_addr, b->size);
++				nss_meminfo_free_imem(nss_ctx, mem_ctx, b->dma_addr, b->size);
+ 				break;
+ 			case NSS_MEMINFO_MEMTYPE_SDRAM:
+ 				nss_meminfo_free_sdram(nss_ctx, b->dma_addr, b->kern_addr, b->size);
+ 				break;
+ 			case NSS_MEMINFO_MEMTYPE_UTCM_SHARED:
+-				nss_meminfo_free_utcm_shared(nss_ctx, b->dma_addr, b->size);
++				nss_meminfo_free_utcm_shared(nss_ctx, mem_ctx, b->dma_addr, b->size);
+ 				break;
+ 			}
+ 
+@@ -252,13 +266,21 @@
+ 			kfree(tmp);
+ 		}
+ 	}
++	mem_ctx->meminfo_map.num_requests = 0;
++	mem_ctx->if_map = NULL;
++	mem_ctx->if_map_dma = 0;
++	mem_ctx->logbuffer = NULL;
++	mem_ctx->logbuffer_dma = 0;
++	mem_ctx->c2c_start_dma = 0;
++	mem_ctx->sdma_ctrl = NULL;
+ }
+ 
+ /*
+  * nss_meminfo_init_block_lists()
+  *	Initialize block lists and allocate memory for each block.
+  */
+-static bool nss_meminfo_init_block_lists(struct nss_ctx_instance *nss_ctx)
++static bool nss_meminfo_init_block_lists(struct nss_ctx_instance *nss_ctx,
++		struct nss_meminfo_ctx *mem_ctx)
+ {
+ 	/*
+ 	 * There is no corresponding mapped address in kernel for UTCM_SHARED.
+@@ -269,15 +291,17 @@
+ 	 */
+ 	void *kern_addr = (void *)NSS_MEMINFO_POISON;
+ 	uint32_t dma_addr = 0;
+-	struct nss_meminfo_ctx *mem_ctx;
++	struct nss_meminfo_block *b = NULL;
+ 	struct nss_meminfo_block_list *l;
+ 	struct nss_meminfo_request *r;
+ 	struct nss_meminfo_map *map;
+ 	int mtype;
+ 	int i;
++	uint32_t size;
++	uint32_t imem_tail = mem_ctx->imem_tail;
++	uint32_t utcm_tail = mem_ctx->utcm_shared_tail;
++	size_t remaining = NSS_MEMINFO_MAP_SIZE - sizeof(uint32_t);
+ 
+-	mem_ctx = &nss_ctx->meminfo_ctx;
+-
+ 	/*
+ 	 * Fill memory type for each block list.
+ 	 */
+@@ -289,16 +313,19 @@
+ 	/*
+ 	 * Loop through all meminfo requests by checking the per-request magic.
+ 	 */
+-	for (r = map->requests; r->magic == NSS_MEMINFO_REQUEST_MAGIC; r++) {
+-		struct nss_meminfo_block *b = (struct nss_meminfo_block *)
+-						kmalloc(sizeof(struct nss_meminfo_block), GFP_KERNEL);
++	for (r = map->requests; remaining >= sizeof(r->magic) &&
++			r->magic == NSS_MEMINFO_REQUEST_MAGIC;
++			r++, remaining -= sizeof(*r)) {
++		if (remaining < sizeof(*r) || !memchr(r->name, 0, sizeof(r->name)))
++			goto cleanup;
++		b = kmalloc(sizeof(*b), GFP_KERNEL);
+ 		if (!b) {
+ 			nss_info_always("%px: failed to allocate meminfo block\n", nss_ctx);
+ 			goto cleanup;
+ 		}
+ 
+-		b->index = map->num_requests++;
+-		b->size = r->size;
++		b->index = map->num_requests;
++		size = r->size;
+ 
+ 		/*
+ 		 * Look up the user-defined memory type.
+@@ -307,7 +334,14 @@
+ 		mtype = nss_meminfo_if_user_overwrite(nss_ctx, r->name);
+ 		if (mtype == -1)
+ 			mtype = r->memtype_default;
+-		r->memtype_user = mtype;
++		if ((!strcmp(r->name, "nss_if_mem_map_inst") ||
++			!strcmp(r->name, "debug_boot_log_desc")) &&
++			mtype != NSS_MEMINFO_MEMTYPE_IMEM &&
++			mtype != NSS_MEMINFO_MEMTYPE_SDRAM)
++			goto cleanup;
++		if (!strcmp(r->name, "nss_if_mem_map_inst") &&
++			size < sizeof(struct nss_if_mem_map))
++			goto cleanup;
+ 
+ 		switch (mtype) {
+ 		case NSS_MEMINFO_MEMTYPE_IMEM:
+@@ -323,7 +357,7 @@
+ 			/*
+ 			 * Return SoC real address for IMEM as DMA address.
+ 			 */
+-			dma_addr = nss_meminfo_alloc_imem(nss_ctx, r->size, r->alignment);
++			dma_addr = nss_meminfo_alloc_imem(nss_ctx, mem_ctx, size, r->alignment);
+ 			if (!dma_addr) {
+ 				nss_info_always("%px: failed to alloc IMEM block\n", nss_ctx);
+ 				goto cleanup;
+@@ -336,15 +370,18 @@
+ 			kern_addr = nss_ctx->vmap + dma_addr - nss_ctx->vphys;
+ 			break;
+ 		case NSS_MEMINFO_MEMTYPE_SDRAM:
+-			kern_addr = nss_meminfo_alloc_sdram(nss_ctx, r->size);
++			if (!size)
++				goto cleanup;
++			kern_addr = nss_meminfo_alloc_sdram(nss_ctx, size);
+ 			if (!kern_addr) {
+ 				nss_info_always("%px: failed to alloc SDRAM block\n", nss_ctx);
+ 				goto cleanup;
+ 			}
+ 
+-			dma_addr = dma_map_single(nss_ctx->dev, kern_addr, r->size, DMA_TO_DEVICE);
++			dma_addr = dma_map_single(nss_ctx->dev, kern_addr, size, DMA_TO_DEVICE);
+ 			if (unlikely(dma_mapping_error(nss_ctx->dev, dma_addr))) {
+ 				nss_info_always("%px: failed to map SDRAM block\n", nss_ctx);
++				kfree(kern_addr);
+ 				goto cleanup;
+ 			}
+ 			break;
+@@ -352,7 +389,7 @@
+ 			/*
+ 			 * Return SoC real address for UTCM_SHARED as DMA address.
+ 			 */
+-			dma_addr = nss_meminfo_alloc_utcm_shared(nss_ctx, r->size, r->alignment);
++			dma_addr = nss_meminfo_alloc_utcm_shared(nss_ctx, mem_ctx, size, r->alignment);
+ 			if (!dma_addr) {
+ 				nss_info_always("%px: failed to alloc UTCM_SHARED block\n", nss_ctx);
+ 				goto cleanup;
+@@ -364,15 +401,17 @@
+ 			 */
+ 			if (!strcmp(r->name, "heap_ddr_size")) {
+ 				struct nss_mmu_ddr_info coreinfo;
+-				r->size = nss_core_ddr_info(&coreinfo);
++				size = nss_core_ddr_info(&coreinfo);
+ 
+ 				/*
+ 				 * split memory among the number of cores
+ 				 */
+-				r->size /= coreinfo.num_active_cores;
+-				dma_addr = coreinfo.start_address + nss_ctx->id * r->size;
++				if (!coreinfo.num_active_cores)
++					goto cleanup;
++				size /= coreinfo.num_active_cores;
++				dma_addr = coreinfo.start_address + nss_ctx->id * size;
+ 				nss_info_always("%px: NSS core %d DDR from %x to %x\n", nss_ctx,
+-						nss_ctx->id, dma_addr, dma_addr + r->size);
++						nss_ctx->id, dma_addr, dma_addr + size);
+ 			}
+ 			break;
+ 		default:
+@@ -381,11 +420,6 @@
+ 		}
+ 
+ 		/*
+-		 * Update the request with DMA address for the memory that only be used by FW.
+-		 */
+-		r->addr = dma_addr;
+-
+-		/*
+ 		 * nss_if_mem_map settings
+ 		 */
+ 		if (!strcmp(r->name, "nss_if_mem_map_inst")) {
+@@ -413,31 +447,34 @@
+ 		}
+ 
+ 		/*
+-		 * Flush the updated meminfo request.
+-		 */
+-		NSS_CORE_DSB();
+-
+-		/*
+ 		 * Update the list
+ 		 */
++		b->dma_addr = dma_addr;
++		b->kern_addr = kern_addr;
++		b->size = size;
+ 		l = &mem_ctx->block_lists[mtype];
+ 		l->num_blks++;
+-		l->total_size += r->size;
++		l->total_size += size;
+ 
+ 		b->next = l->head;
+ 		l->head = b;
++		b = NULL;
++		map->num_requests++;
+ 	}
+ 
+ 	/*
+ 	 * Verify memory map end magic
+ 	 */
+-	if (*((uint16_t *)r) != NSS_MEMINFO_MAP_END_MAGIC)
++	if (remaining < sizeof(r->magic) || r->magic != NSS_MEMINFO_MAP_END_MAGIC)
+ 		goto cleanup;
+ 
+ 	return true;
+ 
+ cleanup:
+-	nss_meminfo_free_block_lists(nss_ctx);
++	kfree(b);
++	nss_meminfo_free_block_lists(nss_ctx, mem_ctx);
++	mem_ctx->imem_tail = imem_tail;
++	mem_ctx->utcm_shared_tail = utcm_tail;
+ 	return false;
+ }
+ 
+@@ -446,7 +483,7 @@
+  *	Allocate N2H/H2N rings.
+  */
+ static bool nss_meminfo_allocate_n2h_h2n_rings(struct nss_ctx_instance *nss_ctx,
+-						struct nss_meminfo_n2h_h2n_info *info)
++		struct nss_meminfo_ctx *mem_ctx, struct nss_meminfo_n2h_h2n_info *info)
+ {
+ 	switch (info->memtype) {
+ 	case NSS_MEMINFO_MEMTYPE_SDRAM:
+@@ -458,6 +495,8 @@
+ 						info->total_size, DMA_TO_DEVICE);
+ 		if (unlikely(dma_mapping_error(nss_ctx->dev, info->dma_addr))) {
+ 			kfree((void *)info->kern_addr);
++			info->kern_addr = NULL;
++			info->dma_addr = 0;
+ 			return false;
+ 		}
+ 		break;
+@@ -471,7 +510,7 @@
+ 			return false;
+ 		}
+ 
+-		info->dma_addr = nss_meminfo_alloc_imem(nss_ctx, info->total_size, L1_CACHE_BYTES);
++		info->dma_addr = nss_meminfo_alloc_imem(nss_ctx, mem_ctx, info->total_size, L1_CACHE_BYTES);
+ 		if (!info->dma_addr)
+ 			return false;
+ 
+@@ -488,9 +527,9 @@
+  * nss_meminfo_configure_n2h_h2n_rings()
+  *	Configure N2H/H2N rings and if_map.
+  */
+-static bool nss_meminfo_configure_n2h_h2n_rings(struct nss_ctx_instance *nss_ctx)
++static bool nss_meminfo_configure_n2h_h2n_rings(struct nss_ctx_instance *nss_ctx,
++		struct nss_meminfo_ctx *mem_ctx)
+ {
+-	struct nss_meminfo_ctx *mem_ctx = &nss_ctx->meminfo_ctx;
+ 	struct nss_meminfo_n2h_h2n_info *h2n_info;
+ 	struct nss_meminfo_n2h_h2n_info *n2h_info;
+ 	struct nss_if_mem_map *if_map;
+@@ -521,7 +560,7 @@
+ 	/*
+ 	 * N2H ring allocations
+ 	 */
+-	if (!(nss_meminfo_allocate_n2h_h2n_rings(nss_ctx, n2h_info))) {
++	if (!(nss_meminfo_allocate_n2h_h2n_rings(nss_ctx, mem_ctx, n2h_info))) {
+ 		nss_info_always("%px: failed to allocate/map n2h rings\n", nss_ctx);
+ 		return false;
+ 	}
+@@ -529,9 +568,9 @@
+ 	/*
+ 	 * H2N ring allocations
+ 	 */
+-	if (!(nss_meminfo_allocate_n2h_h2n_rings(nss_ctx, h2n_info))) {
++	if (!(nss_meminfo_allocate_n2h_h2n_rings(nss_ctx, mem_ctx, h2n_info))) {
+ 		nss_info_always("%px: failed to allocate/map h2n_rings\n", nss_ctx);
+-		goto cleanup;
++		return false;
+ 	}
+ 
+ 	/*
+@@ -587,21 +626,49 @@
+ 	NSS_CORE_DSB();
+ 
+ 	return true;
++}
+ 
+-cleanup:
+-	if (n2h_info->memtype == NSS_MEMINFO_MEMTYPE_SDRAM)
+-		nss_meminfo_free_sdram(nss_ctx, n2h_info->dma_addr, n2h_info->kern_addr, n2h_info->total_size);
++static void nss_meminfo_free_ring(struct nss_ctx_instance *nss_ctx,
++		struct nss_meminfo_ctx *mem_ctx, struct nss_meminfo_n2h_h2n_info *info)
++{
++	if (!info->kern_addr)
++		return;
++	if (info->memtype == NSS_MEMINFO_MEMTYPE_SDRAM)
++		nss_meminfo_free_sdram(nss_ctx, info->dma_addr, info->kern_addr, info->total_size);
+ 	else
+-		nss_meminfo_free_imem(nss_ctx, n2h_info->dma_addr, n2h_info->total_size);
++		nss_meminfo_free_imem(nss_ctx, mem_ctx, info->dma_addr, info->total_size);
++	info->kern_addr = NULL;
++	info->dma_addr = 0;
++}
+ 
+-	nss_meminfo_free_block_lists(nss_ctx);
+-	return false;
++/* No fallible operation follows publication of these firmware-visible handles. */
++static void nss_meminfo_publish_requests(struct nss_meminfo_ctx *mem_ctx)
++{
++	struct nss_meminfo_block *b;
++	struct nss_meminfo_request *r;
++	int i;
++
++	for (i = 0; i < NSS_MEMINFO_MEMTYPE_MAX; i++)
++		for (b = mem_ctx->block_lists[i].head; b; b = b->next) {
++			r = &mem_ctx->meminfo_map.requests[b->index];
++			r->memtype_user = i;
++			r->size = b->size;
++			r->addr = b->dma_addr;
++		}
++	NSS_CORE_DSB();
+ }
+ 
+ /*
+  * nss_meminfo_config_show()
+  *	function to show meinfo configuration per core.
+  */
++static const char *nss_meminfo_type_name(uint32_t type)
++{
++	if (type >= NSS_MEMINFO_MEMTYPE_MAX || !nss_meminfo_memtype_table[type])
++		return "UNKNOWN";
++	return nss_meminfo_memtype_table[type];
++}
++
+ static int nss_meminfo_config_show(struct seq_file *seq, void *v)
+ {
+ 	struct nss_ctx_instance *nss_ctx;
+@@ -611,7 +678,7 @@
+ 	struct nss_meminfo_map *map;
+ 	struct nss_meminfo_request *r;
+ 	int nss_id;
+-	int i;
++	uint32_t i;
+ 
+ 	/*
+ 	 * i_private is passed to us by debug_fs_create()
+@@ -623,10 +690,19 @@
+ 	}
+ 
+ 	nss_ctx = &nss_top_main.nss[nss_id];
+-	NSS_VERIFY_CTX_MAGIC(nss_ctx);
+-
++	mutex_lock(&nss_meminfo_lock);
+ 	mem_ctx = &nss_ctx->meminfo_ctx;
+ 	map = &mem_ctx->meminfo_map;
++	if (!map->start || !map->requests) {
++		mutex_unlock(&nss_meminfo_lock);
++		return -ENODEV;
++	}
++#if (NSS_DEBUG_LEVEL > 0)
++	if (nss_ctx->magic != NSS_CTX_MAGIC) {
++		mutex_unlock(&nss_meminfo_lock);
++		return -ENODEV;
++	}
++#endif
+ 	n2h_info = &mem_ctx->n2h_info;
+ 	h2n_info = &mem_ctx->h2n_info;
+ 
+@@ -634,19 +710,19 @@
+ 			"Index", "Name", "Default", "User", "Size", "DMA Addr");
+ 	seq_printf(seq, "%-5s %-32s %-7s %-7s 0x%-8x 0x%-8x\n",
+ 			"N/A", "n2h_rings", "SDRAM",
+-			nss_meminfo_memtype_table[n2h_info->memtype],
++			nss_meminfo_type_name(n2h_info->memtype),
+ 			n2h_info->total_size, n2h_info->dma_addr);
+ 	seq_printf(seq, "%-5s %-32s %-7s %-7s 0x%-8x 0x%-8x\n",
+ 			"N/A", "h2n_rings", "SDRAM",
+-			nss_meminfo_memtype_table[h2n_info->memtype],
++			nss_meminfo_type_name(h2n_info->memtype),
+ 			h2n_info->total_size, h2n_info->dma_addr);
+ 
+ 	r = map->requests;
+ 	for (i = 0; i < map->num_requests; i++) {
+ 		seq_printf(seq, "%-5d %-32s %-7s %-7s 0x%-8x 0x%-8x\n",
+ 				i, r[i].name,
+-				nss_meminfo_memtype_table[r[i].memtype_default],
+-				nss_meminfo_memtype_table[r[i].memtype_user],
++				nss_meminfo_type_name(r[i].memtype_default),
++				nss_meminfo_type_name(r[i].memtype_user),
+ 				r[i].size, r[i].addr);
+ 	}
+ 
+@@ -657,6 +733,7 @@
+ 	seq_printf(seq, "For example, <1, h2n_rings, IMEM> stands for: h2n_rings of core 1 is on IMEM\n");
+ 	seq_printf(seq, "Note:UTCM_SHARED cannot be used for n2h_rings, h2n_rings and debug_log_boot_desc.\n");
+ 
++	mutex_unlock(&nss_meminfo_lock);
+ 	return 0;
+ }
+ 
+@@ -687,16 +764,17 @@
+ 	struct dentry *meminfo_main_dentry;
+ 	struct dentry *meminfo_core_dentries[NSS_MAX_CORES];
+ 
++	mutex_lock(&nss_meminfo_debugfs_lock);
+ 	if (nss_meminfo_debugfs_exist)
+-		return;
++		goto out;
+ 
+ 	/*
+ 	 * Create directory for showing meminfo configuration of each core.
+ 	 */
+ 	meminfo_main_dentry = debugfs_create_dir("meminfo", nss_top_main.top_dentry);
+-	if (unlikely(!meminfo_main_dentry)) {
++	if (IS_ERR_OR_NULL(meminfo_main_dentry)) {
+ 		nss_warning("Failed to create qca-nss-drv/meminfo directory in debugfs\n");
+-		return;
++		goto out;
+ 	}
+ 
+ 	for (i = 0; i < nss_top_main.num_nss; i++) {
+@@ -704,18 +782,20 @@
+ 		snprintf(file, sizeof(file), "core%d", i);
+ 		meminfo_core_dentries[i] = debugfs_create_file(file, 0400, meminfo_main_dentry,
+ 						(void *)(nss_ptr_t)i, &nss_meminfo_debugfs_ops);
+-		if (unlikely(!meminfo_core_dentries[i])) {
++		if (IS_ERR_OR_NULL(meminfo_core_dentries[i])) {
+ 			int j;
+ 			for (j = 0; j < i; j++)
+ 				debugfs_remove(meminfo_core_dentries[j]);
+ 			debugfs_remove(meminfo_main_dentry);
+ 			nss_warning("Failed to create qca-nss-drv/meminfo/%s file in debugfs", file);
+-			return;
++			goto out;
+ 		}
+ 	}
+ 
+ 	nss_meminfo_debugfs_exist = true;
+ 	nss_info("nss meminfo user config: %s\n", nss_meminfo_user_config);
++out:
++	mutex_unlock(&nss_meminfo_debugfs_lock);
+ }
+ 
+ /*
+@@ -723,14 +803,43 @@
+  *	Initilization
+  *
+  */
++static bool nss_meminfo_has_resources(struct nss_meminfo_ctx *mem_ctx)
++{
++	int i;
++
++	if (mem_ctx->meminfo_map.start || mem_ctx->meminfo_map.requests ||
++		mem_ctx->meminfo_map.num_requests || mem_ctx->if_map ||
++		mem_ctx->if_map_dma || mem_ctx->logbuffer || mem_ctx->logbuffer_dma ||
++		mem_ctx->c2c_start_dma || mem_ctx->sdma_ctrl ||
++		mem_ctx->n2h_info.kern_addr || mem_ctx->n2h_info.dma_addr ||
++		mem_ctx->h2n_info.kern_addr || mem_ctx->h2n_info.dma_addr ||
++		mem_ctx->imem_tail != mem_ctx->imem_head ||
++		mem_ctx->utcm_shared_tail != mem_ctx->utcm_shared_head)
++		return true;
++	for (i = 0; i < NSS_MEMINFO_MEMTYPE_MAX; i++)
++		if (mem_ctx->block_lists[i].head || mem_ctx->block_lists[i].num_blks ||
++			mem_ctx->block_lists[i].total_size)
++			return true;
++	return false;
++}
++
+ bool nss_meminfo_init(struct nss_ctx_instance *nss_ctx)
+ {
+ 	struct nss_meminfo_ctx *mem_ctx;
+-	uint32_t *meminfo_start;
+-	struct nss_meminfo_map *map;
++	struct nss_meminfo_ctx saved, pending;
++	uint32_t *meminfo_start = NULL;
++	uint32_t *map_start = NULL;
+ 	struct nss_top_instance *nss_top = &nss_top_main;
++	bool ready = false;
+ 
++	if (!nss_ctx)
++		return false;
++	mutex_lock(&nss_meminfo_lock);
+ 	mem_ctx = &nss_ctx->meminfo_ctx;
++	if (nss_meminfo_has_resources(mem_ctx))
++		goto out;
++	saved = *mem_ctx;
++	pending = saved;
+ 
+ 	/*
+ 	 * meminfo_start is the label where the start address of meminfo map is stored.
+@@ -739,7 +848,7 @@
+ 							NSS_MEMINFO_RESERVE_AREA_SIZE);
+ 	if (!meminfo_start) {
+ 		nss_info_always("%px: cannot remap meminfo start\n", nss_ctx);
+-		return false;
++		goto out;
+ 	}
+ 
+ 	/*
+@@ -747,31 +856,24 @@
+ 	 */
+ 	if ((uint16_t)meminfo_start[0] != NSS_MEMINFO_RESERVE_AREA_MAGIC) {
+ 		nss_info_always("%px: failed to verify meminfo start magic\n", nss_ctx);
+-		return false;
++		goto out;
+ 	}
+ 
+-	map = &mem_ctx->meminfo_map;
+-	map->start = (uint32_t *)ioremap_cache(meminfo_start[1], NSS_MEMINFO_MAP_SIZE);
+-	if (!map->start) {
++	map_start = (uint32_t *)ioremap_cache(meminfo_start[1], NSS_MEMINFO_MAP_SIZE);
++	if (!map_start) {
+ 		nss_info_always("%px: failed to remap meminfo map\n", nss_ctx);
+-		return false;
++		goto out;
+ 	}
+ 
+ 	/*
+ 	 * Check meminfo map magic
+ 	 */
+-	if ((uint16_t)map->start[0] != NSS_MEMINFO_MAP_START_MAGIC) {
++	if ((uint16_t)map_start[0] != NSS_MEMINFO_MAP_START_MAGIC) {
+ 		nss_info_always("%px: failed to verify meminfo map magic\n", nss_ctx);
+-		return false;
++		goto cleanup;
+ 	}
+ 
+ 	/*
+-	 * Meminfo map settings
+-	 */
+-	map->num_requests = 0;
+-	map->requests = (struct nss_meminfo_request *)(map->start + 1);
+-
+-	/*
+ 	 * Init IMEM
+ 	 */
+ 	nss_top->hal_ops->init_imem(nss_ctx);
+@@ -781,25 +883,53 @@
+ 	 */
+ 	if (!nss_top->hal_ops->init_utcm_shared(nss_ctx, meminfo_start)) {
+ 		nss_info_always("%px: failed to initialize UTCM_SHARED meminfo\n", nss_ctx);
+-		return false;
++		*mem_ctx = saved;
++		goto cleanup;
+ 	}
++	/* HAL initializers establish only the private arena bounds. Keep every
++	 * allocation, derived host alias and FW request unadvertised until commit.
++	 */
++	pending = *mem_ctx;
++	*mem_ctx = saved;
++	pending.meminfo_map.start = map_start;
++	pending.meminfo_map.num_requests = 0;
++	pending.meminfo_map.requests = (struct nss_meminfo_request *)(map_start + 1);
+ 
+ 	/*
+ 	 * Init meminfo block lists
+ 	 */
+-	if (!nss_meminfo_init_block_lists(nss_ctx)) {
++	if (!nss_meminfo_init_block_lists(nss_ctx, &pending)) {
+ 		nss_info_always("%px: failed to initialize meminfo block lists\n", nss_ctx);
+-		return false;
++		goto cleanup;
+ 	}
+ 
+ 	/*
+ 	 * Configure N2H/H2N rings and nss_if_mem_map
+ 	 */
+-	if (!nss_meminfo_configure_n2h_h2n_rings(nss_ctx))
+-		return false;
++	if (!nss_meminfo_configure_n2h_h2n_rings(nss_ctx, &pending))
++		goto cleanup;
+ 
+-	nss_meminfo_init_debugfs(nss_ctx);
+-
++	*mem_ctx = pending;
++	nss_meminfo_publish_requests(mem_ctx);
++	map_start = NULL;
+ 	nss_info("%px: meminfo init succeed\n", nss_ctx);
+-	return true;
++	ready = true;
++	goto out;
++
++cleanup:
++	nss_meminfo_free_ring(nss_ctx, &pending, &pending.h2n_info);
++	nss_meminfo_free_ring(nss_ctx, &pending, &pending.n2h_info);
++	nss_meminfo_free_block_lists(nss_ctx, &pending);
++	if (map_start)
++		iounmap(map_start);
++out:
++	if (meminfo_start)
++		iounmap(meminfo_start);
++	mutex_unlock(&nss_meminfo_lock);
++	/* A failed debugfs creation may join readers during partial removal.
++	 * Never hold the data mutex those readers need across that join.
++	 */
++	if (ready)
++		nss_meminfo_init_debugfs(nss_ctx);
++	return ready;
+ }

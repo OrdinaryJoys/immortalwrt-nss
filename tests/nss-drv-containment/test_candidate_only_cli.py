@@ -16,9 +16,9 @@ RUNNER=HERE/'test-nss-drv-containment.py'
 class CandidateOnlyModes(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        if not os.environ.get('DRV_HOST_BASELINE') or not os.environ.get('DRV_HOST_CANDIDATE'):
-            raise RuntimeError('set DRV_HOST_BASELINE and DRV_HOST_CANDIDATE to actual already-prepared inputs')
-        cls.baseline=Path(os.environ['DRV_HOST_BASELINE']).resolve(strict=True)
+        if not os.environ.get('DRV_HOST_CANDIDATE'):
+            raise RuntimeError('set DRV_HOST_CANDIDATE to an actual already-prepared input')
+        cls.baseline=Path(os.environ['DRV_HOST_BASELINE']).resolve(strict=True) if os.environ.get('DRV_HOST_BASELINE') else None
         cls.candidate=Path(os.environ['DRV_HOST_CANDIDATE']).resolve(strict=True)
 
     def invoke(self,arguments,output):
@@ -36,7 +36,8 @@ class CandidateOnlyModes(unittest.TestCase):
         self.reject(['--candidate-only'],'--candidate-only requires --candidate')
 
     def test_candidate_only_forbids_baseline(self):
-        self.reject(['--candidate-only','--candidate',str(self.candidate),'--baseline',str(self.baseline)],'--candidate-only forbids --baseline')
+        # Rejected by argument validation; this path is never executed as a baseline.
+        self.reject(['--candidate-only','--candidate',str(self.candidate),'--baseline',str(self.baseline or self.candidate)],'--candidate-only forbids --baseline')
 
     def test_candidate_without_explicit_mode_rejected(self):
         self.reject(['--candidate',str(self.candidate)],'--baseline is required unless explicit --candidate-only')
@@ -74,6 +75,7 @@ class CandidateOnlyModes(unittest.TestCase):
         self.assertEqual([row['generic_support'] for row in report['runs']],[True,True,True,False])
 
     def test_baseline_plus_candidate_44_separate_original_controls(self):
+        self.assertIsNotNone(self.baseline,'DRV_HOST_BASELINE is required for original baseline execution')
         report=self.execute(['--baseline',str(self.baseline),'--candidate',str(self.candidate)])
         self.assertEqual(report['mode'],'BASELINE_AND_CANDIDATE_44'); self.assertTrue(report['original_baseline_executed'])
         self.assertEqual(report['total_cases'],44); self.assertEqual([row['count'] for row in report['runs']],[7,20,7,7,3])
@@ -81,6 +83,7 @@ class CandidateOnlyModes(unittest.TestCase):
         self.assertEqual(report['runs'][0]['prepared_root'],str(self.baseline))
 
     def test_baseline_only_is_not_candidate_acceptance(self):
+        self.assertIsNotNone(self.baseline,'DRV_HOST_BASELINE is required for original baseline execution')
         report=self.execute(['--baseline',str(self.baseline)])
         self.assertEqual(report['mode'],'BASELINE_ONLY_7_CANDIDATE_INCOMPLETE')
         self.assertEqual(report['candidate_status'],'INCOMPLETE_NO_CANDIDATE_EXECUTED')

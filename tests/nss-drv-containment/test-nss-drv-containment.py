@@ -19,7 +19,8 @@ HEADER='nss_data_plane/include/nss_data_plane.h'
 HAL='nss_hal/nss_hal.c'
 ASSETS=('test-nss-drv-containment.py','extract_prepared_c.py','driver_kernel_stubs.h',
         'driver_nss_scaffolding.h','driver_api_fixtures.c','driver_emergency_cases.c',
-        'driver_baseline_cases.c','driver_candidate_cases.c','driver_nongeneric_cases.c')
+        'driver_baseline_cases.c','driver_candidate_cases.c','driver_nongeneric_cases.c',
+        'driver_control_fixtures.c','driver_control_cases.c')
 
 
 def asset_manifest():
@@ -52,7 +53,7 @@ def program(prepared,*,candidate=False,cases='driver_baseline_cases.c'):
         globals_text='#ifdef NSS_HAL_IPQ807x_SUPPORT\n'
         for name in ('nss_data_plane_ops_prepared','nss_data_plane_hal_registered'):
             globals_text+=actual_declaration(prepared,PLANE,name)
-        for name in ('nss_hal_receive_group_lock','nss_hal_receive_group_closing','nss_hal_receive_group_stopped','nss_hal_core_removed'):
+        for name in ('nss_hal_receive_group_lock','nss_hal_receive_group_closing','nss_hal_receive_group_stopped','nss_hal_control_group_stopped','nss_hal_core_removed'):
             globals_text+=actual_declaration(prepared,HAL,name)
         globals_text+='#endif\n'
     for name in ('nss_core_register_subsys_dp','nss_core_unregister_subsys_dp','nss_core_handle_napi_emergency'):
@@ -68,6 +69,8 @@ def program(prepared,*,candidate=False,cases='driver_baseline_cases.c'):
     functions.append(prepared.function(HAL,'nss_hal_clean_up_irq'))
     if candidate:
         functions.append(prepared.function(HAL,'nss_hal_probe'))
+        functions.append(prepared.function(HAL,'__nss_hal_quiesce_control_group'))
+        functions.append(prepared.function(HAL,'nss_hal_quiesce_control_group'))
         functions.append(prepared.function(HAL,'nss_hal_quiesce_receive_group'))
     functions.append(prepared.function(HAL,'nss_hal_remove'))
     declarations='bool nss_data_plane_schedule_registration(void);\nint nss_data_plane_init_delay_work(void);\nvoid nss_data_plane_destroy_delay_work(void);\n'
@@ -75,23 +78,70 @@ def program(prepared,*,candidate=False,cases='driver_baseline_cases.c'):
     scaffolding=(HERE/'driver_nss_scaffolding.h').read_text().replace('HOST_EXTRACTED_STRUCTURES',structures).replace('HOST_COMMON_API_DECLARATIONS',declarations)
     fixtures=(HERE/'driver_api_fixtures.c').read_text().replace('HOST_EXTRACTED_FUNCTIONS','\n'.join(functions))
     notices=[row['text'].split('*/',1)[0]+'*/\n' for row in prepared.files.values() if row['text'].startswith('/*')]
-    return '\n'.join(notices)+(HERE/'driver_kernel_stubs.h').read_text()+scaffolding+globals_text+fixtures+(HERE/'driver_emergency_cases.c').read_text()+(HERE/cases).read_text()
+    controls=('#define HOST_CONTROL_GROUP 1\n' if candidate else '')+(HERE/'driver_control_fixtures.c').read_text()
+    return '\n'.join(notices)+(HERE/'driver_kernel_stubs.h').read_text()+scaffolding+globals_text+controls+fixtures+(HERE/'driver_control_cases.c').read_text()+(HERE/'driver_emergency_cases.c').read_text()+(HERE/cases).read_text()
 
 
-def run(program,prepared,cc,output,label,expected,*,soc=None,generic=True,role='ORIGINAL_BASELINE_DEFECT_CONTROL'):
-    source=output/(label+'.c'); binary=output/(label+'.host'); source.write_text(program)
+def file_binding(path):
+    path=Path(path)
+    data=path.read_bytes()
+    return {'path':str(path.absolute()),'bytes':len(data),'sha256':hashlib.sha256(data).hexdigest()}
+
+
+def capture(command,timeout):
+    try:
+        result=subprocess.run(command,text=True,capture_output=True,timeout=timeout)
+        return {'command':command,'status':'COMPLETED','returncode':result.returncode,
+                'stdout':result.stdout,'stderr':result.stderr}
+    except subprocess.TimeoutExpired as error:
+        stream=lambda value: value.decode('utf-8',errors='replace') if isinstance(value,bytes) else value or ''
+        return {'command':command,'status':'TIMEOUT','returncode':None,'timeout_seconds':timeout,
+                'stdout':stream(error.stdout),'stderr':stream(error.stderr),'error':str(error)}
+    except OSError as error:
+        return {'command':command,'status':'SPAWN_ERROR','returncode':None,
+                'stdout':'','stderr':'','error':str(error)}
+
+
+def compiler_binding(cc):
+    return {'executable':file_binding(Path(cc).resolve(strict=True)),
+            'invoked_path':cc,'version':capture([cc,'--version'],10)}
+
+
+def compile_and_execute(program,cc,output,label,*,soc=None,generic=True):
+    source=output/(label+'.c'); binary=output/(label+'.host')
+    source.write_text(program)
+    row={'label':label,'soc_define':soc,'generic_support':generic,
+         'generated_source':file_binding(source),'compiled_binary':None}
     command=[cc,'-std=gnu11','-O0','-g','-pthread','-Wall','-Werror=implicit-function-declaration','-Wno-unused-function','-Wno-unused-variable',str(source),'-o',str(binary)]
     if generic: command.insert(1,'-DNSS_DATA_PLANE_GENERIC_SUPPORT=1')
     if soc: command.insert(1,'-D'+soc+'=1')
-    compiled=subprocess.run(command,text=True,capture_output=True,timeout=30)
-    if compiled.returncode: raise RuntimeError('compilation failed:\n'+compiled.stderr[:16000])
-    executed=subprocess.run([str(binary)],text=True,capture_output=True,timeout=30)
-    if executed.returncode: raise RuntimeError('assertions failed:\n'+executed.stdout+executed.stderr)
-    cases=[line.removeprefix('PASS ') for line in executed.stdout.splitlines() if line.startswith('PASS ')]
+    row['compile']=capture(command,30)
+    row['execute']={'command':[str(binary)],'status':'NOT_RUN','returncode':None,'stdout':'','stderr':''}
+    if binary.is_file(): row['compiled_binary']=file_binding(binary)
+    if row['compile']['returncode']==0 and row['compiled_binary'] is not None:
+        row['execute']=capture([str(binary)],30)
+    row['generated_source_after']=file_binding(source)
+    row['compiled_binary_after']=file_binding(binary) if binary.is_file() else None
+    row['artifact_integrity']=(row['generated_source']==row['generated_source_after'] and
+                               row['compiled_binary']==row['compiled_binary_after'])
+    row['cases']=[line.removeprefix('PASS ') for line in row['execute']['stdout'].splitlines() if line.startswith('PASS ')]
+    row['count']=len(row['cases'])
+    row.update(compile_command=command,compiler_diagnostics=row['compile']['stderr'],
+               execution_stdout=row['execute']['stdout'],execution_stderr=row['execute']['stderr'],
+               generated_c_sha256=row['generated_source']['sha256'],
+               compiled_binary_sha256=row['compiled_binary']['sha256'] if row['compiled_binary'] else None)
+    return row
+
+
+def run(program,prepared,cc,output,label,expected,*,soc=None,generic=True,role='ORIGINAL_BASELINE_DEFECT_CONTROL'):
+    row=compile_and_execute(program,cc,output,label,soc=soc,generic=generic)
+    if row['compile']['returncode']!=0 or row['compile']['stderr']:
+        raise RuntimeError('compilation failed or emitted diagnostics:\n'+json.dumps(row,indent=2))
+    if row['execute']['returncode']!=0 or not row['artifact_integrity']:
+        raise RuntimeError('assertions/artifact integrity failed:\n'+json.dumps(row,indent=2))
+    cases=row['cases']
     if len(cases)!=expected or len(set(cases))!=expected: raise ValueError('missing/duplicate actual-C cases')
-    return {'status':'PASS_HOST_SUBSTITUTES_ONLY','input_role':role,'soc_define':soc,'generic_support':generic,'count':len(cases),'cases':cases,'compile_command':command,
-            'compiler_diagnostics':compiled.stderr,'execution_stdout':executed.stdout,'execution_stderr':executed.stderr,
-            'generated_c_sha256':hashlib.sha256(program.encode()).hexdigest(),'compiled_binary_sha256':hashlib.sha256(binary.read_bytes()).hexdigest(),**prepared.manifest()}
+    return {**row,'status':'PASS_HOST_SUBSTITUTES_ONLY','input_role':role,**prepared.manifest()}
 
 
 def main():
@@ -121,6 +171,7 @@ def main():
                            'Two pthread-backed fixture contexts are not hardware dual-core IRQ/NAPI evidence.',
                            'Kernel workqueue, RTNL, IRQ, NAPI ownership and grace are host API substitutes, not Linux ordering/RCU/lockdep proof.',
                            'Only selected actual DRV C is compiled; ordinary poll bodies, full probe, platform-driver initializer and general module/client lifetime are not executed.',
+                           'Actual HAL control-group orchestration calls observable blocking root/frequency/coredump API substitutes, not the complete real root/producer implementations or firmware retirement.',
                            'DP override/start/restore APIs are substitutes; actual DP state is covered by separate DP extracted-C tests.',
                            'Returning and blocked host coredump notifier substitutes never invoke firmware, panic, crash or hardware.',
                            'Other-SoC and wrong-macro PASS counts assert retained legacy defects, not repaired containment.',
