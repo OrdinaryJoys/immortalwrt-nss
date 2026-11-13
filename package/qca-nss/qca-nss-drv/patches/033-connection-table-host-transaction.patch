@@ -1,0 +1,1429 @@
+Subject: [PATCH] nss: own unpublished connection-table DMA and dispatch by token
+
+Separate CE/CME allocation and mapping from firmware publication. Roll
+back only private resources, using the original DMA mapping tuple.
+Retain any firmware-exposed table until a stop/drain contract exists.
+Do not use firmware callback pointers for SIZE and CFG replies.
+
+This is host-side containment, not NSS firmware retirement support.
+
+diff --git a/Makefile b/Makefile
+index 81feed3..d22d4bf 100644
+--- a/Makefile
++++ b/Makefile
+@@ -14,6 +14,7 @@ ccflags-y += $(NSS_DRV_EXTRA_INCLUDES)
+ #
+ qca-nss-drv-objs := \
+ 			nss_cmn.o \
++			nss_conn_table.o \
+ 			nss_core.o \
+ 			nss_coredump.o \
+ 			nss_drv_stats.o \
+diff --git a/Makefile.fsm b/Makefile.fsm
+index 93ca007..06591bd 100644
+--- a/Makefile.fsm
++++ b/Makefile.fsm
+@@ -3,6 +3,8 @@
+ # ###################################################
+ obj-m += qca-nss-drv.o
+ 
++CFLAGS_nss_conn_table.o += -DNSS_DRV_IPV4_ENABLE -DNSS_DRV_IPV6_ENABLE
++
+ #
+ # List the files that belong to the driver in alphabetical order.
+ #
+@@ -13,6 +15,7 @@ qca-nss-drv-objs := \
+ 			nss_capwap_log.o \
+ 			nss_capwap_stats.o \
+ 			nss_cmn.o \
++			nss_conn_table.o \
+ 			nss_core.o \
+ 			nss_coredump.o \
+ 			nss_crypto.o \
+diff --git a/exports/nss_ipv4.h b/exports/nss_ipv4.h
+index 9a16e5b..9ec4999 100644
+--- a/exports/nss_ipv4.h
++++ b/exports/nss_ipv4.h
+@@ -1024,12 +1024,6 @@ struct nss_ipv4_stats_notification {
+ 	uint64_t exception_stats[NSS_IPV4_EXCEPTION_EVENT_MAX];	/**< IPv4 exception statistics. */
+ };
+ 
+-/**
+- * Configured IPv4 connection number to use for calculating the total number of
+- * connections.
+- */
+-extern int nss_ipv4_conn_cfg;
+-
+ #ifdef __KERNEL__ /* only kernel will use. */
+ 
+ /**
+@@ -1240,15 +1234,6 @@ extern void nss_ipv4_msg_init(struct nss_ipv4_msg *nim, uint16_t if_num, uint32_
+  */
+ int nss_ipv4_update_conn_count(int ipv4_max_conn);
+ 
+-/**
+- * nss_ipv4_free_conn_tables
+- *	Frees memory allocated for connection tables.
+- *
+- * @return
+- * None.
+- */
+-extern void nss_ipv4_free_conn_tables(void);
+-
+ /**
+  * nss_ipv4_dscp_action_get
+  *	Gets the action value of the DSCP.
+diff --git a/exports/nss_ipv6.h b/exports/nss_ipv6.h
+index b6da1b4..f15e73a 100644
+--- a/exports/nss_ipv6.h
++++ b/exports/nss_ipv6.h
+@@ -1017,12 +1017,6 @@ struct nss_ipv6_stats_notification {
+ 	uint64_t exception_stats[NSS_IPV6_EXCEPTION_EVENT_MAX];	/**< IPv6 exception statistics. */
+ };
+ 
+-/**
+- * Configured IPv6 connection number to use for calculating the total number of
+- * connections.
+- */
+-extern int nss_ipv6_conn_cfg;
+-
+ #ifdef __KERNEL__
+ 
+ /**
+@@ -1237,15 +1231,6 @@ void nss_ipv6_unregister_sysctl(void);
+  */
+ int nss_ipv6_update_conn_count(int ipv6_num_conn);
+ 
+-/**
+- * nss_ipv6_free_conn_tables
+- *	Frees memory allocated for connection tables.
+- *
+- * @return
+- * None.
+- */
+-void nss_ipv6_free_conn_tables(void);
+-
+ /**
+  * nss_ipv6_dscp_action_get
+  *	Gets the action value of the DSCP.
+diff --git a/nss_conn_table.c b/nss_conn_table.c
+new file mode 100644
+index 0000000..c2d68d7
+--- /dev/null
++++ b/nss_conn_table.c
+@@ -0,0 +1,432 @@
++/* SPDX-License-Identifier: BSD-2-Clause OR GPL-2.0-only */
++#include <linux/dma-mapping.h>
++#include <linux/mm.h>
++#include <linux/wait.h>
++#include "nss_core.h"
++#include "nss_tx_rx_common.h"
++#include "nss_conn_table.h"
++
++enum nss_conn_phase {
++	NSS_CONN_IDLE,
++	NSS_CONN_SIZE,
++	NSS_CONN_PREPARING,
++	NSS_CONN_CFG_SENDING,
++	NSS_CONN_CFG,
++	NSS_CONN_ACTIVE,
++	NSS_CONN_UNCERTAIN,
++	NSS_CONN_ROLLBACK,
++};
++
++struct nss_conn_dma {
++	struct device *dev;
++	unsigned long cpu;
++	dma_addr_t dma;
++	size_t len;
++	unsigned int order;
++	enum dma_data_direction direction;
++	bool mapped;
++};
++
++struct nss_conn_request {
++	enum nss_conn_phase phase;
++	struct nss_ctx_instance *ctx;
++	nss_ptr_t token;
++	unsigned int requested;
++	unsigned int accepted;
++	bool early_cfg_reply;
++	bool early_cfg_accepted;
++	struct nss_conn_dma dma[2];
++};
++
++struct nss_conn_family {
++	unsigned int slot;
++	unsigned int size;
++	unsigned int cfg;
++};
++
++/* SIZE and CFG both use three words after the common header. */
++struct nss_conn_wire {
++	struct nss_cmn_msg cm;
++	u32 count;
++	u32 ce;
++	u32 cme;
++};
++
++/* The compiled profile remains the host cap before a dynamic ACK. */
++#define NSS_CONN_BASE_COUNT ((NSS_DEFAULT_NUM_CONN < NSS_FW_DEFAULT_NUM_CONN) ? \
++			    NSS_DEFAULT_NUM_CONN : NSS_FW_DEFAULT_NUM_CONN)
++
++static DEFINE_SPINLOCK(nss_conn_lock);
++static DECLARE_WAIT_QUEUE_HEAD(nss_conn_idle);
++static bool nss_conn_closing;
++static unsigned int nss_conn_users;
++/* Other host protocols already use scalar u32 app_data values. */
++static u32 nss_conn_token;
++static struct nss_conn_request nss_conn_tables[2] = {
++#ifdef NSS_DRV_IPV4_ENABLE
++	[0].accepted = NSS_CONN_BASE_COUNT,
++#endif
++#ifdef NSS_DRV_IPV6_ENABLE
++	[1].accepted = NSS_CONN_BASE_COUNT,
++#endif
++};
++
++static const struct nss_conn_family *nss_conn_family(unsigned int iface)
++{
++#ifdef NSS_DRV_IPV4_ENABLE
++	static const struct nss_conn_family v4 = {
++		0, NSS_IPV4_TX_CONN_TABLE_SIZE_MSG, NSS_IPV4_TX_CONN_CFG_RULE_MSG,
++	};
++#endif
++#ifdef NSS_DRV_IPV6_ENABLE
++	static const struct nss_conn_family v6 = {
++		1, NSS_IPV6_TX_CONN_TABLE_SIZE_MSG, NSS_IPV6_TX_CONN_CFG_RULE_MSG,
++	};
++#endif
++
++#ifdef NSS_DRV_IPV4_ENABLE
++	if (iface == NSS_IPV4_RX_INTERFACE)
++		return &v4;
++#endif
++#ifdef NSS_DRV_IPV6_ENABLE
++	if (iface == NSS_IPV6_RX_INTERFACE)
++		return &v6;
++#endif
++	return NULL;
++}
++
++bool nss_conn_table_message(const struct nss_cmn_msg *ncm)
++{
++	const struct nss_conn_family *family = nss_conn_family(ncm->interface);
++
++	return family && (ncm->type == family->size || ncm->type == family->cfg);
++}
++
++static void nss_conn_put(void)
++{
++	spin_lock_bh(&nss_conn_lock);
++	if (!--nss_conn_users)
++		wake_up_all(&nss_conn_idle);
++	spin_unlock_bh(&nss_conn_lock);
++}
++
++static bool nss_conn_valid_len(struct device *dev, u32 len)
++{
++	return len && len <= dma_max_mapping_size(dev) && get_order(len) <= MAX_PAGE_ORDER;
++}
++
++static int nss_conn_alloc(struct nss_conn_dma *record, struct device *dev,
++			  u32 len)
++{
++	record->dev = dev;
++	record->len = len;
++	record->order = get_order(len);
++	record->direction = DMA_TO_DEVICE;
++	record->cpu = __get_free_pages(GFP_ATOMIC | __GFP_NOWARN | __GFP_ZERO,
++				       record->order);
++	if (!record->cpu)
++		return -ENOMEM;
++	return 0;
++}
++
++static int nss_conn_map(struct nss_conn_dma *record)
++{
++	record->dma = dma_map_single(record->dev, (void *)record->cpu,
++				     record->len, record->direction);
++	if (dma_mapping_error(record->dev, record->dma))
++		return -EIO;
++
++	record->mapped = true;
++	/* Both the wire address and the last byte must fit the FW window. */
++	if (record->dma > U32_MAX || record->len - 1 > U32_MAX - record->dma)
++		return -ERANGE;
++	return 0;
++}
++
++static void nss_conn_undo(struct nss_conn_dma dma[2])
++{
++	int i;
++
++	for (i = 1; i >= 0; i--)
++		if (dma[i].mapped)
++			dma_unmap_single(dma[i].dev, dma[i].dma,
++					 dma[i].len, dma[i].direction);
++	for (i = 1; i >= 0; i--)
++		if (dma[i].cpu)
++			free_pages(dma[i].cpu, dma[i].order);
++}
++
++static int nss_conn_send(struct nss_ctx_instance *ctx, unsigned int iface,
++			 unsigned int type, nss_ptr_t token, unsigned int count,
++			 const struct nss_conn_dma *dma)
++{
++	struct nss_conn_wire msg = {};
++	const unsigned int payload = 3 * sizeof(u32);
++
++	/* Assert the common wire view against both vendor message layouts. */
++#ifdef NSS_DRV_IPV4_ENABLE
++	BUILD_BUG_ON(offsetof(struct nss_ipv4_msg, msg) != offsetof(struct nss_conn_wire, count));
++	BUILD_BUG_ON(sizeof(struct nss_ipv4_rule_conn_get_table_size_msg) != 3 * sizeof(u32));
++	BUILD_BUG_ON(sizeof(struct nss_ipv4_rule_conn_cfg_msg) != 3 * sizeof(u32));
++#endif
++#ifdef NSS_DRV_IPV6_ENABLE
++	BUILD_BUG_ON(offsetof(struct nss_ipv6_msg, msg) != offsetof(struct nss_conn_wire, count));
++	BUILD_BUG_ON(sizeof(struct nss_ipv6_rule_conn_get_table_size_msg) != 3 * sizeof(u32));
++	BUILD_BUG_ON(sizeof(struct nss_ipv6_rule_conn_cfg_msg) != 3 * sizeof(u32));
++#endif
++	nss_cmn_msg_init(&msg.cm, iface, type, payload, NULL, (void *)(unsigned long)token);
++	msg.count = htonl(count);
++	if (dma) {
++		msg.ce = (u32)dma[0].dma;
++		msg.cme = (u32)dma[1].dma;
++	}
++	return nss_core_send_conn_cmd(ctx, &msg.cm, sizeof(msg.cm) + payload);
++}
++
++static void nss_conn_reset(struct nss_conn_request *req)
++{
++	req->phase = NSS_CONN_IDLE;
++	req->token = 0;
++	req->ctx = NULL;
++	req->requested = 0;
++	req->early_cfg_reply = false;
++	req->early_cfg_accepted = false;
++}
++
++int nss_conn_table_start(struct nss_ctx_instance *ctx, unsigned int iface, int count)
++{
++	const struct nss_conn_family *family = nss_conn_family(iface);
++	struct nss_conn_request *req, *other;
++	unsigned int reserved;
++	nss_ptr_t token;
++	int ret;
++
++	if (!family)
++		return -EINVAL;
++
++	req = &nss_conn_tables[family->slot];
++	other = &nss_conn_tables[family->slot ^ 1];
++	spin_lock_bh(&nss_conn_lock);
++	if (nss_conn_closing) {
++		ret = -ESHUTDOWN;
++		goto unlock;
++	}
++	if (req->phase != NSS_CONN_IDLE) {
++		ret = -EBUSY;
++		goto unlock;
++	}
++	/* The default shortcut is not a FW reconfiguration or retirement. */
++	if (count == NSS_FW_DEFAULT_NUM_CONN) {
++		ret = 0;
++		goto unlock;
++	}
++	reserved = max(other->accepted, other->requested);
++	if (count < NSS_MIN_NUM_CONN || (count & NSS_NUM_CONN_QUANTA_MASK) ||
++	    (u32)count > NSS_MAX_TOTAL_NUM_CONN_IPV4_IPV6 ||
++	    reserved > NSS_MAX_TOTAL_NUM_CONN_IPV4_IPV6 - (u32)count) {
++		ret = -EINVAL;
++		goto unlock;
++	}
++	if (nss_conn_token == U32_MAX) {
++		ret = -EOVERFLOW;
++		goto unlock;
++	}
++	token = ++nss_conn_token;
++	req->ctx = ctx;
++	req->requested = count;
++	req->token = token;
++	req->phase = NSS_CONN_SIZE;
++	nss_conn_users++;
++	spin_unlock_bh(&nss_conn_lock);
++
++	ret = nss_conn_send(ctx, iface, family->size, token, count, NULL);
++	if (ret != NSS_TX_SUCCESS) {
++		spin_lock_bh(&nss_conn_lock);
++		if (req->token == token && req->phase == NSS_CONN_SIZE)
++			nss_conn_reset(req);
++		spin_unlock_bh(&nss_conn_lock);
++	}
++	nss_conn_put();
++	if (ret == NSS_TX_SUCCESS)
++		return 0;
++	return ret == NSS_TX_FAILURE_QUEUE ? -ENOSPC : -EIO;
++
++unlock:
++	spin_unlock_bh(&nss_conn_lock);
++	return ret;
++}
++
++static void nss_conn_configure(struct nss_conn_request *req,
++			       struct nss_ctx_instance *ctx,
++			       const struct nss_conn_family *family,
++			       unsigned int iface, nss_ptr_t token,
++			       unsigned int count, u32 ce_len, u32 cme_len)
++{
++	struct nss_conn_dma dma[2] = {};
++	int ret;
++
++	if (!nss_conn_valid_len(ctx->dev, ce_len) || !nss_conn_valid_len(ctx->dev, cme_len)) {
++		ret = -EINVAL;
++		goto undo;
++	}
++
++	ret = nss_conn_alloc(&dma[0], ctx->dev, ce_len);
++	if (ret)
++		goto undo;
++	ret = nss_conn_alloc(&dma[1], ctx->dev, cme_len);
++	if (ret)
++		goto undo;
++	ret = nss_conn_map(&dma[0]);
++	if (ret)
++		goto undo;
++	ret = nss_conn_map(&dma[1]);
++	if (ret)
++		goto undo;
++
++	spin_lock_bh(&nss_conn_lock);
++	if (nss_conn_closing) {
++		spin_unlock_bh(&nss_conn_lock);
++		ret = -ESHUTDOWN;
++		goto undo;
++	}
++	/* Install records before TX: the response can arrive inside send. */
++	memcpy(req->dma, dma, sizeof(dma));
++	req->phase = NSS_CONN_CFG_SENDING;
++	spin_unlock_bh(&nss_conn_lock);
++
++	ret = nss_conn_send(ctx, iface, family->cfg, token, count, dma);
++	spin_lock_bh(&nss_conn_lock);
++	if (ret == NSS_TX_SUCCESS) {
++		if (!req->early_cfg_reply) {
++			req->phase = NSS_CONN_CFG;
++		} else if (req->early_cfg_accepted) {
++			WRITE_ONCE(req->accepted, count);
++			req->phase = NSS_CONN_ACTIVE;
++		} else {
++			req->phase = NSS_CONN_UNCERTAIN;
++		}
++		spin_unlock_bh(&nss_conn_lock);
++		return;
++	}
++	/* A reply is not a publication receipt. Definite TX failure wins. */
++	req->phase = NSS_CONN_ROLLBACK;
++	memset(req->dma, 0, sizeof(req->dma));
++	spin_unlock_bh(&nss_conn_lock);
++	ret = ret == NSS_TX_FAILURE_QUEUE ? -ENOSPC : -EIO;
++undo:
++	nss_conn_undo(dma);
++	spin_lock_bh(&nss_conn_lock);
++	nss_conn_reset(req);
++	spin_unlock_bh(&nss_conn_lock);
++	nss_warning("%px: connection table interface %u private setup failed: %d\n",
++		    ctx, iface, ret);
++}
++
++void nss_conn_table_rx(struct nss_ctx_instance *ctx, const struct nss_cmn_msg *ncm)
++{
++	const struct nss_conn_family *family = nss_conn_family(ncm->interface);
++	struct nss_conn_request *req;
++	u32 count, ce_len, cme_len;
++	bool ack;
++
++	/* Core has bounded the actual contiguous extent before dispatch. */
++	if (!family || !nss_conn_table_message(ncm) ||
++	    (unsigned int)ncm->response >= NSS_CMN_RESPONSE_NOTIFY)
++		return;
++	ack = ncm->response == NSS_CMN_RESPONSE_ACK;
++	if (ack && ncm->len < (ncm->type == family->size ? 3 : 1) * sizeof(u32))
++		return;
++
++	req = &nss_conn_tables[family->slot];
++	spin_lock_bh(&nss_conn_lock);
++	if (nss_conn_closing || req->ctx != ctx || !ncm->app_data ||
++	    req->token != ncm->app_data)
++		goto unlock;
++
++	/* Count is the first word of both immutable family payload layouts. */
++	if (ack) {
++		__be32 wire_count;
++
++		memcpy(&wire_count, ncm + 1, sizeof(wire_count));
++		count = ntohl(wire_count);
++	} else {
++		count = 0;
++	}
++	if (ncm->type == family->cfg && req->phase == NSS_CONN_CFG_SENDING) {
++		if (!req->early_cfg_reply) {
++			req->early_cfg_reply = true;
++			req->early_cfg_accepted = ack && count == req->requested;
++		}
++		goto unlock;
++	}
++	if (ncm->type == family->cfg && req->phase == NSS_CONN_CFG) {
++		if (ack && count == req->requested) {
++			WRITE_ONCE(req->accepted, count);
++			req->phase = NSS_CONN_ACTIVE;
++		} else {
++			/* Neither a NACK nor a malformed ACK retires FW DMA. */
++			req->phase = NSS_CONN_UNCERTAIN;
++			nss_warning("%px: interface %u CFG response %u error %u; retaining FW-visible tables\n",
++				    ctx, ncm->interface, ncm->response, ncm->error);
++		}
++		goto unlock;
++	}
++
++	if (ncm->type != family->size || req->phase != NSS_CONN_SIZE)
++		goto unlock;
++	if (!ack || count != req->requested) {
++		nss_warning("%px: interface %u SIZE response %u error %u rejected\n",
++			    ctx, ncm->interface, ncm->response, ncm->error);
++		nss_conn_reset(req);
++		goto unlock;
++	}
++	{
++		__be32 lengths[2];
++
++		memcpy(lengths, (const u8 *)(ncm + 1) + sizeof(u32), sizeof(lengths));
++		ce_len = ntohl(lengths[0]);
++		cme_len = ntohl(lengths[1]);
++	}
++	req->phase = NSS_CONN_PREPARING;
++	nss_conn_users++;
++	spin_unlock_bh(&nss_conn_lock);
++	nss_conn_configure(req, ctx, family, ncm->interface, ncm->app_data,
++			   count, ce_len, cme_len);
++	nss_conn_put();
++	return;
++
++unlock:
++	spin_unlock_bh(&nss_conn_lock);
++}
++
++int nss_conn_table_count(unsigned int iface)
++{
++	const struct nss_conn_family *family = nss_conn_family(iface);
++
++	return family ? READ_ONCE(nss_conn_tables[family->slot].accepted) : 0;
++}
++
++void nss_conn_table_close(void)
++{
++	bool retained = false;
++	int i;
++
++	spin_lock_bh(&nss_conn_lock);
++	nss_conn_closing = true;
++	spin_unlock_bh(&nss_conn_lock);
++	wait_event(nss_conn_idle, !READ_ONCE(nss_conn_users));
++
++	spin_lock_bh(&nss_conn_lock);
++	for (i = 0; i < ARRAY_SIZE(nss_conn_tables); i++) {
++		struct nss_conn_request *req = &nss_conn_tables[i];
++
++		if (req->phase == NSS_CONN_SIZE)
++			nss_conn_reset(req);
++		if (req->phase == NSS_CONN_CFG || req->phase == NSS_CONN_ACTIVE ||
++		    req->phase == NSS_CONN_UNCERTAIN)
++			retained = true;
++	}
++	spin_unlock_bh(&nss_conn_lock);
++	if (retained)
++		pr_warn_once("NSS: FW retirement unknown; connection table mappings retained\n");
++}
+diff --git a/nss_conn_table.h b/nss_conn_table.h
+new file mode 100644
+index 0000000..085f49c
+--- /dev/null
++++ b/nss_conn_table.h
+@@ -0,0 +1,16 @@
++/* SPDX-License-Identifier: BSD-2-Clause OR GPL-2.0-only */
++#ifndef __NSS_CONN_TABLE_H
++#define __NSS_CONN_TABLE_H
++
++struct nss_cmn_msg;
++struct nss_ctx_instance;
++
++bool nss_conn_table_message(const struct nss_cmn_msg *ncm);
++int nss_conn_table_start(struct nss_ctx_instance *ctx, unsigned int iface, int count);
++void nss_conn_table_rx(struct nss_ctx_instance *ctx, const struct nss_cmn_msg *ncm);
++int nss_conn_table_count(unsigned int iface);
++void nss_conn_table_close(void);
++
++int32_t nss_core_send_conn_cmd(struct nss_ctx_instance *ctx, struct nss_cmn_msg *msg, int size);
++
++#endif
+diff --git a/nss_core.c b/nss_core.c
+index 7354a1c..78c1d91 100644
+--- a/nss_core.c
++++ b/nss_core.c
+@@ -40,6 +40,7 @@
+ #include <linux/etherdevice.h>
+ #include <linux/skbuff_ref.h>
+ #include "nss_tx_rx_common.h"
++#include "nss_conn_table.h"
+ 
+ #ifdef NSS_DATA_PLANE_GENERIC_SUPPORT
+ #include "nss_data_plane.h"
+@@ -112,24 +113,6 @@ int nss_core_get_qos_mem_size(void)
+ 	return qos_mem_size;
+ }
+ 
+-/*
+- * nss_core_update_max_ipv4_conn()
+- *	Update the maximum number of configured IPv4 connections
+- */
+-void nss_core_update_max_ipv4_conn(int conn)
+-{
+-	max_ipv4_conn = conn;
+-}
+-
+-/*
+- * nss_core_update_max_ipv6_conn()
+- *	Update the maximum number of configured IPv6 connections
+- */
+-void nss_core_update_max_ipv6_conn(int conn)
+-{
+-	max_ipv6_conn = conn;
+-}
+-
+ #if (NSS_SKB_REUSE_SUPPORT == 1)
+ /*
+  * nss_core_set_max_reuse()
+@@ -403,40 +386,58 @@ void nss_core_unregister_subsys_dp(struct nss_ctx_instance *nss_ctx, uint32_t if
+  * nss_core_handle_nss_status_pkt()
+  *	Handle the metadata/status packet.
+  */
+-static void nss_core_handle_nss_status_pkt(struct nss_ctx_instance *nss_ctx, struct sk_buff *nbuf)
++static void nss_core_handle_nss_status_pkt(struct nss_ctx_instance *nss_ctx, struct sk_buff *nbuf,
++					   struct nss_ctx_instance *rx_ctx)
+ {
++	struct nss_cmn_msg header;
++	unsigned char *data;
+ 	struct nss_cmn_msg *ncm;
+ 	uint32_t expected_version = NSS_HLOS_MESSAGE_VERSION;
+ 	nss_core_rx_callback_t cb;
+ 	void *app_data;
+-	uint16_t nss_if;
++	unsigned int contiguous;
++	uint32_t nss_if;
+ 
+ 	if (skb_shinfo(nbuf)->nr_frags > 0) {
+-		ncm = (struct nss_cmn_msg *)skb_frag_address(&skb_shinfo(nbuf)->frags[0]);
++		const skb_frag_t *frag = &skb_shinfo(nbuf)->frags[0];
++		unsigned int offset = skb_frag_off(frag);
++
++		if (offset > PAGE_SIZE)
++			return;
++		contiguous = min_t(unsigned int, skb_frag_size(frag), PAGE_SIZE - offset);
++		data = skb_frag_address(frag);
+ 	} else {
+-		ncm = (struct nss_cmn_msg *)nbuf->data;
++		const unsigned char *end = skb_end_pointer(nbuf);
++
++		if (nbuf->data < nbuf->head || nbuf->data > end)
++			return;
++		contiguous = min_t(unsigned int, skb_headlen(nbuf), end - nbuf->data);
++		data = nbuf->data;
+ 	}
++	if (contiguous < sizeof(*ncm) || nbuf->len < sizeof(*ncm))
++		return;
++	memcpy(&header, data, sizeof(header));
+ 
+ 	/*
+ 	 * Save NSS interface number in local variable
+ 	 */
+-	nss_if = ncm->interface;
++	nss_if = header.interface;
+ 
+ 	/*
+ 	 * Check for version number
+ 	 */
+-	if (ncm->version != expected_version) {
++	if (header.version != expected_version) {
+ 		nss_warning("%px: Message %d for interface %d received with invalid version %d, expected version %d",
+-							nss_ctx, ncm->type, nss_if, ncm->version, expected_version);
++							nss_ctx, header.type, nss_if, header.version, expected_version);
+ 		return;
+ 	}
+ 
+ 	/*
+ 	 * Validate message size
+ 	 */
+-	if (ncm->len > nbuf->len) {
++	if (header.len > nbuf->len) {
+ 		nss_warning("%px: Message %d for interface %d received with invalid length %d, expected length %d",
+-							nss_ctx, ncm->type, nss_if, nbuf->len, ncm->len);
++							nss_ctx, header.type, nss_if, nbuf->len, header.len);
+ 		return;
+ 	}
+ 
+@@ -444,10 +445,28 @@ static void nss_core_handle_nss_status_pkt(struct nss_ctx_instance *nss_ctx, str
+ 	 * Check for validity of interface number
+ 	 */
+ 	if (nss_if >= NSS_MAX_NET_INTERFACES) {
+-		nss_warning("%px: Message %d received with invalid interface number %d", nss_ctx, ncm->type, nss_if);
++		nss_warning("%px: Message %d received with invalid interface number %d", nss_ctx, header.type, nss_if);
++		return;
++	}
++
++	/* Table replies never dispatch a firmware-supplied function pointer. */
++	if (nss_conn_table_message(&header)) {
++		struct {
++			struct nss_cmn_msg cm;
++			__be32 words[3];
++		} reply;
++		unsigned int len = nss_cmn_get_msg_len(&header);
++
++		if (rx_ctx != nss_ctx || len > contiguous || len > nbuf->len)
++			return;
++		memcpy(&reply, data, min_t(unsigned int, len, sizeof(reply)));
++		nss_conn_table_rx(nss_ctx, &reply.cm);
+ 		return;
+ 	}
+ 
++	if (!IS_ALIGNED((unsigned long)data, __alignof__(*ncm)))
++		return;
++	ncm = (struct nss_cmn_msg *)data;
+ 	cb = nss_ctx->nss_rx_interface_handlers[nss_if].cb;
+ 	app_data = nss_ctx->nss_rx_interface_handlers[nss_if].app_data;
+ 
+@@ -1052,6 +1071,7 @@ static inline void nss_core_rx_pbuf(struct nss_ctx_instance *nss_ctx, struct n2h
+ {
+ 	unsigned int interface_num = NSS_INTERFACE_NUM_GET(desc->interface_num);
+ 	unsigned int core_id = NSS_INTERFACE_NUM_GET_COREID(desc->interface_num);
++	struct nss_ctx_instance *rx_ctx = nss_ctx;
+ 	struct nss_shaper_bounce_registrant *reg = NULL;
+ 	int32_t status;
+ 
+@@ -1106,7 +1126,7 @@ static inline void nss_core_rx_pbuf(struct nss_ctx_instance *nss_ctx, struct n2h
+ 
+ 	case N2H_BUFFER_STATUS:
+ 		NSS_PKT_STATS_INC(&nss_ctx->nss_top->stats_drv[NSS_DRV_STATS_RX_STATUS]);
+-		nss_core_handle_nss_status_pkt(nss_ctx, nbuf);
++		nss_core_handle_nss_status_pkt(nss_ctx, nbuf, rx_ctx);
+ 		dev_kfree_skb_any(nbuf);
+ 		break;
+ 
+@@ -1840,13 +1860,15 @@ static void nss_core_init_nss(struct nss_ctx_instance *nss_ctx, struct nss_if_me
+ 		 * connections supported by the accelerator.
+ 		 */
+ #ifdef NSS_DRV_IPV4_ENABLE
+-		nss_ipv4_conn_cfg = max_ipv4_conn;
+-		nss_ipv4_update_conn_count(max_ipv4_conn);
++		ret = nss_ipv4_update_conn_count(max_ipv4_conn);
++		if (ret)
++			nss_warning("%px: IPv4 table request not admitted: %d\n", nss_ctx, ret);
+ #endif
+ 
+ #ifdef NSS_DRV_IPV6_ENABLE
+-		nss_ipv6_conn_cfg = max_ipv6_conn;
+-		nss_ipv6_update_conn_count(max_ipv6_conn);
++		ret = nss_ipv6_update_conn_count(max_ipv6_conn);
++		if (ret)
++			nss_warning("%px: IPv6 table request not admitted: %d\n", nss_ctx, ret);
+ #endif
+ 
+ #ifdef NSS_MEM_PROFILE_LOW
+@@ -2719,6 +2741,23 @@ static inline uint32_t nss_core_dma_map_single(struct device *dev, struct sk_buf
+ 	return (uint32_t)dma_map_single(dev, skb->head, nss_core_skb_tail_offset(skb), DMA_TO_DEVICE);
+ }
+ 
++static bool nss_core_map_linear_cmd(struct device *dev, void *cpu, u32 len, u32 *wire)
++{
++	dma_addr_t dma;
++
++	if (!len)
++		return false;
++	dma = dma_map_single(dev, cpu, len, DMA_TO_DEVICE);
++	if (dma_mapping_error(dev, dma))
++		return false;
++	if (dma > U32_MAX || len - 1 > U32_MAX - dma) {
++		dma_unmap_single(dev, dma, len, DMA_TO_DEVICE);
++		return false;
++	}
++	*wire = (u32)dma;
++	return true;
++}
++
+ #if (NSS_SKB_REUSE_SUPPORT == 1)
+ /*
+  * nss_core_skb_can_reuse
+@@ -2910,9 +2949,13 @@ static inline int32_t nss_core_send_buffer_simple_skb(struct nss_ctx_instance *n
+ 	 * and then map Rx over the entire buffer.
+ 	 */
+ 	sz = max((uint16_t)nss_core_skb_tail_offset(nbuf), (uint16_t)(nss_ctx->max_buf_size + NET_SKB_PAD));
+-	frag0phyaddr = (uint32_t)dma_map_single(nss_ctx->dev, nbuf->head, sz, DMA_TO_DEVICE);
+-	if (unlikely(dma_mapping_error(nss_ctx->dev, frag0phyaddr))) {
+-		goto no_reuse;
++	if (buffer_type == H2N_BUFFER_CTRL) {
++		if (!nss_core_map_linear_cmd(nss_ctx->dev, nbuf->head, sz, &frag0phyaddr))
++			goto no_reuse;
++	} else {
++		frag0phyaddr = (uint32_t)dma_map_single(nss_ctx->dev, nbuf->head, sz, DMA_TO_DEVICE);
++		if (unlikely(dma_mapping_error(nss_ctx->dev, frag0phyaddr)))
++			goto no_reuse;
+ 	}
+ 
+ 	/*
+@@ -2937,10 +2980,16 @@ no_reuse:
+ #endif
+ 
+ 	bit_flags &= ~H2N_BIT_FLAG_BUFFER_REUSABLE;
+-	frag0phyaddr = nss_core_dma_map_single(nss_ctx->dev, nbuf);
+-	if (unlikely(dma_mapping_error(nss_ctx->dev, frag0phyaddr))) {
+-		nss_warning("%px: DMA mapping failed for virtual address = %px", nss_ctx, nbuf->head);
+-		return 0;
++	if (buffer_type == H2N_BUFFER_CTRL) {
++		if (!nss_core_map_linear_cmd(nss_ctx->dev, nbuf->head,
++					    nss_core_skb_tail_offset(nbuf), &frag0phyaddr))
++			return 0;
++	} else {
++		frag0phyaddr = nss_core_dma_map_single(nss_ctx->dev, nbuf);
++		if (unlikely(dma_mapping_error(nss_ctx->dev, frag0phyaddr))) {
++			nss_warning("%px: DMA mapping failed for virtual address = %px", nss_ctx, nbuf->head);
++			return 0;
++		}
+ 	}
+ 
+ 	nss_core_write_one_descriptor(desc, buffer_type, frag0phyaddr, if_num,
+@@ -3388,7 +3437,8 @@ int32_t nss_core_send_buffer(struct nss_ctx_instance *nss_ctx, uint32_t if_num,
+  * nss_core_send_cmd()
+  *	Send command message to NSS
+  */
+-int32_t nss_core_send_cmd(struct nss_ctx_instance *nss_ctx, void *msg, int size, int buf_size)
++static int32_t __nss_core_send_cmd(struct nss_ctx_instance *nss_ctx, void *msg, int size, int buf_size,
++				   bool zero_tail)
+ {
+ 	struct nss_cmn_msg *ncm = (struct nss_cmn_msg *)msg;
+ 	int32_t status;
+@@ -3419,9 +3469,15 @@ int32_t nss_core_send_cmd(struct nss_ctx_instance *nss_ctx, void *msg, int size,
+ 		return NSS_TX_FAILURE;
+ 	}
+ 
+-	memcpy(skb_put(nbuf, buf_size), (void *)ncm, size);
++	if (zero_tail) {
++		memcpy(skb_put(nbuf, size), ncm, size);
++		skb_put_zero(nbuf, buf_size - size);
++	} else {
++		memcpy(skb_put(nbuf, buf_size), ncm, size);
++	}
+ 
+-	status = nss_core_send_buffer(nss_ctx, 0, nbuf, NSS_IF_H2N_CMD_QUEUE, H2N_BUFFER_CTRL, H2N_BIT_FLAG_BUFFER_REUSABLE);
++	status = nss_core_send_buffer(nss_ctx, 0, nbuf, NSS_IF_H2N_CMD_QUEUE, H2N_BUFFER_CTRL,
++				      zero_tail ? 0 : H2N_BIT_FLAG_BUFFER_REUSABLE);
+ 	if (status != NSS_CORE_STATUS_SUCCESS) {
+ 		dev_kfree_skb_any(nbuf);
+ 		NSS_PKT_STATS_INC(&nss_ctx->nss_top->stats_drv[NSS_DRV_STATS_TX_CMD_QUEUE_FULL]);
+@@ -3434,6 +3490,24 @@ int32_t nss_core_send_cmd(struct nss_ctx_instance *nss_ctx, void *msg, int size,
+ 	return status;
+ }
+ 
++int32_t nss_core_send_cmd(struct nss_ctx_instance *nss_ctx, void *msg, int size, int buf_size)
++{
++	if (size < (int)sizeof(struct nss_cmn_msg) || size > buf_size)
++		return NSS_TX_FAILURE_BAD_PARAM;
++	if (nss_conn_table_message(msg))
++		return NSS_TX_FAILURE_NOT_SUPPORTED;
++	return __nss_core_send_cmd(nss_ctx, msg, size, buf_size, false);
++}
++
++/* Internal transport: only the admitted transaction builds these messages. */
++int32_t nss_core_send_conn_cmd(struct nss_ctx_instance *ctx, struct nss_cmn_msg *msg, int size)
++{
++	if (size < (int)sizeof(*msg) || size > NSS_NBUF_PAYLOAD_SIZE ||
++	    !nss_conn_table_message(msg) || nss_cmn_get_msg_len(msg) > size)
++		return NSS_TX_FAILURE_BAD_PARAM;
++	return __nss_core_send_cmd(ctx, msg, nss_cmn_get_msg_len(msg), NSS_NBUF_PAYLOAD_SIZE, true);
++}
++
+ /*
+  * nss_core_send_packet()
+  *	Send data packet to NSS
+diff --git a/nss_core.h b/nss_core.h
+index b8b6aa8..2c0e757 100644
+--- a/nss_core.h
++++ b/nss_core.h
+@@ -1002,8 +1002,6 @@ extern uint32_t nss_core_unregister_msg_handler(struct nss_ctx_instance *nss_ctx
+ extern uint32_t nss_core_register_handler(struct nss_ctx_instance *nss_ctx, uint32_t interface, nss_core_rx_callback_t cb, void *app_data);
+ extern uint32_t nss_core_unregister_handler(struct nss_ctx_instance *nss_ctx, uint32_t interface);
+ extern void nss_core_init_handlers(struct nss_ctx_instance *nss_ctx);
+-void nss_core_update_max_ipv4_conn(int conn);
+-void nss_core_update_max_ipv6_conn(int conn);
+ void nss_core_update_qos_mem_size(int size);
+ int nss_core_get_qos_mem_size(void);
+ extern void nss_core_register_subsys_dp(struct nss_ctx_instance *nss_ctx, uint32_t if_num,
+diff --git a/nss_hal/nss_hal.c b/nss_hal/nss_hal.c
+index 072f2c8..cc9a27f 100644
+--- a/nss_hal/nss_hal.c
++++ b/nss_hal/nss_hal.c
+@@ -41,6 +41,7 @@
+ #include "nss_coredump.h"
+ #include "nss_sysctl.h"
+ #include "nss_tx_rx_common.h"
++#include "nss_conn_table.h"
+ #ifdef NSS_DATA_PLANE_GENERIC_SUPPORT
+ #include "nss_data_plane.h"
+ #endif
+@@ -949,6 +950,9 @@ static void __nss_hal_quiesce_control_group(void)
+ 	if (nss_hal_control_group_stopped)
+ 		return;
+ 	nss_hal_receive_group_closing = true;
++#endif
++	nss_conn_table_close();
++#ifdef NSS_HAL_IPQ807x_SUPPORT
+ #ifdef NSS_DATA_PLANE_GENERIC_SUPPORT
+ 	/* Join registration work while its ACK RX and core resources are live. */
+ 	nss_data_plane_stop_registration();
+@@ -1043,6 +1047,7 @@ int nss_hal_remove(struct platform_device *nss_dev)
+ #ifdef NSS_HAL_IPQ807x_SUPPORT
+ 	nss_hal_quiesce_receive_group();
+ #else
++	nss_conn_table_close();
+ 	nss_stats_clean();
+ 
+ 	/*
+diff --git a/nss_init.c b/nss_init.c
+index 570b5d8..3daadfd 100644
+--- a/nss_init.c
++++ b/nss_init.c
+@@ -1340,17 +1340,6 @@ static void __exit nss_cleanup(void)
+ 	/* Unpublish and join controls while core/clock resources and RX are live. */
+ 	nss_hal_quiesce_control_group();
+ 
+-	/*
+-	 * Unregister ipv4/6 specific sysctl and free allocated to connection tables
+-	 */
+-#ifdef NSS_DRV_IPV4_ENABLE
+-	nss_ipv4_free_conn_tables();
+-#endif
+-
+-#ifdef NSS_DRV_IPV6_ENABLE
+-	nss_ipv6_free_conn_tables();
+-#endif
+-
+ #ifdef NSS_DATA_PLANE_GENERIC_SUPPORT
+ 	nss_data_plane_destroy_delay_work();
+ #endif
+diff --git a/nss_ipv4.c b/nss_ipv4.c
+index d6fa9c6..5953250 100644
+--- a/nss_ipv4.c
++++ b/nss_ipv4.c
+@@ -21,6 +21,7 @@
+ #include <linux/sysctl.h>
+ #include <linux/mutex.h>
+ #include "nss_sysctl.h"
++#include "nss_conn_table.h"
+ #include "nss_dscp_map.h"
+ #include "nss_ipv4_stats.h"
+ #include "nss_ipv4_strings.h"
+@@ -38,17 +39,6 @@ struct nss_ipv4_pvt {
+ 	void *app_data;			/* Original app_data for sync msgs */
+ } nss_ipv4_pvt;
+ 
+-/*
+- * Private data structure for ipv4 connection information.
+- */
+-struct nss_ipv4_conn_table_info {
+-	uint32_t ce_table_size;		/* Size of connection table entry in NSS FW */
+-	uint32_t cme_table_size;	/* Size of connection match table entry in NSS FW */
+-	unsigned long ce_mem;		/* Start address for connection entry table */
+-	unsigned long cme_mem;		/* Start address for connection match entry table */
+-} nss_ipv4_ct_info;
+-
+-int nss_ipv4_conn_cfg = NSS_DEFAULT_NUM_CONN;
+ int nss_ipv4_accel_mode_cfg __read_mostly = 1;
+ 
+ static struct nss_dscp_map_entry mapping[NSS_DSCP_MAP_ARRAY_SIZE];
+@@ -71,20 +61,6 @@ static inline void nss_ipv4_dscp_map_usage(void)
+ 				NSS_DSCP_MAP_PRIORITY_MAX - 1);
+ }
+ 
+-/*
+- * nss_ipv4_get_total_conn_count()
+- *	 Returns the sum of IPv4 and IPv6 connections.
+- */
+-static uint32_t nss_ipv4_get_total_conn_count(int ipv4_num_conn)
+-{
+-
+-#ifdef NSS_DRV_IPV6_ENABLE
+-	return ipv4_num_conn + nss_ipv6_conn_cfg;
+-#else
+-	return ipv4_num_conn;
+-#endif
+-}
+-
+ /*
+  * nss_ipv4_rx_msg_handler()
+  *	Handle NSS -> HLOS messages for IPv4 bridge/route
+@@ -209,7 +185,7 @@ EXPORT_SYMBOL(nss_ipv4_dscp_action_get);
+  */
+ int nss_ipv4_max_conn_count(void)
+ {
+-	return nss_ipv4_conn_cfg;
++	return nss_conn_table_count(NSS_IPV4_RX_INTERFACE);
+ }
+ EXPORT_SYMBOL(nss_ipv4_max_conn_count);
+ 
+@@ -402,199 +378,9 @@ void nss_ipv4_register_handler(void)
+ 	nss_ipv4_strings_dentry_create();
+ }
+ 
+-/*
+- * nss_ipv4_conn_cfg_process_callback()
+- *	Call back function for the ipv4 connection configure process
+- */
+-static void nss_ipv4_conn_cfg_process_callback(void *app_data, struct nss_ipv4_msg *nim)
+-{
+-	struct nss_ipv4_rule_conn_cfg_msg *nirccm = &nim->msg.rule_conn_cfg;
+-	struct nss_ctx_instance *nss_ctx __maybe_unused = nss_ipv4_get_mgr();
+-
+-	if (nim->cm.response != NSS_CMN_RESPONSE_ACK) {
+-		nss_warning("%px: IPv4 connection configuration failed with error: %d\n", nss_ctx, nim->cm.error);
+-		nss_core_update_max_ipv4_conn(NSS_FW_DEFAULT_NUM_CONN);
+-		nss_ipv4_free_conn_tables();
+-		return;
+-	}
+-
+-	nss_ipv4_conn_cfg = ntohl(nirccm->num_conn);
+-	nss_info("%px: IPv4 connection configuration success: %d\n", nss_ctx, nim->cm.error);
+-}
+-
+-/*
+- * nss_ipv4_conn_cfg_process()
+- *	Process request to configure number of ipv4 connections
+- */
+-static int nss_ipv4_conn_cfg_process(struct nss_ctx_instance *nss_ctx, int conn)
+-{
+-	struct nss_ipv4_msg nim;
+-	struct nss_ipv4_rule_conn_cfg_msg *nirccm;
+-	nss_tx_status_t nss_tx_status;
+-
+-	if ((!nss_ipv4_ct_info.ce_table_size) || (!nss_ipv4_ct_info.cme_table_size)) {
+-		nss_warning("%px: connection entry or connection match entry table size not available\n",
+-				nss_ctx);
+-		return -EINVAL;
+-	}
+-
+-	nss_info("%px: IPv4 supported connections: %d\n", nss_ctx, conn);
+-
+-	nss_ipv4_ct_info.ce_mem = __get_free_pages(GFP_ATOMIC | __GFP_NOWARN | __GFP_ZERO,
+-					get_order(nss_ipv4_ct_info.ce_table_size));
+-	if (!nss_ipv4_ct_info.ce_mem) {
+-		nss_warning("%px: Memory allocation failed for IPv4 Connections: %d\n",
+-							nss_ctx,
+-							conn);
+-		goto fail;
+-	}
+-
+-	nss_ipv4_ct_info.cme_mem = __get_free_pages(GFP_ATOMIC | __GFP_NOWARN | __GFP_ZERO,
+-					get_order(nss_ipv4_ct_info.cme_table_size));
+-	if (!nss_ipv4_ct_info.cme_mem) {
+-		nss_warning("%px: Memory allocation failed for IPv4 Connections: %d\n",
+-							nss_ctx,
+-							conn);
+-		goto fail;
+-	}
+-
+-	memset(&nim, 0, sizeof(struct nss_ipv4_msg));
+-	nss_ipv4_msg_init(&nim, NSS_IPV4_RX_INTERFACE, NSS_IPV4_TX_CONN_CFG_RULE_MSG,
+-		sizeof(struct nss_ipv4_rule_conn_cfg_msg), nss_ipv4_conn_cfg_process_callback, NULL);
+-
+-	nirccm = &nim.msg.rule_conn_cfg;
+-	nirccm->num_conn = htonl(conn);
+-	nirccm->ce_mem = dma_map_single(nss_ctx->dev, (void *)nss_ipv4_ct_info.ce_mem, nss_ipv4_ct_info.ce_table_size, DMA_TO_DEVICE);
+-	if (unlikely(dma_mapping_error(nss_ctx->dev, nirccm->ce_mem))) {
+-		nss_warning("%px: DMA mapping failed for virtual address = %px", nss_ctx, (void *)nss_ipv4_ct_info.ce_mem);
+-		goto fail;
+-	}
+-
+-	nirccm->cme_mem = dma_map_single(nss_ctx->dev, (void *)nss_ipv4_ct_info.cme_mem, nss_ipv4_ct_info.cme_table_size, DMA_TO_DEVICE);
+-	if (unlikely(dma_mapping_error(nss_ctx->dev, nirccm->cme_mem))) {
+-		nss_warning("%px: DMA mapping failed for virtual address = %px", nss_ctx, (void *)nss_ipv4_ct_info.cme_mem);
+-		goto fail;
+-	}
+-
+-	nss_tx_status = nss_ipv4_tx(nss_ctx, &nim);
+-	if (nss_tx_status != NSS_TX_SUCCESS) {
+-		nss_warning("%px: nss_tx error setting IPv4 Connections: %d\n",
+-							nss_ctx,
+-							conn);
+-		goto fail;
+-	}
+-
+-	return 0;
+-
+-fail:
+-	nss_ipv4_free_conn_tables();
+-	return -EINVAL;;
+-}
+-
+-/*
+- * nss_ipv4_update_conn_count_callback()
+- *	Callback function for the ipv4 get connection info message.
+- */
+-static void nss_ipv4_update_conn_count_callback(void *app_data, struct nss_ipv4_msg *nim)
+-{
+-	struct nss_ipv4_rule_conn_get_table_size_msg *nircgts = &nim->msg.size;
+-	struct nss_ctx_instance *nss_ctx = nss_ipv4_get_mgr();
+-
+-	if (nim->cm.response != NSS_CMN_RESPONSE_ACK) {
+-		nss_warning("%px: IPv4 fetch connection info failed with error: %d\n", nss_ctx, nim->cm.error);
+-		nss_core_update_max_ipv4_conn(NSS_FW_DEFAULT_NUM_CONN);
+-		return;
+-	}
+-
+-	nss_info("IPv4 get connection info success\n");
+-
+-	nss_ipv4_ct_info.ce_table_size = ntohl(nircgts->ce_table_size);
+-	nss_ipv4_ct_info.cme_table_size = ntohl(nircgts->cme_table_size);
+-
+-	if (nss_ipv4_conn_cfg_process(nss_ctx, ntohl(nircgts->num_conn)) != 0) {
+-		nss_warning("%px: IPv4 connection entry or connection match entry table size\
+-				not available\n", nss_ctx);
+-	}
+-
+-	return;
+-}
+-
+-/*
+- * nss_ipv4_update_conn_count()
+- *	Sets the maximum number of IPv4 connections.
+- *
+- * It first gets the connection tables size information from NSS FW
+- * and then configures the connections in NSS FW.
+- */
+-int nss_ipv4_update_conn_count(int ipv4_num_conn)
++int nss_ipv4_update_conn_count(int count)
+ {
+-	struct nss_ctx_instance *nss_ctx = nss_ipv4_get_mgr();
+-	struct nss_ipv4_msg nim;
+-	struct nss_ipv4_rule_conn_get_table_size_msg *nircgts;
+-	nss_tx_status_t nss_tx_status;
+-	uint32_t sum_of_conn;
+-
+-	/*
+-	 * By default, NSS FW is configured with default number of connections.
+-	 */
+-	if (ipv4_num_conn == NSS_FW_DEFAULT_NUM_CONN) {
+-		nss_info("%px: Default number of connections (%d) already configured\n", nss_ctx, ipv4_num_conn);
+-		return 0;
+-	}
+-
+-	/*
+-	 * The input should be multiple of 1024.
+-	 * Input for ipv4 and ipv6 sum together should not exceed 8k
+-	 * Min. value should be at least 256 connections. This is the
+-	 * minimum connections we will support for each of them.
+-	 */
+-	sum_of_conn = nss_ipv4_get_total_conn_count(ipv4_num_conn);
+-
+-	if ((ipv4_num_conn & NSS_NUM_CONN_QUANTA_MASK) ||
+-		(sum_of_conn > NSS_MAX_TOTAL_NUM_CONN_IPV4_IPV6) ||
+-		(ipv4_num_conn < NSS_MIN_NUM_CONN)) {
+-		nss_warning("%px: input supported connections (%d) does not adhere\
+-				specifications\n1) not multiple of 1024,\n2) is less than \
+-				min val: %d, OR\n	IPv4/6 total exceeds %d\n",
+-				nss_ctx,
+-				ipv4_num_conn,
+-				NSS_MIN_NUM_CONN,
+-				NSS_MAX_TOTAL_NUM_CONN_IPV4_IPV6);
+-		return -EINVAL;
+-	}
+-
+-	memset(&nim, 0, sizeof(struct nss_ipv4_msg));
+-	nss_ipv4_msg_init(&nim, NSS_IPV4_RX_INTERFACE, NSS_IPV4_TX_CONN_TABLE_SIZE_MSG,
+-		sizeof(struct nss_ipv4_rule_conn_get_table_size_msg), nss_ipv4_update_conn_count_callback, NULL);
+-
+-	nircgts = &nim.msg.size;
+-	nircgts->num_conn = htonl(ipv4_num_conn);
+-	nss_tx_status = nss_ipv4_tx(nss_ctx, &nim);
+-
+-	if (nss_tx_status != NSS_TX_SUCCESS) {
+-		nss_warning("%px: Send fetch connection info message failed\n", nss_ctx);
+-		return -EINVAL;
+-	}
+-
+-	return 0;
+-}
+-
+-/*
+- * nss_ipv4_free_conn_tables()
+- *	Frees memory allocated for connection tables
+- */
+-void nss_ipv4_free_conn_tables(void)
+-{
+-	if (nss_ipv4_ct_info.ce_mem) {
+-		free_pages(nss_ipv4_ct_info.ce_mem, get_order(nss_ipv4_ct_info.ce_table_size));
+-	}
+-
+-	if (nss_ipv4_ct_info.cme_mem) {
+-		free_pages(nss_ipv4_ct_info.cme_mem, get_order(nss_ipv4_ct_info.cme_table_size));
+-	}
+-
+-	memset(&nss_ipv4_ct_info, 0, sizeof(struct nss_ipv4_conn_table_info));
+-	return;
++	return nss_conn_table_start(nss_ipv4_get_mgr(), NSS_IPV4_RX_INTERFACE, count);
+ }
+ 
+ /*
+diff --git a/nss_ipv6.c b/nss_ipv6.c
+index 77a2685..2bf33a8 100644
+--- a/nss_ipv6.c
++++ b/nss_ipv6.c
+@@ -21,6 +21,7 @@
+ #include "linux/ipv6.h"
+ #include <linux/mutex.h>
+ #include "nss_sysctl.h"
++#include "nss_conn_table.h"
+ #include <nss_core.h>
+ #include "nss_dscp_map.h"
+ #include "nss_ipv6_stats.h"
+@@ -39,17 +40,6 @@ struct nss_ipv6_cfg_pvt {
+ 	void *app_data;			/* Original app_data for sync msgs */
+ } nss_ipv6_pvt;
+ 
+-/*
+- * Private data structure for ipv6 connection information.
+- */
+-struct nss_ipv6_conn_table_info {
+-	uint32_t ce_table_size;		/* Size of connection entry table in NSS FW */
+-	uint32_t cme_table_size;	/* Size of connection match entry table in NSS FW */
+-	unsigned long ce_mem;		/* Start address for connection entry table */
+-	unsigned long cme_mem;		/* Start address for connection match entry table */
+-} nss_ipv6_ct_info;
+-
+-int nss_ipv6_conn_cfg = NSS_DEFAULT_NUM_CONN;
+ int nss_ipv6_accel_mode_cfg __read_mostly = 1;
+ 
+ static struct nss_dscp_map_entry mapping[NSS_DSCP_MAP_ARRAY_SIZE];
+@@ -199,7 +189,7 @@ EXPORT_SYMBOL(nss_ipv6_dscp_action_get);
+  */
+ int nss_ipv6_max_conn_count(void)
+ {
+-	return nss_ipv6_conn_cfg;
++	return nss_conn_table_count(NSS_IPV6_RX_INTERFACE);
+ }
+ EXPORT_SYMBOL(nss_ipv6_max_conn_count);
+ 
+@@ -392,205 +382,9 @@ void nss_ipv6_register_handler(void)
+ 	nss_ipv6_strings_dentry_create();
+ }
+ 
+-/*
+- * nss_ipv6_conn_cfg_process_callback()
+- *	Call back function for the ipv6 connection configuration process.
+- */
+-static void nss_ipv6_conn_cfg_process_callback(void *app_data, struct nss_ipv6_msg *nim)
+-{
+-	struct nss_ipv6_rule_conn_cfg_msg *nirccm = &nim->msg.rule_conn_cfg;
+-	struct nss_ctx_instance *nss_ctx __maybe_unused = nss_ipv6_get_mgr();
+-
+-	if (nim->cm.response != NSS_CMN_RESPONSE_ACK) {
+-		nss_warning("%px: IPv6 connection configuration failed with error: %d\n", nss_ctx, nim->cm.error);
+-		nss_core_update_max_ipv6_conn(NSS_FW_DEFAULT_NUM_CONN);
+-		nss_ipv6_free_conn_tables();
+-		return;
+-	}
+-
+-	nss_ipv6_conn_cfg = ntohl(nirccm->num_conn);
+-
+-	nss_info("%px: IPv6 connection configuration success: %d\n", nss_ctx, nim->cm.error);
+-}
+-
+-/*
+- * nss_ipv6_conn_cfg_process()
+- *	Process request to configure number of ipv6 connections
+- */
+-static int nss_ipv6_conn_cfg_process(struct nss_ctx_instance *nss_ctx, int conn)
+-{
+-	struct nss_ipv6_msg nim;
+-	struct nss_ipv6_rule_conn_cfg_msg *nirccm;
+-	nss_tx_status_t nss_tx_status;
+-
+-	if ((!nss_ipv6_ct_info.ce_table_size) || (!nss_ipv6_ct_info.cme_table_size)) {
+-		nss_warning("%px: connection entry or connection match entry table size not available\n",
+-				nss_ctx);
+-		return -EINVAL;
+-	}
+-
+-	nss_info("%px: IPv6 supported connections: %d\n", nss_ctx, conn);
+-
+-	nss_ipv6_ct_info.ce_mem = __get_free_pages(GFP_ATOMIC | __GFP_NOWARN | __GFP_ZERO,
+-					get_order(nss_ipv6_ct_info.ce_table_size));
+-	if (!nss_ipv6_ct_info.ce_mem) {
+-		nss_warning("%px: Memory allocation failed for IPv6 Connections: %d\n",
+-							nss_ctx,
+-							conn);
+-		goto fail;
+-	}
+-	nss_info("%px: CE Memory allocated for IPv6 Connections: %d\n",
+-							nss_ctx,
+-							conn);
+-
+-	nss_ipv6_ct_info.cme_mem = __get_free_pages(GFP_ATOMIC | __GFP_NOWARN | __GFP_ZERO,
+-					get_order(nss_ipv6_ct_info.cme_table_size));
+-	if (!nss_ipv6_ct_info.cme_mem) {
+-		nss_warning("%px: Memory allocation failed for IPv6 Connections: %d\n",
+-							nss_ctx,
+-							conn);
+-		goto fail;
+-	}
+-	nss_info("%px: CME Memory allocated for IPv6 Connections: %d\n",
+-							nss_ctx,
+-							conn);
+-
+-	memset(&nim, 0, sizeof(struct nss_ipv6_msg));
+-	nss_ipv6_msg_init(&nim, NSS_IPV6_RX_INTERFACE, NSS_IPV6_TX_CONN_CFG_RULE_MSG,
+-		sizeof(struct nss_ipv6_rule_conn_cfg_msg), nss_ipv6_conn_cfg_process_callback, NULL);
+-
+-	nirccm = &nim.msg.rule_conn_cfg;
+-	nirccm->num_conn = htonl(conn);
+-	nirccm->ce_mem = dma_map_single(nss_ctx->dev, (void *)nss_ipv6_ct_info.ce_mem, nss_ipv6_ct_info.ce_table_size, DMA_TO_DEVICE);
+-	if (unlikely(dma_mapping_error(nss_ctx->dev, nirccm->ce_mem))) {
+-		nss_warning("%px: DMA mapping failed for virtual address = %px", nss_ctx, (void *)nss_ipv6_ct_info.ce_mem);
+-		goto fail;
+-	}
+-
+-	nirccm->cme_mem = dma_map_single(nss_ctx->dev, (void *)nss_ipv6_ct_info.cme_mem, nss_ipv6_ct_info.cme_table_size, DMA_TO_DEVICE);
+-	if (unlikely(dma_mapping_error(nss_ctx->dev, nirccm->cme_mem))) {
+-		nss_warning("%px: DMA mapping failed for virtual address = %px", nss_ctx, (void *)nss_ipv6_ct_info.cme_mem);
+-		goto fail;
+-	}
+-
+-	nss_tx_status = nss_ipv6_tx(nss_ctx, &nim);
+-	if (nss_tx_status != NSS_TX_SUCCESS) {
+-		nss_warning("%px: nss_tx error setting IPv6 Connections: %d\n",
+-						nss_ctx,
+-						conn);
+-		goto fail;
+-	}
+-
+-	return 0;
+-
+-fail:
+-	nss_ipv6_free_conn_tables();
+-	return -EINVAL;
+-}
+-
+-/*
+- * nss_ipv6_update_conn_count_callback()
+- *	Call back function for the ipv6 get connection info message.
+- */
+-static void nss_ipv6_update_conn_count_callback(void *app_data, struct nss_ipv6_msg *nim)
+-{
+-	struct nss_ipv6_rule_conn_get_table_size_msg *nircgts = &nim->msg.size;
+-	struct nss_ctx_instance *nss_ctx = nss_ipv6_get_mgr();
+-
+-	if (nim->cm.response != NSS_CMN_RESPONSE_ACK) {
+-		nss_warning("%px: IPv6 fetch connection info failed with error: %d\n", nss_ctx, nim->cm.error);
+-		nss_core_update_max_ipv6_conn(NSS_FW_DEFAULT_NUM_CONN);
+-		return;
+-	}
+-
+-	nss_info("IPv6 get connection info success\n");
+-
+-	nss_ipv6_ct_info.ce_table_size = ntohl(nircgts->ce_table_size);
+-	nss_ipv6_ct_info.cme_table_size = ntohl(nircgts->cme_table_size);
+-
+-	if (nss_ipv6_conn_cfg_process(nss_ctx, ntohl(nircgts->num_conn)) != 0) {
+-		nss_warning("%px: IPv6 connection entry or connection match entry table size\
+-				not available\n", nss_ctx);
+-	}
+-
+-	return;
+-}
+-
+-/*
+- * nss_ipv6_update_conn_count()
+- *	Sets the maximum number of IPv6 connections.
+- *
+- * It first gets the connection tables size information from NSS FW
+- * and then configures the connections in NSS FW.
+- */
+-int nss_ipv6_update_conn_count(int ipv6_num_conn)
+-{
+-	struct nss_ctx_instance *nss_ctx = nss_ipv6_get_mgr();
+-	struct nss_ipv6_msg nim;
+-	struct nss_ipv6_rule_conn_get_table_size_msg *nircgts;
+-	nss_tx_status_t nss_tx_status;
+-	uint32_t sum_of_conn;
+-
+-	/*
+-	 * By default, NSS FW is configured with default number of connections.
+-	 */
+-	if (ipv6_num_conn == NSS_FW_DEFAULT_NUM_CONN) {
+-		nss_info("%px: Default number of connections (%d) already configured\n", nss_ctx, ipv6_num_conn);
+-		return 0;
+-	}
+-
+-	/*
+-	 * Specifications for input
+-	 * 1) The input should be power of 2.
+-	 * 2) Input for ipv4 and ipv6 sum togther should not exceed 8k
+-	 * 3) Min. value should be at leat 256 connections. This is the
+-	 * minimum connections we will support for each of them.
+-	 */
+-	sum_of_conn = nss_ipv4_conn_cfg + ipv6_num_conn;
+-	if ((ipv6_num_conn & NSS_NUM_CONN_QUANTA_MASK) ||
+-		(sum_of_conn > NSS_MAX_TOTAL_NUM_CONN_IPV4_IPV6) ||
+-		(ipv6_num_conn < NSS_MIN_NUM_CONN)) {
+-		nss_warning("%px: input supported connections (%d) does not adhere\
+-				specifications\n1) not power of 2,\n2) is less than \
+-				min val: %d, OR\n	IPv4/6 total exceeds %d\n",
+-				nss_ctx,
+-				ipv6_num_conn,
+-				NSS_MIN_NUM_CONN,
+-				NSS_MAX_TOTAL_NUM_CONN_IPV4_IPV6);
+-		return -EINVAL;
+-	}
+-
+-	memset(&nim, 0, sizeof(struct nss_ipv6_msg));
+-	nss_ipv6_msg_init(&nim, NSS_IPV6_RX_INTERFACE, NSS_IPV6_TX_CONN_TABLE_SIZE_MSG,
+-		sizeof(struct nss_ipv6_rule_conn_get_table_size_msg), nss_ipv6_update_conn_count_callback, NULL);
+-
+-	nircgts = &nim.msg.size;
+-	nircgts->num_conn = htonl(ipv6_num_conn);
+-	nss_tx_status = nss_ipv6_tx(nss_ctx, &nim);
+-	if (nss_tx_status != NSS_TX_SUCCESS) {
+-		nss_warning("%px: Send acceleration mode message failed\n", nss_ctx);
+-		return -EINVAL;
+-	}
+-
+-	return 0;
+-}
+-
+-/*
+- * nss_ipv6_free_conn_tables()
+- *	Frees memory allocated for connection tables
+- */
+-void nss_ipv6_free_conn_tables(void)
++int nss_ipv6_update_conn_count(int count)
+ {
+-	if (nss_ipv6_ct_info.ce_mem) {
+-		free_pages(nss_ipv6_ct_info.ce_mem, get_order(nss_ipv6_ct_info.ce_table_size));
+-	}
+-
+-	if (nss_ipv6_ct_info.cme_mem) {
+-		free_pages(nss_ipv6_ct_info.cme_mem, get_order(nss_ipv6_ct_info.cme_table_size));
+-	}
+-
+-	memset(&nss_ipv6_ct_info, 0, sizeof(struct nss_ipv6_conn_table_info));
+-	return;
++	return nss_conn_table_start(nss_ipv6_get_mgr(), NSS_IPV6_RX_INTERFACE, count);
+ }
+ 
+ /*

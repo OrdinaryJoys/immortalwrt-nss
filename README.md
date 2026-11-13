@@ -1,8 +1,8 @@
 # ImmortalWRT AI Edition
 
-> **AX6 独立候选动态（2026-11-07）：** driver27 的 028/029 冷初始化与根入口宿主事务正在进行 stock 云验证。
-> 修复范围、精确来源及尚未关闭的 FW/provider/采样/性能问题见
-> [本批验证说明](docs/AX6_ROOT_HOST_CLOUD_VALIDATION_2026-11-07.md)。
+> **AX6 独立候选动态（2026-11-13）：** 本地 driver28 新增 030/031/032：probe 分配事务、空 coredump 写入、IPQ807x 私有 pdata 回滚与准入；已完成实际源码宿主组合验证及非作者复核，未提交、推送或编译本批固件。
+> 旧云成功批次仍锁定 driver27，不包含本批变更。修复范围、来源及尚未关闭的连接表/FW/provider/性能问题见
+> [本批验证与剩余事务](docs/AX6_NSS_ROOT_TRANSACTION_2026-11-13.md)；[上一批说明](docs/AX6_ROOT_HOST_CLOUD_VALIDATION_2026-11-07.md)仅作历史。
 > 这是候选分支，不是整机无故障、最高性能或可刷写批准；不修改其他硬件版本策略。
 
 > 本项目高通6.18由GPT5.5全程自动适配！

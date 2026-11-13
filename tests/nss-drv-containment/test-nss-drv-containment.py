@@ -78,7 +78,10 @@ def program(prepared,*,candidate=False,cases='driver_baseline_cases.c'):
     scaffolding=(HERE/'driver_nss_scaffolding.h').read_text().replace('HOST_EXTRACTED_STRUCTURES',structures).replace('HOST_COMMON_API_DECLARATIONS',declarations)
     fixtures=(HERE/'driver_api_fixtures.c').read_text().replace('HOST_EXTRACTED_FUNCTIONS','\n'.join(functions))
     notices=[row['text'].split('*/',1)[0]+'*/\n' for row in prepared.files.values() if row['text'].startswith('/*')]
-    controls=('#define HOST_CONTROL_GROUP 1\n' if candidate else '')+(HERE/'driver_control_fixtures.c').read_text()
+    controls='#define HOST_CONTROL_GROUP 1\n' if candidate else ''
+    if '#include "nss_conn_table.h"' in prepared.read(HAL):
+        controls+='#define HOST_CONNECTION_CONTROL 1\n'
+    controls+=(HERE/'driver_control_fixtures.c').read_text()
     return '\n'.join(notices)+(HERE/'driver_kernel_stubs.h').read_text()+scaffolding+globals_text+controls+fixtures+(HERE/'driver_control_cases.c').read_text()+(HERE/'driver_emergency_cases.c').read_text()+(HERE/cases).read_text()
 
 
