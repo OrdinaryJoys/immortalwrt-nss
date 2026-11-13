@@ -10,6 +10,10 @@ int main(void) {
     passed("baseline_down_registration_skips_readiness_control");
     setup(); assert(nss_data_plane_register_to_nss_dp(&nss_top_main.nss[0],1));
     struct platform_device device={.id=0}; assert(nss_hal_remove(&device)==0);
+#ifdef HOST_CONNECTION_CONTROL
+    assert(event_index(HOST_CONTROL_CLOSE,0)>=0);
+    assert(event_index(HOST_CONTROL_CLOSE,0)<event_index(HOST_NAPI_WAIT,0));
+#endif
     assert(nss_top_main.nss[1].int_ctx[0].irq==101 && !nss_top_main.nss[1].subsys_dp_register[1].ndev);
     passed("baseline_remove_clears_other_core_registry_before_other_irq_cleanup_control");
     setup(); nss_hal_clean_up_irq(&nss_top_main.nss[0].int_ctx[0]);

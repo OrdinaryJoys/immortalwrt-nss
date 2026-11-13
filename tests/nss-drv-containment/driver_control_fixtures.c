@@ -2,8 +2,18 @@
  * The actual HAL orchestrator must close and join each dependency in order.
  * Held host readers keep it blocked while actual receive resources stay live.
  */
+#if defined(HOST_CONNECTION_CONTROL) && !defined(HOST_CONTROL_GROUP)
+static void nss_conn_table_close(void) {
+    assert(!host_holds_rtnl);
+    host_observe(HOST_CONTROL_CLOSE,0);
+}
+#endif
 #ifdef HOST_CONTROL_GROUP
-enum host_control_kind { HOST_ROOT_CONTROL, HOST_FREQUENCY_CONTROL,
+enum host_control_kind {
+#ifdef HOST_CONNECTION_CONTROL
+                         HOST_CONN_CONTROL,
+#endif
+                         HOST_ROOT_CONTROL, HOST_FREQUENCY_CONTROL,
                          HOST_COREDUMP_CONTROL, HOST_CONTROL_COUNT };
 static pthread_mutex_t host_control_lock=PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t host_control_cond=PTHREAD_COND_INITIALIZER;
@@ -46,4 +56,7 @@ static void host_control_stop(int kind) {
 static void nss_root_controls_stop(void) { host_control_stop(HOST_ROOT_CONTROL); }
 static void nss_freq_work_quiesce(void) { host_control_stop(HOST_FREQUENCY_CONTROL); }
 static void nss_coredump_quiesce(void) { host_control_stop(HOST_COREDUMP_CONTROL); }
+#ifdef HOST_CONNECTION_CONTROL
+static void nss_conn_table_close(void) { host_control_stop(HOST_CONN_CONTROL); }
+#endif
 #endif

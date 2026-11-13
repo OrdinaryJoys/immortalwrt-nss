@@ -1,0 +1,75 @@
+From: NSS lifecycle repair review
+Subject: [PATCH 032] nss: ipq807x: complete private pdata validation before TCM writes
+
+Release the node reference even if managed pdata allocation fails. Reject
+an out-of-range core id before indexing the fixed-size context array.
+Unmap the locally acquired QGIC mapping when later IRQ parsing fails.
+Defer TCM clearing and its barrier until all IRQ numbers are validated.
+
+The successful return transfers these mappings to the caller unchanged.
+Do not dispose IRQ mappings, alter global frequency behavior, or touch
+context-owned mappings from this pre-return failure path.
+
+--- a/nss_hal/ipq807x/nss_hal_pvt.c
++++ b/nss_hal/ipq807x/nss_hal_pvt.c
+@@ -210,6 +210,7 @@
+ 
+ 	npd = devm_kzalloc(&pdev->dev, sizeof(struct nss_platform_data), GFP_KERNEL);
+ 	if (!npd) {
++		of_node_put(np);
+ 		return NULL;
+ 	}
+ 
+@@ -221,6 +222,11 @@
+ 		goto out;
+ 	}
+ 
++	if (npd->id >= NSS_MAX_CORES) {
++		pr_err("%s: invalid NSS core id %u\n", np->name, npd->id);
++		goto out;
++	}
++
+ 	/*
+ 	 * Read frequencies. If failure, load default values.
+ 	 */
+@@ -277,14 +283,6 @@
+ 		goto out;
+ 	}
+ 
+-	/*
+-	 * Clear TCM memory used by this core
+-	 */
+-	for (i = 0; i < resource_size(&res_vphys) ; i += 4)
+-		nss_write_32(npd->vmap, i, 0);
+-
+-	NSS_CORE_DSB();
+-
+ 	/*
+ 	 * Get IRQ numbers
+ 	 */
+@@ -296,6 +294,14 @@
+ 		}
+ 	}
+ 
++	/*
++	 * Clear TCM only after all fallible pdata validation has completed.
++	 */
++	for (i = 0; i < resource_size(&res_vphys) ; i += 4)
++		nss_write_32(npd->vmap, i, 0);
++
++	NSS_CORE_DSB();
++
+ 	nss_hal_dt_parse_features(np, npd);
+ 
+ 	of_node_put(np);
+@@ -302,6 +308,10 @@
+ 	return npd;
+ 
+ out:
++	if (npd->qgic_map) {
++		iounmap(npd->qgic_map);
++	}
++
+ 	if (npd->nmap) {
+ 		iounmap(npd->nmap);
+ 	}

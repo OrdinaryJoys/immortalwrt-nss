@@ -39,7 +39,7 @@ def mutations(program, actual_definition):
     original = function(program, name)
     if original != actual_definition:
         raise ValueError('generated HAL definition differs from actual prepared source')
-    for label, old, new, assertion, where in (
+    cases = [
         ('omit-root-join', '\tnss_root_controls_stop();', '',
          '!host_controls[kind-1].accepting && !host_controls[kind-1].active', 'host_control_stop'),
         ('omit-frequency-join', '\tnss_freq_work_quiesce();', '',
@@ -55,7 +55,12 @@ def mutations(program, actual_definition):
         ('join-under-rtnl', '\tnss_root_controls_stop();',
          '\trtnl_lock();\n\tnss_root_controls_stop();\n\trtnl_unlock();',
          '!host_holds_rtnl', 'host_control_stop'),
-    ):
+    ]
+    if '\tnss_conn_table_close();' in original:
+        cases.append(('omit-connection-join', '\tnss_conn_table_close();', '',
+                      '!host_controls[kind-1].accepting && !host_controls[kind-1].active',
+                      'host_control_stop'))
+    for label, old, new, assertion, where in cases:
         changed = replace_once(original, old, new)
         yield {'mutation': label, 'program': replace_once(program, original, changed),
                'expected_assertion': assertion, 'expected_assertion_function': where,
@@ -130,6 +135,12 @@ def main(argv=None):
         if report['compiler']['version']['returncode'] != 0:
             report['errors'].append({'stage': 'compiler-version', 'message': 'compiler --version failed'})
         persist(output, report)
+        initial = Prepared(args.candidate)
+        initial_hal = initial.read(RUNNER.HAL)
+        if '#include "nss_conn_table.h"' in initial_hal:
+            report['expected_exact_runtime_negatives'] = 14
+            if function(initial_hal, '__nss_hal_quiesce_control_group').count('\tnss_conn_table_close();') != 1:
+                raise ValueError('exact connection producer close required')
         for generic, case_file, expected in (
             (True, 'driver_candidate_cases.c', 20),
             (False, 'driver_nongeneric_cases.c', 3),
@@ -185,8 +196,9 @@ def main(argv=None):
         report['exact_runtime_negatives'] = sum(row.get('status') == 'PASS_EXACT_RUNTIME_ASSERTION'
                                                 for row in report['negative_runs'])
         passed = (not report['errors'] and len(report['positive_runs']) == 2 and
-                  report['positive_cases'] == 23 and len(report['negative_runs']) == 12 and
-                  report['exact_runtime_negatives'] == 12)
+                  report['positive_cases'] == 23 and
+                  len(report['negative_runs']) == report['expected_exact_runtime_negatives'] and
+                  report['exact_runtime_negatives'] == report['expected_exact_runtime_negatives'])
         report['status'] = 'PASS_HOST_SUBSTITUTES_ONLY' if passed else 'FAIL'
         persist(output, report, final=True)
     print(json.dumps({'status': report['status'], 'positive_cases': report['positive_cases'],
