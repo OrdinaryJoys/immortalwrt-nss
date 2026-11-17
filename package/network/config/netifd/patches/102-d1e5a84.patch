@@ -1,0 +1,42 @@
+From d1e5a8499071c430627c6e7ca4639a2ee1838c3e Mon Sep 17 00:00:00 2001
+From: Felix Fietkau <nbd@nbd.name>
+Date: Thu, 16 Jul 2026 19:48:47 +0200
+Subject: [PATCH] vlan: do not free the vlan device with live users on rename
+ failure
+
+When renaming the vlan device after a parent ifname change failed
+(combined name exceeding IFNAMSIZ), the device was freed immediately
+although bridges or interfaces may still hold device_user references
+to it, leaving dangling pointers that crash netifd on the next reload
+or ifdown. Mark the device absent, detach it from the parent and let
+device_free_unused() reap it once the last user is gone.
+
+Signed-off-by: Felix Fietkau <nbd@nbd.name>
+---
+ vlan.c | 13 ++++++++++---
+ 1 file changed, 10 insertions(+), 3 deletions(-)
+
+diff --git a/vlan.c b/vlan.c
+index 8bc5a06..374389f 100644
+--- a/vlan.c
++++ b/vlan.c
+@@ -158,9 +158,16 @@ static void vlan_dev_cb(struct device_user *dep, enum device_event ev)
+ 		vlan_hotplug_check(vldev, dep->dev);
+ 		vldev->dev.hidden = dep->dev->hidden;
+ 		if (snprintf(name, sizeof(name), "%s.%d", dep->dev->ifname,
+-			     vldev->id) >= (int)sizeof(name) ||
+-		    device_set_ifname(&vldev->dev, name))
+-			free_vlan_if(&vldev->dev);
++			     vldev->id) < (int)sizeof(name) &&
++		    !device_set_ifname(&vldev->dev, name))
++			break;
++
++		/* freeing the device here would leave dangling device_user
++		 * entries behind; detach it and let device_free_unused()
++		 * reap it once the last user is gone */
++		device_set_present(&vldev->dev, false);
++		device_remove_user(&vldev->dep);
++		device_free_unused();
+ 		break;
+ 	case DEV_EVENT_TOPO_CHANGE:
+ 		/* Propagate topo changes */

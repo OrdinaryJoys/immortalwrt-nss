@@ -1,0 +1,37 @@
+From 1e7cc9f5804f00c7816b7710985a1198faafdc45 Mon Sep 17 00:00:00 2001
+From: YAMAMOTO Masaya <pandax381@gmail.com>
+Date: Tue, 23 Jun 2026 03:30:56 +0900
+Subject: [PATCH] odhcpd: leave the receive loop on recvmsg errors
+
+recvmsg() errors other than EAGAIN restart the receive loop without a
+log entry, so an error that repeats keeps the loop busy without a
+trace. Leave the loop on such errors and log them; uloop calls the
+handler again while the socket is readable. Retry on EINTR.
+
+Signed-off-by: YAMAMOTO Masaya <pandax381@gmail.com>
+[reworded the commit message, dropped an else after continue]
+Link: https://github.com/openwrt/odhcpd/pull/403
+Signed-off-by: John Crispin <john@phrozen.org>
+---
+ src/odhcpd.c | 7 ++++---
+ 1 file changed, 4 insertions(+), 3 deletions(-)
+
+diff --git a/src/odhcpd.c b/src/odhcpd.c
+index b4e745e..d0afebc 100644
+--- a/src/odhcpd.c
++++ b/src/odhcpd.c
+@@ -455,10 +455,11 @@ static void odhcpd_receive_packets(struct uloop_fd *u, _o_unused unsigned int ev
+ 
+ 		ssize_t len = recvmsg(u->fd, &msg, MSG_DONTWAIT);
+ 		if (len < 0) {
+-			if (errno == EAGAIN)
+-				break;
+-			else
++			if (errno == EINTR)
+ 				continue;
++			if (errno != EAGAIN)
++				error("Failed to recvmsg %d (%m)", u->fd);
++			break;
+ 		}
+ 
+ 

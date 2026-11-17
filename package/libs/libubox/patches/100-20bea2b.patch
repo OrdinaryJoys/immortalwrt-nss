@@ -1,0 +1,130 @@
+From 20bea2ba777dec6e62e15415ded5ffd8be1a5f18 Mon Sep 17 00:00:00 2001
+From: Hauke Mehrtens <hauke@hauke-m.de>
+Date: Thu, 8 Oct 2026 23:12:17 +0200
+Subject: [PATCH] blobmsg_json: avoid out-of-bounds read on non-extended
+ attributes
+
+blobmsg_format_element() printed the attribute name whenever it formatted
+an element in a table context (without_name == false), calling
+blobmsg_name() unconditionally. blobmsg_name() blind-casts the attribute
+payload to a struct blobmsg_hdr and returns hdr->name, and
+blobmsg_format_string() then strlen()s that pointer with no length bound.
+
+A non-extended attribute carries no blobmsg name header. Such an
+attribute still passes blobmsg_check_attr(attr, false): the name check
+returns true for a non-extended attribute when no name is required, and a
+garbage attribute declaring itself BLOBMSG_TYPE_TABLE or BLOBMSG_TYPE_ARRAY
+has no entry in blob_type[] and so skips content validation entirely.
+Its raw bytes are then reinterpreted as a length-prefixed name string and
+strlen()d past the end of the attribute, leaking adjacent memory into the
+JSON output. Both ubus (via the monitor path) and rpcd forward
+attacker-controlled, non-revalidated UBUS_ATTR_DATA to this formatter.
+
+Guard the name access with blob_is_extended() so the name is only read
+from attributes that actually carry a name header. For extended
+attributes blobmsg_check_attr() has already verified the name is
+NUL-terminated within bounds, so the subsequent strlen() is safe.
+
+Add a regression test that crafts a non-extended, TABLE-typed attribute
+whose payload ends exactly at the allocation boundary; on an unfixed
+build the name strlen() reads past it, which the sanitized test catches.
+
+Reported-by: Erfan-Nasiri <https://github.com/Erfan-Nasiri>
+Fixes: 0918243e90e6 ("move json formatting to the blobmsg_json library")
+Assisted-by: Claude:claude-opus-4-8
+Link: https://github.com/openwrt/libubox/pull/57
+Signed-off-by: Hauke Mehrtens <hauke@hauke-m.de>
+---
+ blobmsg_json.c                   |  2 +-
+ tests/test-blobmsg-format-json.c | 69 ++++++++++++++++++++++++++++++++
+ 2 files changed, 70 insertions(+), 1 deletion(-)
+ create mode 100644 tests/test-blobmsg-format-json.c
+
+diff --git a/blobmsg_json.c b/blobmsg_json.c
+index 4865cd3..f7ec67c 100644
+--- a/blobmsg_json.c
++++ b/blobmsg_json.c
+@@ -240,7 +240,7 @@ static void blobmsg_format_element(struct strbuf *s, struct blob_attr *attr, boo
+ 	if (!blobmsg_check_attr(attr, false))
+ 		return;
+ 
+-	if (!without_name && blobmsg_name(attr)[0]) {
++	if (!without_name && blob_is_extended(attr) && blobmsg_name(attr)[0]) {
+ 		blobmsg_format_string(s, blobmsg_name(attr));
+ 		blobmsg_puts(s, ": ", s->indent ? 2 : 1);
+ 	}
+diff --git a/tests/test-blobmsg-format-json.c b/tests/test-blobmsg-format-json.c
+new file mode 100644
+index 0000000..be9eaba
+--- /dev/null
++++ b/tests/test-blobmsg-format-json.c
+@@ -0,0 +1,69 @@
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <stdint.h>
++
++#include "blobmsg.h"
++#include "blobmsg_json.h"
++
++/*
++ * Regression test for the type-confusion / out-of-bounds read reported in
++ * GHSA-r59q-rcp6-w5j2.
++ *
++ * A non-extended attribute carries no blobmsg name header, yet when such an
++ * attribute appears in a table context blobmsg_format_element() used to call
++ * blobmsg_name() on it unconditionally. blobmsg_name() blind-casts the raw
++ * payload to struct blobmsg_hdr and returns hdr->name, which is then strlen()d
++ * with no guarantee that a NUL terminator exists within the attribute's own
++ * bounds.
++ *
++ * This builds a tightly sized buffer so the crafted attribute's payload ends
++ * exactly at the end of the allocation. On an unfixed build the name strlen()
++ * reads past that boundary, which an ASAN build detects. The payload bytes are
++ * all non-NUL and non-'A'-free so that, even without ASAN, a leaked name would
++ * surface as 'A' characters in the JSON output.
++ */
++
++static void put_be32(uint8_t *p, uint32_t v)
++{
++	p[0] = v >> 24;
++	p[1] = v >> 16;
++	p[2] = v >> 8;
++	p[3] = v;
++}
++
++int main(void)
++{
++	/*
++	 * Layout, all 4-byte aligned:
++	 *   [0]  outer table container: non-extended, id TABLE, raw_len = size
++	 *   [4]  crafted child:         non-extended, id TABLE, raw_len = size - 4
++	 *   [8]  child payload:         non-NUL bytes up to the allocation end
++	 */
++	const size_t size = 64;
++	uint8_t *buf = malloc(size);
++	char *json;
++
++	if (!buf)
++		return EXIT_FAILURE;
++
++	put_be32(buf, (BLOBMSG_TYPE_TABLE << BLOB_ATTR_ID_SHIFT) | size);
++	put_be32(buf + 4, (BLOBMSG_TYPE_TABLE << BLOB_ATTR_ID_SHIFT) | (size - 4));
++	memset(buf + 8, 'A', size - 8);
++
++	json = blobmsg_format_json((struct blob_attr *)buf, true);
++
++	if (json) {
++		fprintf(stderr, "result: %s\n", json);
++		if (strchr(json, 'A')) {
++			fprintf(stderr, "FAIL: leaked payload bytes in output\n");
++			free(json);
++			free(buf);
++			return EXIT_FAILURE;
++		}
++		free(json);
++	}
++
++	free(buf);
++	return EXIT_SUCCESS;
++}

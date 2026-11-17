@@ -1,0 +1,19 @@
+Subject: vlandev: reject an explicitly empty VLAN identifier
+
+An unset VID keeps the existing default in vlandev_config_init().
+An explicitly empty string is not VLAN 0: strtoul() consumes no digits
+but returns zero and leaves the end pointer at the terminating NUL.
+Reject it before parsing without changing numeric VID 0 or alias lookup.
+
+--- a/vlandev.c
++++ b/vlandev.c
+@@ -257,6 +257,9 @@ vlandev_get_vid(struct device *dev, const char *id_str)
+ 	unsigned int *alias_id;
+ 	char *err;
+ 
++	if (!*id_str)
++		return -1;
++
+ 	id = strtoul(id_str, &err, 10);
+ 	if (err && *err) {
+ 		if (!dev)

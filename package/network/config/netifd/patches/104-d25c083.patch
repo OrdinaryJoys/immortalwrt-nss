@@ -1,0 +1,30 @@
+From d25c083f65ec45cd97bcab4407a7983af02fc5f9 Mon Sep 17 00:00:00 2001
+From: Felix Fietkau <nbd@nbd.name>
+Date: Thu, 16 Jul 2026 19:53:09 +0200
+Subject: [PATCH] device: validate extra vlan ranges against the valid vid
+ range
+
+Values were stored into uint16_t fields without an upper bound check,
+so an out of range entry like 65601 silently truncated to vlan 65 and
+enabled an unintended vlan on the bridge port. Reject vids outside
+1-4095, matching the checks in the bridge hotplug path.
+
+Signed-off-by: Felix Fietkau <nbd@nbd.name>
+---
+ device.c | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/device.c b/device.c
+index ba2ecff..8f4701f 100644
+--- a/device.c
++++ b/device.c
+@@ -340,7 +340,8 @@ static bool device_fill_vlan_range(struct device_vlan_range *r, const char *val)
+ 
+ 	if (*sep == '-')
+ 		cur_end = strtoul(sep + 1, &sep, 0);
+-	if (*sep || cur_end < cur_start)
++	if (*sep || cur_end < cur_start ||
++	    !cur_start || cur_end > 4095)
+ 		return false;
+ 
+ 	r->start = cur_start;

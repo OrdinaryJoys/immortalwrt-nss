@@ -1,0 +1,42 @@
+Subject: blobmsg_json: skip non-extended object members before separators
+
+The preceding bounds fix stops reading a missing name, but a table
+containing a non-extended child can still produce "{{}}". An object
+member must have a name header. Do not emit that member or its comma.
+Keep array entries and formatting a standalone value unchanged.
+
+--- a/blobmsg_json.c
++++ b/blobmsg_json.c
+@@ -300,6 +300,9 @@ static void blobmsg_format_json_list(struct strbuf *s, struct blob_attr *attr, si
+ 	s->indent_level++;
+ 	add_separator(s);
+ 	__blob_for_each_attr(pos, attr, rem) {
++		if (!array && !blob_is_extended(pos))
++			continue;
++
+ 		if (!first) {
+ 			blobmsg_puts(s, ",", 1);
+ 			add_separator(s);
+--- a/tests/test-blobmsg-format-json.c
++++ b/tests/test-blobmsg-format-json.c
+@@ -56,14 +56,12 @@ int main(void)
+ 	json = blobmsg_format_json((struct blob_attr *)buf, true);
+ 
+-	if (json) {
+-		fprintf(stderr, "result: %s\n", json);
+-		if (strchr(json, 'A')) {
+-			fprintf(stderr, "FAIL: leaked payload bytes in output\n");
+-			free(json);
+-			free(buf);
+-			return EXIT_FAILURE;
+-		}
++	if (!json || strcmp(json, "{}")) {
++		fprintf(stderr, "FAIL: invalid formatted object: %s\n",
++			json ? json : "(null)");
+ 		free(json);
++		free(buf);
++		return EXIT_FAILURE;
+ 	}
++	free(json);
+ 
+ 	free(buf);

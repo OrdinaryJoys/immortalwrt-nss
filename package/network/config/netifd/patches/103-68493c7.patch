@@ -1,0 +1,33 @@
+From 68493c7d96f4f5ab94293c7a511051646bf02ae9 Mon Sep 17 00:00:00 2001
+From: Felix Fietkau <nbd@nbd.name>
+Date: Thu, 16 Jul 2026 19:52:44 +0200
+Subject: [PATCH] device: release the parent claim when enabling a device fails
+
+simple_device_set_state claimed the parent before set_device_state,
+but a failure there (e.g. the netdev vanished before the ifindex
+lookup) left the parent claimed and administratively up for as long
+as the child device object existed.
+
+Signed-off-by: Felix Fietkau <nbd@nbd.name>
+---
+ device.c | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/device.c b/device.c
+index b0a3f2d..ba2ecff 100644
+--- a/device.c
++++ b/device.c
+@@ -212,7 +212,12 @@ simple_device_set_state(struct device *dev, bool state)
+ 		if (ret < 0)
+ 			return ret;
+ 	}
+-	return set_device_state(dev, state);
++
++	ret = set_device_state(dev, state);
++	if (ret && state && pdev)
++		device_release(&dev->parent);
++
++	return ret;
+ }
+ 
+ static struct device *

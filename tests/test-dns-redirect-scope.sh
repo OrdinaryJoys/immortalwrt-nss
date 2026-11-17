@@ -185,7 +185,7 @@ done
 
 # Packaging and implementation gates apply only to the source defaults.
 if [ "$#" -eq 0 ]; then
-	grep -Fxq 'PKG_RELEASE:=3' "$root/package/network/services/dnsmasq/Makefile" || fail 'package release not bumped'
+	grep -Fxq 'PKG_RELEASE:=6' "$root/package/network/services/dnsmasq/Makefile" || fail 'unexpected dnsmasq package release'
 	grep -Fq '$(INSTALL_BIN) ./files/dns-redirect-scope.sh $(1)/usr/libexec/dns-redirect-scope' \
 		"$root/package/network/services/dnsmasq/Makefile" || fail 'scope helper not installed'
 	pass 'scope helper installed for dnsmasq variants and package release bumped'

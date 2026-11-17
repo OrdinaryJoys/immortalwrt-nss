@@ -1,0 +1,58 @@
+From 079f447ccc0bf21b8f3657f16b4f91601e082d30 Mon Sep 17 00:00:00 2001
+From: Duc Anh Luu <luuducanh05051995@gmail.com>
+Date: Sat, 24 Oct 2026 16:28:20 +0700
+Subject: [PATCH] dhcpv6: drop relay messages without a client message
+
+A Relay-Forward whose RELAY_MSG option is empty, or a relay chain deeper
+than DHCPV6_HOP_COUNT_LIMIT, never yields a client message:
+handle_nested_message() returns without updating hdr, so
+handle_client_request() goes on treating the Relay-Forward header as a
+client message. update_nested_message() then recurses into the
+zero-length RELAY_MSG payload and reads its msg_type one byte past the
+end of the datagram, and rewrites that byte to RELAY_REPL if it happens
+to hold RELAY_FORW. Any client on the link can trigger this with a
+single unauthenticated DHCPv6 packet.
+
+Drop the request when no client message was found, and make
+update_nested_message() check the length before reading the header.
+
+Found with libFuzzer + AddressSanitizer, reproduced against the daemon.
+
+Signed-off-by: Duc Anh Luu <luuducanh05051995@gmail.com>
+[split from a combined fix, reworded the subject]
+Link: https://github.com/openwrt/odhcpd/pull/428
+Signed-off-by: John Crispin <john@phrozen.org>
+---
+ src/dhcpv6.c | 10 ++++++++--
+ 1 file changed, 8 insertions(+), 2 deletions(-)
+
+diff --git a/src/dhcpv6.c b/src/dhcpv6.c
+index b5d4ee8..723baba 100644
+--- a/src/dhcpv6.c
++++ b/src/dhcpv6.c
+@@ -238,7 +238,7 @@ static void handle_nested_message(uint8_t *data, size_t len, unsigned depth,
+ static void update_nested_message(uint8_t *data, size_t len, unsigned depth, ssize_t pdiff)
+ {
+ 	struct dhcpv6_relay_header *hdr = (struct dhcpv6_relay_header*)data;
+-	if (hdr->msg_type != DHCPV6_MSG_RELAY_FORW)
++	if (len < sizeof(*hdr) || hdr->msg_type != DHCPV6_MSG_RELAY_FORW)
+ 		return;
+ 
+ 	hdr->msg_type = DHCPV6_MSG_RELAY_REPL;
+@@ -696,9 +696,15 @@ static void handle_client_request(void *addr, void *data, size_t len,
+ 		[IOV_BOOTFILE_URL] = {NULL, 0}
+ 	};
+ 
+-	if (hdr->msg_type == DHCPV6_MSG_RELAY_FORW)
++	if (hdr->msg_type == DHCPV6_MSG_RELAY_FORW) {
+ 		handle_nested_message(data, len, 0, &hdr, &opts, &opts_end, iov);
+ 
++		/* No client message found inside the relay chain (truncated
++		 * RELAY_MSG or hop limit reached) */
++		if (hdr->msg_type == DHCPV6_MSG_RELAY_FORW)
++			return;
++	}
++
+ 	if (!IN6_IS_ADDR_MULTICAST((struct in6_addr *)dest_addr) && iov[IOV_NESTED].iov_len == 0 &&
+ 	    (hdr->msg_type == DHCPV6_MSG_SOLICIT || hdr->msg_type == DHCPV6_MSG_CONFIRM ||
+ 	     hdr->msg_type == DHCPV6_MSG_REBIND || hdr->msg_type == DHCPV6_MSG_INFORMATION_REQUEST))

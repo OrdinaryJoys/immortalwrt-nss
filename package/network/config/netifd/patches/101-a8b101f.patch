@@ -1,0 +1,54 @@
+From a8b101fe9a7c44704bed3796c0695caf9e947a98 Mon Sep 17 00:00:00 2001
+From: Felix Fietkau <nbd@nbd.name>
+Date: Thu, 16 Jul 2026 19:46:52 +0200
+Subject: [PATCH] vlan: clean up the kernel device when bringing the vlan up
+ fails
+
+When set_state(true) failed after system_vlan_add, the newly created
+8021q netdev was left behind in the kernel while netifd considered
+the device down. Delete it again on failure and propagate errors from
+system_vlan_add, tolerating a device left behind by a previous run.
+
+Signed-off-by: Felix Fietkau <nbd@nbd.name>
+---
+ vlan.c | 17 +++++++++++++++--
+ 1 file changed, 15 insertions(+), 2 deletions(-)
+
+diff --git a/vlan.c b/vlan.c
+index dad3c8b..8bc5a06 100644
+--- a/vlan.c
++++ b/vlan.c
+@@ -11,6 +11,7 @@
+  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+  * GNU General Public License for more details.
+  */
++#include <errno.h>
+ #include <string.h>
+ #include <stdlib.h>
+ #include <stdio.h>
+@@ -120,11 +121,23 @@ static int vlan_set_device_state(struct device *dev, bool up)
+ 	if (ret < 0)
+ 		return ret;
+ 
+-	system_vlan_add(vldev->dep.dev, vldev->id);
++	/* tolerate a vlan device left behind by a previous netifd run */
++	if (system_vlan_add(vldev->dep.dev, vldev->id) < 0 &&
++	    errno != EEXIST) {
++		ret = -1;
++		goto release;
++	}
++
+ 	ret = vldev->set_state(dev, true);
+ 	if (ret)
+-		device_release(&vldev->dep);
++		goto delete;
++
++	return 0;
+ 
++delete:
++	system_vlan_del(dev);
++release:
++	device_release(&vldev->dep);
+ 	return ret;
+ }
+ 

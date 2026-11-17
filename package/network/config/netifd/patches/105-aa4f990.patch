@@ -1,0 +1,29 @@
+From aa4f99092de27d8d265b60033241b76ac733379b Mon Sep 17 00:00:00 2001
+From: Felix Fietkau <nbd@nbd.name>
+Date: Thu, 16 Jul 2026 20:02:20 +0200
+Subject: [PATCH] extdev: fix use after free in extdev_hotplug_remove
+
+vlist_delete already removes the member from the external bridge and
+frees it through the vlist update callback. The subsequent call to
+extdev_bridge_remove_member operated on the freed structure and
+decremented the present counter a second time.
+
+Signed-off-by: Felix Fietkau <nbd@nbd.name>
+---
+ extdev.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/extdev.c b/extdev.c
+index eea22dd..a4aafd6 100644
+--- a/extdev.c
++++ b/extdev.c
+@@ -660,8 +660,8 @@ extdev_hotplug_remove(struct device *dev, struct device *member, struct blob_att
+ 	if (!ubm)
+ 		return UBUS_STATUS_NOT_FOUND;
+ 
++	/* the vlist update callback removes the member and frees it */
+ 	vlist_delete(&ebr->members, &ubm->node);
+-	extdev_bridge_remove_member(ubm);
+ 
+ 	return 0;
+ }

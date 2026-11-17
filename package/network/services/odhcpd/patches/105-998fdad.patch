@@ -1,0 +1,48 @@
+From 998fdad7e3b253b6586b5320565f277acf50077f Mon Sep 17 00:00:00 2001
+From: Michael Pfeifroth <micpf@westermo.com>
+Date: Tue, 21 Jul 2026 08:42:39 +0200
+Subject: [PATCH] dhcpv6-ia: zero-initialize first_key to silence
+ -Wmaybe-uninitialized
+
+first_key[] is only read on the path guarded by first_key_valid, and
+first_key_valid is only set to true after first_key has been populated
+by memcpy(). The code is therefore correct, but GCC's uninitialized
+analysis cannot correlate the boolean guard with the array's
+initialization state.
+
+With glibc's _FORTIFY_SOURCE enabled, memcpy() is expanded inline as
+__builtin___memcpy_chk(), and on aarch64 the 16-byte copy is further
+lowered to a single 128-bit access. GCC 12 then emits:
+
+  error: '*(__int128 unsigned *)(&first_key[0])' may be used
+         uninitialized [-Werror=maybe-uninitialized]
+
+which -Werror in CMakeLists.txt turns into a build failure on
+aarch64 glibc targets (e.g. NXP LS1046). musl and non-fortified
+builds are unaffected because they don't inline the fortified
+wrapper the same way.
+
+Zero-initialize the buffer to silence the false positive. Runtime
+behavior is unchanged: when first_key_valid is true, the buffer has
+already been overwritten by memcpy(first_key, a->key, ...).
+
+Signed-off-by: Michael Pfeifroth <micpf@westermo.com>
+Link: https://github.com/openwrt/odhcpd/pull/409
+Signed-off-by: John Crispin <john@phrozen.org>
+---
+ src/dhcpv6-ia.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/dhcpv6-ia.c b/src/dhcpv6-ia.c
+index e568fee..30765d5 100644
+--- a/src/dhcpv6-ia.c
++++ b/src/dhcpv6-ia.c
+@@ -969,7 +969,7 @@ static bool dhcpv6_ia_on_link(const struct dhcpv6_ia_hdr *ia, struct dhcpv6_leas
+ ssize_t dhcpv6_ia_handle_IAs(uint8_t *buf, size_t buflen, struct interface *iface,
+ 		const struct sockaddr_in6 *addr, const void *data, const uint8_t *end)
+ {
+-	uint8_t first_key[16];
++	uint8_t first_key[16] = {0};
+ 	bool first_key_valid = false;
+ 	const struct dhcpv6_client_header *hdr = data;
+ 	time_t now = odhcpd_time();
