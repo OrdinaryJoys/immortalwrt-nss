@@ -1,0 +1,63 @@
+--- a/root/sbin/fw4
++++ b/root/sbin/fw4
+@@ -31,23 +31,26 @@
+ 			;;
+ 		esac
+ 
+-		local batch saved had_state=0 result
++		local batch saved staged had_state=0 result
+ 		batch=$(mktemp /tmp/fw4-start.XXXXXX) || return 1
+ 		saved=$(mktemp /tmp/fw4-state.XXXXXX) || { rm -f "$batch"; return 1; }
++		staged=$(mktemp /tmp/fw4-state-new.XXXXXX) || { rm -f "$batch" "$saved"; return 1; }
+ 		if [ -f "$STATE" ]; then
+ 			cp -p "$STATE" "$saved" || { rm -f "$batch" "$saved"; return 1; }
+ 			had_state=1
+ 		fi
+ 		rm -f "$STATE"
+ 
+-		# A failed renderer can emit a valid flush prefix. Never apply it.
+-		ACTION=start utpl -S $MAIN > "$batch"
++		# Render into a staged file; the ucode writer must not touch the live
++		# state before the ruleset has been committed to nftables.
++		FW4_STATEFILE="$staged" ACTION=start utpl -S $MAIN > "$batch"
+ 		result=$?
+ 		if [ "$result" -eq 0 ]; then
+ 			nft $VERBOSE -f "$batch"
+ 			result=$?
+ 		fi
+ 		if [ "$result" -ne 0 ]; then
++			rm -f "$staged"
+ 			if [ "$had_state" -eq 1 ]; then
+ 				if ! cp -p "$saved" "$STATE"; then
+ 					echo "fw4: cannot restore previous state; backup retained at $saved" >&2
+@@ -58,10 +61,18 @@
+ 				rm -f "$STATE"
+ 			fi
+ 		else
++			# Publish the staged state atomically before running includes, so a
++			# crash can never leave "new state, old rules". If publish fails the
++			# ruleset is already committed: fail visibly and keep the backup.
++			if ! mv -f "$staged" "$STATE"; then
++				echo "fw4: ruleset committed but state publish failed; backup kept at $saved; staged state kept at $staged" >&2
++				rm -f "$batch"
++				return 1
++			fi
+ 			ACTION=includes utpl -S $MAIN
+ 			result=$?
+ 			if [ "$result" -ne 0 ]; then
+-				echo "fw4: ruleset committed but includes failed; state may be inconsistent" >&2
++				echo "fw4: ruleset committed but includes failed; state published, include rules may be missing" >&2
+ 				echo "fw4: fix includes and run 'fw4 reload'; refusing to replay externally visible includes automatically" >&2
+ 			fi
+ 		fi
+--- a/root/usr/share/ucode/fw4.uc
++++ b/root/usr/share/ucode/fw4.uc
+@@ -2,7 +2,7 @@
+ const uci = require("uci");
+ const ubus = require("ubus");
+ 
+-const STATEFILE = "/var/run/fw4.state";
++const STATEFILE = getenv("FW4_STATEFILE") || "/var/run/fw4.state";
+ 
+ const PARSE_LIST   = 0x01;
+ const FLATTEN_LIST = 0x02;
