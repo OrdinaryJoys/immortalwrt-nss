@@ -836,13 +836,7 @@ index 7354a1c..7fa7252 100644
  
 +int32_t nss_core_send_cmd(struct nss_ctx_instance *nss_ctx, void *msg, int size, int buf_size)
 +{
-+	/*
-+	 * Do not reject existing non-connection-table commands solely because
-+	 * their structure is larger than NSS_NBUF_PAYLOAD_SIZE. In particular
-+	 * struct nss_wifili_msg is larger than that buffer and is sent through
-+	 * this common path by nss_wifili_tx_msg().
-+	 */
-+	if (size < (int)sizeof(struct nss_cmn_msg))
++	if (size < (int)sizeof(struct nss_cmn_msg) || size > buf_size)
 +		return NSS_TX_FAILURE_BAD_PARAM;
 +	if (nss_conn_table_message(msg))
 +		return NSS_TX_FAILURE_NOT_SUPPORTED;

@@ -1,0 +1,27 @@
+From: AX6 lifecycle review
+Subject: [PATCH] qca-nss-drv: send actual wifili message length
+
+diff --git a/nss_wifili.c b/nss_wifili.c
+index e01ac27..06b9966 100644
+--- a/nss_wifili.c
++++ b/nss_wifili.c
+@@ -240,7 +240,18 @@ nss_tx_status_t nss_wifili_tx_msg(struct nss_ctx_instance *nss_ctx, struct nss_w
+ 		return NSS_TX_FAILURE;
+ 	}
+ 
+-	return nss_core_send_cmd(nss_ctx, msg, sizeof(*msg), NSS_NBUF_PAYLOAD_SIZE);
++	/*
++	 * Send the actual message length, not sizeof(struct nss_wifili_msg).
++	 * The union is larger than NSS_NBUF_PAYLOAD_SIZE in the current tree,
++	 * while each concrete wifili message (including init) fits.
++	 */
++	if (nss_cmn_get_msg_len(ncm) > NSS_NBUF_PAYLOAD_SIZE) {
++		nss_warning("%px: wifili message length out of range: %u", nss_ctx,
++			    nss_cmn_get_msg_len(ncm));
++		return NSS_TX_FAILURE;
++	}
++	return nss_core_send_cmd(nss_ctx, msg, nss_cmn_get_msg_len(ncm),
++				 NSS_NBUF_PAYLOAD_SIZE);
+ }
+ EXPORT_SYMBOL(nss_wifili_tx_msg);
+ 
