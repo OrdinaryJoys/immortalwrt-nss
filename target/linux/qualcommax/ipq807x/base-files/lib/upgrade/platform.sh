@@ -259,6 +259,15 @@ platform_do_upgrade() {
 	redmi,ax6-stock|\
 	xiaomi,ax3600-stock|\
 	xiaomi,ax9000-stock)
+		# Large-partition (merged single-rootfs) AX6/stock layout has no
+		# rootfs_1. The Xiaomi dual-boot flag path would target the running
+		# rootfs and u-boot_mod does not consume those flags. Upgrade the
+		# single UBI rootfs directly instead.
+		if [ -n "$(find_mtd_index rootfs)" ] && [ -z "$(find_mtd_index rootfs_1)" ]; then
+			CI_UBIPART="rootfs"
+			nand_do_upgrade "$1"
+			return 0
+		fi
 		CI_UBIPART="$(xiaomi_stock_get_upgrade_part)" ||
 			nand_do_upgrade_failed
 		if [ "$CI_UBIPART" = "rootfs_1" ]; then
