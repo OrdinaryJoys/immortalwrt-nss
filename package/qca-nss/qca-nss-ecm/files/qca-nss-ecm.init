@@ -89,14 +89,38 @@ get_front_end_mode() {
 }
 
 disable_packet_steering() {
-	local changed=0 status=0 rc
-	uci -q set network.globals.packet_steering='0' && changed=1 || status=$?
-	# An absent optional key is not an error. A failed deletion is.
-	if uci -q get network.globals.steering_flows >/dev/null; then
-		uci -q delete network.globals.steering_flows && changed=1 || { rc=$?; [ "$status" -ne 0 ] || status="$rc"; }
-	else
-		# Distinguish a missing optional key from an unreadable globals section.
-		uci -q show network.globals >/dev/null || { rc=$?; [ "$status" -ne 0 ] || status="$rc"; }
+	local changed=0 status=0 rc snapshot globals flows_present pending
+	# Do not commit another caller's uncommitted network changes.
+	pending=$(uci -q changes network) || status=$?
+	if [ "$status" -eq 0 ] && [ -n "$pending" ]; then
+		status=1
+	fi
+	if [ "$status" -eq 0 ]; then
+		snapshot=$(uci -q show network) || status=$?
+	fi
+	if [ "$status" -eq 0 ]; then
+		# netifd reads @globals[0]; a named section is not mandatory.
+		globals=$(printf '%s\n' "$snapshot" | awk -F= \
+			'$1 ~ /^network\.[^.]+$/ && $2 == "globals" {print $1; exit}') || status=$?
+		if [ "$status" -eq 0 ] && [ -n "$globals" ]; then
+			uci -q set "$globals.packet_steering=0" && changed=1 || status=$?
+			if flows_present=$(printf '%s\n' "$snapshot" | awk -v p="$globals.steering_flows=" \
+				'index($0,p)==1 {found=1} END {print found ? 1 : 0}'); then
+				if [ "$flows_present" -eq 1 ]; then
+					if uci -q get "$globals.steering_flows" >/dev/null; then
+						if uci -q delete "$globals.steering_flows"; then
+							changed=1
+						else
+							rc=$?; [ "$status" -ne 0 ] || status="$rc"
+						fi
+					else
+						rc=$?; [ "$status" -ne 0 ] || status="$rc"
+					fi
+				fi
+			else
+				rc=$?; [ "$status" -ne 0 ] || status="$rc"
+			fi
+		fi
 	fi
 	if [ "$changed" -ne 0 ]; then
 		uci -q commit network || { rc=$?; [ "$status" -ne 0 ] || status="$rc"; }

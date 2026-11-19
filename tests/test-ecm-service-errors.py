@@ -140,15 +140,49 @@ esac
         write('bin/uci', '''#!/bin/sh
 printf 'uci:%s\n' "$*" >&2
 case "$2" in
- set) exit "${SET_RC:-0}";;
- get) [ "${FLOWS_PRESENT:-1}" = 1 ] || exit 1; printf '64\n';;
- show) exit "${SHOW_RC:-0}";;
+ changes)
+    [ "${CHANGES_RC:-0}" -eq 0 ] || exit "$CHANGES_RC"
+    [ "${PENDING_EDITS:-0}" = 0 ] || echo "network.lan.ipaddr='192.0.2.10'"
+    exit 0;;
+ set)
+    [ "${GLOBALS_PRESENT:-1}" = 1 ] || exit 1
+    case "$3" in "network.${GLOBALS_NAME:-globals}."*) :;; *) exit 1;; esac
+    exit "${SET_RC:-0}";;
+ get)
+    [ "${GLOBALS_PRESENT:-1}" = 1 ] || exit 1
+    case "$3" in "network.${GLOBALS_NAME:-globals}.steering_flows") :;; *) exit 1;; esac
+    [ "${FLOWS_GET_RC:-0}" -eq 0 ] || exit "$FLOWS_GET_RC"
+    [ "${FLOWS_PRESENT:-1}" = 1 ] || exit 1
+    printf '64\n';;
+ show)
+    [ "${SHOW_RC:-0}" -eq 0 ] || exit "$SHOW_RC"
+    if [ "$3" = network ]; then
+       echo 'network.lan=interface'
+    else
+       [ "${GLOBALS_PRESENT:-1}" = 1 ] || exit 1
+       [ "$3" = "network.${GLOBALS_NAME:-globals}" ] || exit 1
+    fi
+    if [ "${GLOBALS_PRESENT:-1}" = 1 ]; then
+       echo "network.${GLOBALS_NAME:-globals}=globals"
+       echo "network.${GLOBALS_NAME:-globals}.packet_steering='0'"
+       [ "${FLOWS_PRESENT:-1}" = 0 ] || echo "network.${GLOBALS_NAME:-globals}.steering_flows='64'"
+       [ -z "${SECOND_GLOBALS_NAME:-}" ] || echo "network.$SECOND_GLOBALS_NAME=globals"
+    fi
+    exit 0;;
  delete) exit "${DELETE_RC:-0}";;
  commit) exit "${COMMIT_RC:-0}";;
  *) exit 98;;
 esac
 ''', True)
         write('bin/logger', '#!/bin/sh\nprintf "log:%s\\n" "$*" >&2\nexit "${LOGGER_RC:-0}"\n', True)
+        write('bin/awk', '''#!/bin/sh
+if [ "$1" = -F= ]; then
+    [ "${GLOBALS_SCAN_RC:-0}" -eq 0 ] || exit "$GLOBALS_SCAN_RC"
+elif [ "$1" = -v ]; then
+    [ "${FLOWS_SCAN_RC:-0}" -eq 0 ] || exit "$FLOWS_SCAN_RC"
+fi
+exec /usr/bin/awk "$@"
+''', True)
         write('bin/uname', '#!/bin/sh\necho 6.18.38\n', True)
         write('bin/sysctl', '''#!/bin/sh
 printf 'sysctl:%s\n' "$*" >&2
@@ -281,6 +315,48 @@ return "${OFFLOAD_SOURCE_RC:-0}"
         checks += 1
         print('PASS: ' + label)
 
+
+for action in ('boot', 'start', 'reload'):
+    check(action + ' accepts a valid network without optional globals', action,
+          env={'GLOBALS_PRESENT': '0'}, require=('steering-platform', 'offload-called'),
+          forbid=('uci:-q set network.', 'uci:-q delete network.', 'uci:-q commit network'))
+check('first typed globals section is used instead of an invented name', 'start',
+      env={'GLOBALS_NAME': 'cfgfirst', 'SECOND_GLOBALS_NAME': 'globals'},
+      require=('uci:-q set network.cfgfirst.packet_steering=0',
+               'uci:-q delete network.cfgfirst.steering_flows', 'procd-close'),
+      forbid=('uci:-q set network.globals.', 'uci:-q delete network.globals.'))
+check('unreadable network is not optional globals absence', 'start', expected=23,
+      env={'SHOW_RC': '23'}, require=('steering-platform', 'offload-called'),
+      forbid=('uci:-q set network.', 'uci:-q commit network', 'procd-close'))
+check('known steering_flows read failure is not optional absence', 'start', expected=24,
+      env={'FLOWS_GET_RC': '24'}, require=('steering-platform', 'offload-called'),
+      forbid=('uci:-q delete network.globals.steering_flows', 'procd-close'))
+check('failed globals scan is not optional absence', 'start', expected=25,
+      env={'GLOBALS_SCAN_RC': '25'}, require=('steering-platform', 'offload-called'),
+      forbid=('uci:-q set network.', 'uci:-q commit network', 'procd-close'))
+check('failed optional-key scan is not optional absence', 'start', expected=26,
+      env={'FLOWS_SCAN_RC': '26'}, require=('steering-platform', 'offload-called'),
+      forbid=('uci:-q delete network.globals.steering_flows', 'procd-close'))
+check('steering set error remains first when optional-key scan also fails', 'start', expected=17,
+      env={'SET_RC': '17', 'FLOWS_SCAN_RC': '26'},
+      require=('steering-platform', 'offload-called'),
+      forbid=('uci:-q delete network.globals.steering_flows', 'uci:-q commit network', 'procd-close'))
+check('foreign pending edits cannot be committed by ECM', 'start', expected=1,
+      env={'PENDING_EDITS': '1'}, require=('steering-platform', 'offload-called'),
+      forbid=('uci:-q show network', 'uci:-q set network.', 'uci:-q delete network.',
+              'uci:-q commit network', 'procd-close'))
+check('unreadable pending state cannot be treated as clean', 'start', expected=27,
+      env={'CHANGES_RC': '27'}, require=('steering-platform', 'offload-called'),
+      forbid=('uci:-q show network', 'uci:-q set network.', 'uci:-q commit network', 'procd-close'))
+check('reload pending query error remains first across later live errors', 'reload', expected=27,
+      env={'CHANGES_RC': '27', 'GENERIC_RC': '7', 'OFFLOAD_RC': '9'},
+      require=('steering-generic', 'offload-called', 'packet steering failed (status 27)',
+               'offload policy failed (status 9)'),
+      forbid=('uci:-q set network.', 'uci:-q commit network', 'steering-platform', 'procd-close'))
+check('start preserves earlier load-offload error when pending query also fails', 'start', expected=9,
+      env={'CHANGES_RC': '27', 'OFFLOAD_RC': '9'},
+      require=('steering-platform', 'offload-called'),
+      forbid=('uci:-q set network.', 'uci:-q commit network', 'procd-close'))
 
 for action in ('reload', 'start', 'restart'):
     check(action + ' with real offload helper succeeds', action, real_offload=True)

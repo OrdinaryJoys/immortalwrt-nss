@@ -70,6 +70,9 @@ with tempfile.TemporaryDirectory(prefix='ecm-full-reload-') as directory:
 ''')
     write(binary / 'uci', '''#!/bin/sh
 case "$*" in
+  '-q changes network') exit 0 ;;
+  '-q show network')
+    printf '%s\n' 'network.globals=globals' "network.globals.packet_steering='0'" "network.globals.steering_flows='64'" ;;
   '-q get network.@globals[0].steering_flows') echo 0 ;;
   '-q get network.globals.steering_flows') echo 64 ;;
   '-q set network.globals.packet_steering=0'|'-q delete network.globals.steering_flows'|'-q commit network') exit 0 ;;
