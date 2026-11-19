@@ -259,6 +259,12 @@ platform_do_upgrade() {
 	redmi,ax6-stock|\
 	xiaomi,ax3600-stock|\
 	xiaomi,ax9000-stock)
+		if [ -n "$(find_mtd_index rootfs)" ] && [ -z "$(find_mtd_index rootfs_1)" ]; then
+			echo "AX6-LARGE-PARTITION-BRANCH: upgrading single rootfs"
+			CI_UBIPART="rootfs"
+			nand_do_upgrade "$1"
+			return 0
+		fi
 		CI_UBIPART="$(xiaomi_stock_get_upgrade_part)" ||
 			nand_do_upgrade_failed
 		if [ "$CI_UBIPART" = "rootfs_1" ]; then
