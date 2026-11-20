@@ -13,39 +13,62 @@
  	u32 npeers;
  
  	if (len < sizeof(stats->npeers)) {
-@@ -180,21 +180,34 @@
+@@ -180,21 +180,58 @@
  		return false;
  	}
  
 -	required = sizeof(*stats) + (npeers - 1) * stride;
 -	if (len < required) {
-+	/* The firmware can advertise more peers than it actually puts in this
-+	 * message. Parse only the records that fit in the declared payload; never
-+	 * walk past cm.len. A truncated message is still useful for its complete
-+	 * leading records.
++	/* A payload shorter than one complete compiled-layout record cannot be
++	 * parsed. A payload whose length is an exact multiple of the legacy
++	 * 196-byte stride but not of the compiled stride is the foreign layout and
++	 * must be rejected before any peer is read. Otherwise allow a trailing
++	 * partial record, but only parse complete records that fit.
 +	 */
-+	available = (len - sizeof(stats->npeers)) / stride;
-+	if (!available) {
++	if (len < sizeof(*stats)) {
  		if (!ab->nss.peer_stats_len_warned) {
  			ab->nss.peer_stats_len_warned = true;
--			ath11k_warn(ab, "nss wifili peer stats: payload too short: "
+ 			ath11k_warn(ab, "nss wifili peer stats: payload too short: "
 -				    "len=%u required=%zu npeers=%u stride=%zu\n",
 -				    len, required, npeers, stride);
++				    "len=%u npeers=%u stride=%zu\n",
++				    len, npeers, stride);
++		}
++		return false;
++	}
++
++	if (((len - sizeof(stats->npeers)) % 196) == 0 &&
++	    ((len - sizeof(stats->npeers)) % stride) != 0) {
++		if (!ab->nss.peer_stats_len_warned) {
++			ab->nss.peer_stats_len_warned = true;
++			ath11k_warn(ab, "nss wifili peer stats: payload too short: "
++				    "len=%u npeers=%u stride=%zu\n",
++				    len, npeers, stride);
++		}
++		return false;
++	}
++
++	available = (len - sizeof(stats->npeers)) / stride;
++	if (!available) {
++		if (!ab->nss.peer_stats_len_warned) {
++			ab->nss.peer_stats_len_warned = true;
 +			ath11k_warn(ab, "nss wifili peer stats: no complete record: "
 +				    "len=%u npeers=%u stride=%zu\n",
 +				    len, npeers, stride);
  		}
  		return false;
-+	}
-+
-+	*parse_npeers = min_t(u32, npeers, available);
+ 	}
+ 
++	*parse_npeers = npeers;
++	if (*parse_npeers > available)
++		*parse_npeers = available;
 +	if (*parse_npeers < npeers && !ab->nss.peer_stats_len_warned) {
 +		ab->nss.peer_stats_len_warned = true;
 +		ath11k_warn(ab, "nss wifili peer stats: truncated: len=%u npeers=%u "
 +			    "parse_npeers=%u stride=%zu\n",
 +			    len, npeers, *parse_npeers, stride);
- 	}
- 
++	}
++
  	if (!ab->nss.peer_stats_layout_logged) {
  		ab->nss.peer_stats_layout_logged = true;
  		ath11k_info(ab, "nss wifili peer stats: len=%u npeers=%u stride=%zu\n",
@@ -54,7 +77,7 @@
  	}
  
  	return true;
-@@ -206,6 +219,7 @@
+@@ -206,6 +243,7 @@
  	struct nss_wifili_peer_stats *stats = &msg->msg.peer_stats.stats;
  	struct ath11k_peer *peer;
  	struct nss_wifili_peer_ctrl_stats *pstats = NULL;
@@ -62,7 +85,7 @@
  	int i, j;
  	u64 tx_packets, tx_bytes, tx_dropped;
  	u64 rx_packets, rx_bytes, rx_dropped;
-@@ -213,10 +227,10 @@
+@@ -213,10 +251,10 @@
  	if (!ab->nss.stats_enabled)
  		return;
  

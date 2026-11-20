@@ -283,16 +283,17 @@ required_line = "\trequired = sizeof(*stats) + (npeers - 1) * stride;\n"
 layout_log = "ath11k_info(ab, \"nss wifili peer stats: len="
 
 mutations = [
-    ("drop-length-bind", length_block, "\t(void)required;\n"),
+    ("drop-truncation-clamp",
+     "\tif (*parse_npeers > available)\n\t\t*parse_npeers = available;\n",
+     "\t(void)available;\n"),
+    ("parse-all-reported-peers",
+     "\tfor (i = 0; i < parse_npeers; i++) {",
+     "\tfor (i = 0; i < stats->npeers; i++) {"),
     ("drop-zero-peer-check", cap_condition,
      "if (npeers > ATH11K_NSS_PEER_STATS_MAX_PEERS) {"),
     ("drop-peers-cap", cap_condition, "if (!npeers) {"),
     ("always-log-layout", log_on, log_off),
     ("always-warn", warn_on, warn_off),
-    ("required-plus-one", required_line,
-     "\trequired = sizeof(*stats) + (npeers - 1) * stride + 1;\n"),
-    ("required-counts-all-peers", required_line,
-     "\trequired = sizeof(*stats) + npeers * stride;\n"),
     ("no-layout-log", layout_log, "ath11k_dbg(ab, 0, \"nss wifili peer stats: len="),
 ]
 if args.sanitize:

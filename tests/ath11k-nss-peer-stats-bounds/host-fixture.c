@@ -371,8 +371,8 @@ static void scenario_rejected(void)
     ath11k_nss_get_peer_stats(&ab, message.msg);
     check(warn_calls == 1 && info_calls == 0 && peer_lookups == 0,
           "truncated single-peer payload rejected");
-    check(strstr(last_warn, "no complete record") != NULL,
-          "truncated payload warning reports the missing complete record");
+    check(strstr(last_warn, "payload too short") != NULL,
+          "truncated payload warning reports the short length");
     message_drop(&message);
 }
 
@@ -524,6 +524,29 @@ static void scenario_foreign_layout(void)
 }
 #endif
 
+static void scenario_truncated_multi_peer(void)
+{
+    struct host_message message;
+
+    /* Firmware advertises two peers but cm.len only carries one complete
+     * record. The parser must use the one record that fits, warn once, and
+     * never look up the second peer. */
+    reset_world(true);
+    add_peer(0, 7);
+    message = message_new(HOST_PEER_COUNT_OFFSET + HOST_STRIDE);
+    message.stats->npeers = 2;
+    fill_record(record_at(&message, 0), 7, 1000);
+
+    ath11k_nss_get_peer_stats(&ab, message.msg);
+    check(warn_calls == 1 && info_calls == 1 && peer_lookups == 1,
+          "truncated message parses only the complete record");
+    check(strstr(last_warn, "truncated") != NULL,
+          "truncated message warning reports the mismatch");
+    check(peer_counters[0].tx_packets == 3006,
+          "truncated message still updates the complete peer");
+    message_drop(&message);
+}
+
 static void report(void)
 {
     printf("{\"wide\":%d,\"checks\":%u,\"failures\":%u,"
@@ -545,6 +568,7 @@ int main(void)
     scenario_rejected();
     scenario_disabled();
     scenario_same_layout();
+    scenario_truncated_multi_peer();
     scenario_probe_after_rejection();
     scenario_foreign_layout();
     report();
