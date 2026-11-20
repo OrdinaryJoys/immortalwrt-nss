@@ -178,6 +178,22 @@ nand_detach_ubi() {
 	fi
 }
 
+nand_verify_ubi_volume() {
+	local vol="$1"
+	local expected="$2"
+	local sysfs="${UBI_SYSFS_ROOT:-/sys}/class/ubi/${vol}/data_bytes"
+	[ -n "$vol" ] && [ -n "$expected" ] || return 1
+	[ -r "$sysfs" ] || {
+		echo "UBI verification unavailable for ${vol}"
+		return 1
+	}
+	[ "$(cat "$sysfs")" = "$expected" ] || {
+		echo "UBI volume ${vol} size mismatch: expected ${expected}, got $(cat "$sysfs")"
+		return 1
+	}
+	return 0
+}
+
 nand_upgrade_prepare_ubi() {
 	local rootfs_length="$1"
 	local rootfs_type="$2"
@@ -212,10 +228,19 @@ nand_upgrade_prepare_ubi() {
 	[ "$root_ubivol" ] && { nand_remove_ubiblock $root_ubivol || return 1; }
 	[ "$data_ubivol" ] && { nand_remove_ubiblock $data_ubivol || return 1; }
 
-	# kill volumes
-	[ "$kern_ubivol" ] && ubirmvol /dev/$kern_ubidev -N "$CI_KERNPART" || :
-	[ "$root_ubivol" ] && ubirmvol /dev/$root_ubidev -N "$CI_ROOTPART" || :
-	[ "$data_ubivol" ] && ubirmvol /dev/$root_ubidev -N rootfs_data || :
+	# kill volumes; a failed removal must stop the upgrade before mkvol/write
+	if [ "$kern_ubivol" ] && ! ubirmvol /dev/$kern_ubidev -N "$CI_KERNPART"; then
+		echo "cannot remove kernel volume $CI_KERNPART"
+		return 1
+	fi
+	if [ "$root_ubivol" ] && ! ubirmvol /dev/$root_ubidev -N "$CI_ROOTPART"; then
+		echo "cannot remove rootfs volume $CI_ROOTPART"
+		return 1
+	fi
+	if [ "$data_ubivol" ] && ! ubirmvol /dev/$root_ubidev -N rootfs_data; then
+		echo "cannot remove rootfs_data volume"
+		return 1
+	fi
 
 	# create provisioning vol
 	if [ "${UPGRADE_OPT_ADD_PROVISIONING:-0}" -gt 0 ]; then
@@ -290,7 +315,14 @@ nand_upgrade_ubifs() {
 
 	local ubidev="$( nand_find_ubi "$CI_UBIPART" )"
 	local root_ubivol="$(nand_find_volume $ubidev "$CI_ROOTPART")"
-	$cmd < "$ubifs_file" | ubiupdatevol /dev/$root_ubivol -s "$ubifs_length" -
+	if ! $cmd < "$ubifs_file" | ubiupdatevol /dev/$root_ubivol -s "$ubifs_length" -; then
+		echo "failed to write UBIFS rootfs volume"
+		return 1
+	fi
+	if ! nand_verify_ubi_volume "$root_ubivol" "$ubifs_length"; then
+		echo "UBIFS rootfs volume verification failed"
+		return 1
+	fi
 }
 
 # Write the FIT image to UBI kernel volume
@@ -304,7 +336,14 @@ nand_upgrade_fit() {
 
 	local fit_ubidev="$(nand_find_ubi "$CI_UBIPART")"
 	local fit_ubivol="$(nand_find_volume $fit_ubidev "$CI_KERNPART")"
-	$cmd < "$fit_file" | ubiupdatevol /dev/$fit_ubivol -s "$fit_length" -
+	if ! $cmd < "$fit_file" | ubiupdatevol /dev/$fit_ubivol -s "$fit_length" -; then
+		echo "failed to write FIT kernel volume"
+		return 1
+	fi
+	if ! nand_verify_ubi_volume "$fit_ubivol" "$fit_length"; then
+		echo "FIT kernel volume verification failed"
+		return 1
+	fi
 }
 
 # Write images in the TAR file to MTD partitions and/or UBI volumes as required
@@ -347,8 +386,15 @@ nand_upgrade_tar() {
 	if [ "$rootfs_length" ]; then
 		local ubidev="$( nand_find_ubi "${CI_ROOT_UBIPART:-$CI_UBIPART}" )"
 		local root_ubivol="$( nand_find_volume $ubidev "$CI_ROOTPART" )"
-		$cmd < "$tar_file" | tar xOf - "$board_dir/root" | \
-			ubiupdatevol /dev/$root_ubivol -s "$rootfs_length" -
+		if ! $cmd < "$tar_file" | tar xOf - "$board_dir/root" | \
+			ubiupdatevol /dev/$root_ubivol -s "$rootfs_length" -; then
+			echo "failed to write rootfs volume"
+			return 1
+		fi
+		if ! nand_verify_ubi_volume "$root_ubivol" "$rootfs_length"; then
+			echo "rootfs volume verification failed"
+			return 1
+		fi
 	fi
 	if [ "$kernel_length" ]; then
 		if [ "$kernel_mtd" ]; then
@@ -363,8 +409,15 @@ nand_upgrade_tar() {
 		else
 			local ubidev="$( nand_find_ubi "${CI_KERN_UBIPART:-$CI_UBIPART}" )"
 			local kern_ubivol="$( nand_find_volume $ubidev "$CI_KERNPART" )"
-			$cmd < "$tar_file" | tar xOf - "$board_dir/kernel" | \
-				ubiupdatevol /dev/$kern_ubivol -s "$kernel_length" -
+			if ! $cmd < "$tar_file" | tar xOf - "$board_dir/kernel" | \
+				ubiupdatevol /dev/$kern_ubivol -s "$kernel_length" -; then
+				echo "failed to write kernel volume"
+				return 1
+			fi
+			if ! nand_verify_ubi_volume "$kern_ubivol" "$kernel_length"; then
+				echo "kernel volume verification failed"
+				return 1
+			fi
 		fi
 	fi
 
