@@ -1,0 +1,147 @@
+From: AX6 local correctness review <local@localhost>
+Subject: [PATCH] ath11k: nss: bound the wifili peer stats payload length
+
+The wifili peer stats message is a peer count followed by that many
+nss_wifili_peer_ctrl_stats records scaled by a compile-time record size
+(NSS_FIRMWARE_VERSION_12_5, now wired into the mac80211 build, selects the
+12.5 212-byte record over the legacy 196-byte one). ath11k_nss_get_peer_stats()
+parses wpcs[0..npeers-1] without looking at the firmware-reported cm.len, so a
+host built for the wrong layout reads past the declared payload for every peer
+beyond the first; only the outer NSS message-size limit bounds the read.
+
+Hand the message itself to the parser instead of the bare stats pointer so it
+can validate the payload before parsing: reject a length that cannot hold the
+peer count, reject a peer count of zero or beyond the 1024 defensive cap, and
+reject a payload shorter than 4 + (npeers - 1) * sizeof(wpcs[0]). Warn once
+when a message is rejected for these reasons, and log the observed
+len/npeers/stride once when a payload is accepted, so one boot resolves the
+layout direction (4 + n*212 = 12.5 wide, 4 + n*196 = legacy narrow). Rejected
+messages leave the per-peer counters untouched and the parsing loop unentered.
+
+This bound only reasons about the firmware-declared cm.len; the NSS driver's
+receive-side skb bound is not visible here. It does not change the counters
+added by 999-921 or the message sizes of any host->NSS command.
+
+Upstream-Status: Pending
+
+---
+
+--- a/drivers/net/wireless/ath/ath11k/nss.c
++++ b/drivers/net/wireless/ath/ath11k/nss.c
+@@ -140,8 +140,70 @@
+ 	spin_unlock_bh(&srng->lock);
+ }
+ 
+-static void ath11k_nss_get_peer_stats(struct ath11k_base *ab, struct nss_wifili_peer_stats *stats)
+-{
++#define ATH11K_NSS_PEER_STATS_MAX_PEERS	1024
++
++/*
++ * The wifili firmware reports peer statistics as a variable-length message: a
++ * peer count followed by that many nss_wifili_peer_ctrl_stats records. The
++ * record size is a compile-time property of the host (NSS_FIRMWARE_VERSION_12_5
++ * selects the 212-byte 12.5 layout over the 196-byte legacy layout), so a host
++ * built for the wrong firmware layout walks past the payload the firmware
++ * declared when more than one peer is reported. Bound the firmware-reported
++ * payload with the compile-time record size before parsing it, and log the
++ * observed length and stride once so that a single boot resolves the layout
++ * direction.
++ */
++static bool ath11k_nss_peer_stats_len_ok(struct ath11k_base *ab,
++					 const struct nss_wifili_peer_stats *stats,
++					 u32 len)
++{
++	size_t stride = sizeof(stats->wpcs[0]);
++	size_t required;
++	u32 npeers;
++
++	if (len < sizeof(stats->npeers)) {
++		if (!ab->nss.peer_stats_len_warned) {
++			ab->nss.peer_stats_len_warned = true;
++			ath11k_warn(ab, "nss wifili peer stats: message too short "
++				    "for npeers: len=%u\n", len);
++		}
++		return false;
++	}
++
++	npeers = stats->npeers;
++	if (!npeers || npeers > ATH11K_NSS_PEER_STATS_MAX_PEERS) {
++		if (!ab->nss.peer_stats_len_warned) {
++			ab->nss.peer_stats_len_warned = true;
++			ath11k_warn(ab, "nss wifili peer stats: invalid npeers=%u len=%u\n",
++				    npeers, len);
++		}
++		return false;
++	}
++
++	required = sizeof(*stats) + (npeers - 1) * stride;
++	if (len < required) {
++		if (!ab->nss.peer_stats_len_warned) {
++			ab->nss.peer_stats_len_warned = true;
++			ath11k_warn(ab, "nss wifili peer stats: payload too short: "
++				    "len=%u required=%zu npeers=%u stride=%zu\n",
++				    len, required, npeers, stride);
++		}
++		return false;
++	}
++
++	if (!ab->nss.peer_stats_layout_logged) {
++		ab->nss.peer_stats_layout_logged = true;
++		ath11k_info(ab, "nss wifili peer stats: len=%u npeers=%u stride=%zu\n",
++			    len, npeers, stride);
++	}
++
++	return true;
++}
++
++static void ath11k_nss_get_peer_stats(struct ath11k_base *ab,
++				      struct nss_wifili_msg *msg)
++{
++	struct nss_wifili_peer_stats *stats = &msg->msg.peer_stats.stats;
+ 	struct ath11k_peer *peer;
+ 	struct nss_wifili_peer_ctrl_stats *pstats = NULL;
+ 	int i, j;
+@@ -149,6 +211,9 @@
+ 	u64 rx_packets, rx_bytes, rx_dropped;
+ 
+ 	if (!ab->nss.stats_enabled)
++		return;
++
++	if (!ath11k_nss_peer_stats_len_ok(ab, stats, msg->cm.len))
+ 		return;
+ 
+ 	for (i = 0; i < stats->npeers; i++) {
+@@ -336,7 +401,6 @@
+ 	enum nss_cmn_response response = msg->cm.response;
+ 	u32 error =  msg->cm.error;
+ 	u32 peer_id;
+-	struct nss_wifili_peer_stats *peer_stats;
+ 	struct ath11k_base *ab = (struct ath11k_base *)context;
+ 
+ 	if (!ab)
+@@ -394,12 +458,11 @@
+ 		ath11k_nss_wifili_stats_sync(ab, &msg->msg.wlsoc_stats);
+ 		break;
+ 	case NSS_WIFILI_PEER_STATS_MSG:
+-		peer_stats = &msg->msg.peer_stats.stats;
+ 		if (response == NSS_CMN_RESPONSE_EMSG) {
+ 			ath11k_warn(ab, "peer stats msg failed with error = %u\n", error);
+ 			break;
+ 		}
+-		ath11k_nss_get_peer_stats(ab, peer_stats);
++		ath11k_nss_get_peer_stats(ab, msg);
+ 		break;
+ 	case NSS_WIFILI_TID_REOQ_SETUP_MSG:
+ 		/* TODO setup tidq */
+--- a/drivers/net/wireless/ath/ath11k/nss.h
++++ b/drivers/net/wireless/ath/ath11k/nss.h
+@@ -272,6 +272,9 @@
+ 	bool enabled;
+ 	/* turn on/off nss stats support in ath11k */
+ 	bool stats_enabled;
++	/* one-shot diagnostics for the wifili peer stats payload layout */
++	bool peer_stats_len_warned;
++	bool peer_stats_layout_logged;
+ 	/* Mesh offload support as advertised by nss */
+ 	bool mesh_nss_offload_enabled;
+ 	/* soc nss ctx */

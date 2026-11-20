@@ -21,12 +21,18 @@ boot() {
 	netgear,wax630)
 		fw_setenv boot_count 0
 	;;
-	redmi,ax6-stock|\
+	redmi,ax6-stock)
+		# Merged-layout AX6 has no rootfs_1/dual-slot flags. Writing them
+		# is dead code and breaks on the broken U-Boot env geometry.
+		if [ -n "$(find_mtd_index rootfs_1)" ]; then
+			fw_setenv flag_ota_reboot 0
+			fw_setenv flag_boot_success 1
+		fi
+		;;
 	xiaomi,ax3600-stock|\
 	xiaomi,ax9000-stock)
-		# OTA handling should not be used. Reset it just in case.
+		# These stock variants retain their dual-slot semantics.
 		fw_setenv flag_ota_reboot 0
-		# Not strictly needed but useful to handle partition crash condition
 		fw_setenv flag_boot_success 1
 	;;
 	esac

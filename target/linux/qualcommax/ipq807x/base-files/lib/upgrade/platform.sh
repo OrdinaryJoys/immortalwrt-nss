@@ -55,6 +55,16 @@ xiaomi_stock_get_upgrade_part() {
 	return 1
 }
 
+# The merged single-partition AX6 layout exposes exactly one "rootfs" MTD
+# partition (mtd12, 0x06640000) and no rootfs_1 fallback slot. The installed
+# U-Boot on that layout has no Xiaomi flag/altboot selection logic, so the
+# flag_* environment variables are dead code there and writing them only
+# invalidates the bootloader environment (S1-02). Keep this probe in one
+# place so the upgrade paths cannot disagree about the layout.
+xiaomi_stock_is_merged_layout() {
+	[ -n "$(find_mtd_index rootfs)" ] && [ -z "$(find_mtd_index rootfs_1)" ]
+}
+
 xiaomi_stock_check_image_size() {
 	local file="$1"
 	local cmd
@@ -259,14 +269,27 @@ platform_do_upgrade() {
 	redmi,ax6-stock|\
 	xiaomi,ax3600-stock|\
 	xiaomi,ax9000-stock)
-		if [ -n "$(find_mtd_index rootfs)" ] && [ -z "$(find_mtd_index rootfs_1)" ]; then
+		if xiaomi_stock_is_merged_layout; then
+			# Merged single-UBI layout: one "rootfs" partition holding the
+			# kernel/rootfs volumes, no rootfs_1 slot. Write no Xiaomi
+			# flags here: the installed U-Boot on this layout has no
+			# flag/altboot selection and there is no second slot to switch
+			# to, so such writes are dead code that only invalidates the
+			# bootloader environment (S1-02).
 			echo "AX6-LARGE-PARTITION-BRANCH: upgrading single rootfs"
 			CI_UBIPART="rootfs"
+			# Propagate the writer result; returning 0 here masked a failed
+			# nand_do_upgrade in the replay harness (A-00 rc capture).
 			nand_do_upgrade "$1"
-			return 0
+			return $?
 		fi
-		CI_UBIPART="$(xiaomi_stock_get_upgrade_part)" ||
+		# Dual-slot stock layout (rootfs + rootfs_1): the stock bootloader
+		# still selects the slot through the flag_* variables, so keep the
+		# writes here.
+		CI_UBIPART="$(xiaomi_stock_get_upgrade_part)" || {
 			nand_do_upgrade_failed
+			return 1
+		}
 		if [ "$CI_UBIPART" = "rootfs_1" ]; then
 			target_num=1
 			try_flag=flag_try_sys2_failed
@@ -275,12 +298,16 @@ platform_do_upgrade() {
 			try_flag=flag_try_sys1_failed
 		fi
 
-		fw_setenv -s - <<-EOF || nand_do_upgrade_failed
+		fw_setenv -s - <<-EOF
 			$try_flag 0
 			flag_boot_rootfs $target_num
 			flag_last_success $target_num
 			flag_boot_success 0
 		EOF
+		if [ $? -ne 0 ]; then
+			nand_do_upgrade_failed
+			return 1
+		fi
 
 		nand_do_upgrade "$1"
 		;;

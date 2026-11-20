@@ -205,6 +205,221 @@ nand_verify_ubi_volume() {
 	return 0
 }
 
+# Read a UBI sysfs attribute as a non-negative integer. Returns 1 when the
+# attribute cannot be read or is not a plain decimal number.
+nand_ubi_sysfs_int() {
+	local attr="$1"
+	local value
+
+	value="$(cat "${UBI_SYSFS_ROOT:-/sys}/class/ubi/$attr" 2>/dev/null)" || return 1
+	case "$value" in
+	''|*[!0-9]*)
+		return 1
+		;;
+	esac
+	echo "$value"
+}
+
+# Number of whole LEBs required to store $1 bytes with a $2-byte LEB.
+nand_ubi_leb_count() {
+	local length="$1"
+	local leb_size="$2"
+
+	case "$length" in
+	''|*[!0-9]*) length=0 ;;
+	esac
+	case "$leb_size" in
+	''|*[!0-9]*) leb_size=0 ;;
+	esac
+	[ "$leb_size" -gt 0 ] || {
+		echo 0
+		return 0
+	}
+	echo $(( (length + leb_size - 1) / leb_size ))
+}
+
+# The capacity preflight must never block a valid upgrade just because a
+# measurement attribute is missing; the post-write verification below stays
+# active in that case.
+nand_ubi_preflight_skip() {
+	echo "UBI capacity preflight unavailable ($1); continuing without preflight"
+	return 0
+}
+
+# Compare the eraseblocks (UBI LEBs, reported as PEBs by the writer) required
+# by the new volumes against the LEBs that are already free plus the LEBs
+# reclaimed by deleting the old volumes.
+nand_ubi_capacity_assert() {
+	local label="$1"
+	local required="$2"
+	local avail="$3"
+	local freed="$4"
+	local usable=$((avail + freed))
+
+	if [ "$required" -gt "$usable" ]; then
+		echo "UBI capacity preflight failed: ${label} requires ${required} UBI PEBs but only ${usable} are usable (${avail} free + ${freed} reclaimed)"
+		return 1
+	fi
+	echo "UBI capacity preflight: ${label} requires ${required} UBI PEBs, ${usable} usable (${avail} free + ${freed} reclaimed)"
+	return 0
+}
+
+# Number of LEBs currently reserved by an existing UBI volume.
+nand_ubi_volume_ebs() {
+	local vol="$1"
+	local reserved
+
+	[ -n "$vol" ] || {
+		echo 0
+		return 0
+	}
+	reserved="$(nand_ubi_sysfs_int "$vol/reserved_ebs")" || return 1
+	echo "$reserved"
+}
+
+# Capacity preflight for the UBI write transaction.
+#
+# nand_upgrade_prepare_ubi removes the existing kernel/rootfs/rootfs_data
+# volumes before it creates the new ones. Make sure that the requested image
+# fits into the free LEBs plus the LEBs owned by the volumes that are about to
+# be removed *before* the first ubirmvol touches the flash. A failed check
+# leaves the flash untouched; after the first removal there is no in-device
+# rollback on the merged single-UBI layout.
+nand_preflight_ubi_capacity() {
+	local kern_ubidev="$1"
+	local root_ubidev="$2"
+	local kernel_length="$3"
+	local rootfs_length="$4"
+	local rootfs_type="$5"
+	local kern_ubivol="$6"
+	local root_ubivol="$7"
+	local data_ubivol="$8"
+	local kern_reserved=0 root_reserved=0 data_reserved=0
+	local kern_leb kern_avail root_leb root_avail
+	local kern_required root_required data_required provisioning_required=0
+	local existing_provisioning=""
+	local value
+
+	[ -n "$kernel_length" ] || [ -n "$rootfs_length" ] || return 0
+
+	if [ -n "$kern_ubivol" ]; then
+		value="$(nand_ubi_volume_ebs "$kern_ubivol")" || {
+			nand_ubi_preflight_skip "cannot read reserved_ebs for ${kern_ubivol}"
+			return 0
+		}
+		kern_reserved="$value"
+	fi
+	if [ -n "$root_ubivol" ]; then
+		value="$(nand_ubi_volume_ebs "$root_ubivol")" || {
+			nand_ubi_preflight_skip "cannot read reserved_ebs for ${root_ubivol}"
+			return 0
+		}
+		root_reserved="$value"
+	fi
+	if [ -n "$data_ubivol" ]; then
+		value="$(nand_ubi_volume_ebs "$data_ubivol")" || {
+			nand_ubi_preflight_skip "cannot read reserved_ebs for ${data_ubivol}"
+			return 0
+		}
+		data_reserved="$value"
+	fi
+
+	kern_leb="$(nand_ubi_sysfs_int "$kern_ubidev/eraseblock_size")" || {
+		nand_ubi_preflight_skip "cannot read eraseblock_size for ${kern_ubidev}"
+		return 0
+	}
+	kern_avail="$(nand_ubi_sysfs_int "$kern_ubidev/avail_eraseblocks")" || {
+		nand_ubi_preflight_skip "cannot read avail_eraseblocks for ${kern_ubidev}"
+		return 0
+	}
+
+	# rootfs_data is created with -m (all remaining space), so one LEB is
+	# enough for the conservative preflight. A larger rootfs_data_max is
+	# handled by prepare's -m fallback when the static request does not fit,
+	# so it must not turn into a preflight failure.
+	if [ "$rootfs_type" = "ubifs" ]; then
+		data_required=0
+	else
+		data_required=1
+	fi
+	kern_required="$(nand_ubi_leb_count "$kernel_length" "$kern_leb")"
+
+	if [ "$kern_ubidev" = "$root_ubidev" ]; then
+		root_required="$(nand_ubi_leb_count "$rootfs_length" "$kern_leb")"
+		if [ "${UPGRADE_OPT_ADD_PROVISIONING:-0}" -gt 0 ]; then
+			existing_provisioning="$(nand_find_volume "$root_ubidev" provisioning)"
+			[ -n "$existing_provisioning" ] || \
+				provisioning_required="$(nand_ubi_leb_count 131072 "$kern_leb")"
+		fi
+		nand_ubi_capacity_assert "UBI device ${kern_ubidev}" \
+			"$((kern_required + root_required + data_required + provisioning_required))" \
+			"$kern_avail" "$((kern_reserved + root_reserved + data_reserved))"
+		return $?
+	fi
+
+	# Kernel and rootfs live on different UBI devices; check each one.
+	root_leb="$(nand_ubi_sysfs_int "$root_ubidev/eraseblock_size")" || {
+		nand_ubi_preflight_skip "cannot read eraseblock_size for ${root_ubidev}"
+		return 0
+	}
+	root_avail="$(nand_ubi_sysfs_int "$root_ubidev/avail_eraseblocks")" || {
+		nand_ubi_preflight_skip "cannot read avail_eraseblocks for ${root_ubidev}"
+		return 0
+	}
+	root_required="$(nand_ubi_leb_count "$rootfs_length" "$root_leb")"
+	if [ "${UPGRADE_OPT_ADD_PROVISIONING:-0}" -gt 0 ]; then
+		existing_provisioning="$(nand_find_volume "$root_ubidev" provisioning)"
+		[ -n "$existing_provisioning" ] || \
+			provisioning_required="$(nand_ubi_leb_count 131072 "$root_leb")"
+	fi
+	nand_ubi_capacity_assert "UBI device ${kern_ubidev} (kernel)" \
+		"$kern_required" "$kern_avail" "$kern_reserved" || return 1
+	nand_ubi_capacity_assert "UBI device ${root_ubidev} (rootfs/rootfs_data)" \
+		"$((root_required + data_required + provisioning_required))" \
+		"$root_avail" "$((root_reserved + data_reserved))"
+}
+
+# Print the MD5 hash (normalized to the bare hash) of a byte stream read from
+# stdin. Only used when CI_UBI_READBACK_HASH=1.
+nand_ubi_source_hash() {
+	local hash
+
+	hash="$(md5sum 2>/dev/null)" || return 1
+	hash="${hash%% *}"
+	[ -n "$hash" ] || return 1
+	echo "$hash"
+}
+
+# Optional evidence-only readback: re-read the written bytes from the UBI
+# volume and compare them with the MD5 of the source stream. Default off;
+# enable with CI_UBI_READBACK_HASH=1 for RT-3/RT-6 evidence. md5sum, dd and
+# head are installed into the ramfs by the stage2 default binary list.
+nand_verify_ubi_readback() {
+	local vol="$1"
+	local expected="$2"
+	local source_hash="$3"
+	local readback_hash
+
+	[ "${CI_UBI_READBACK_HASH:-0}" = "1" ] || return 0
+	if [ -z "$vol" ] || [ -z "$expected" ] || [ -z "$source_hash" ]; then
+		echo "UBI readback verification failed for ${vol}: missing volume, length or source hash"
+		return 1
+	fi
+	readback_hash="$( dd if="/dev/$vol" bs=65536 2>/dev/null | head -c "$expected" | md5sum 2>/dev/null )"
+	readback_hash="${readback_hash%% *}"
+	if [ -z "$readback_hash" ]; then
+		echo "UBI readback verification failed for ${vol}: cannot hash the volume"
+		return 1
+	fi
+	if [ "$readback_hash" != "$source_hash" ]; then
+		echo "UBI readback mismatch for ${vol}: source ${source_hash}, volume ${readback_hash}"
+		echo "UBI readback verification failed for ${vol}"
+		return 1
+	fi
+	echo "UBI readback verified for ${vol}: ${readback_hash}"
+	return 0
+}
+
 nand_upgrade_prepare_ubi() {
 	local rootfs_length="$1"
 	local rootfs_type="$2"
@@ -234,22 +449,35 @@ nand_upgrade_prepare_ubi() {
 	local data_ubivol="$( nand_find_volume $root_ubidev rootfs_data )"
 	[ "$root_ubivol" = "$kern_ubivol" ] && root_ubivol=
 
+	# Refuse an image that cannot fit before deleting anything. This must run
+	# before the first ubirmvol: once a volume is removed the previous
+	# kernel/rootfs are gone and there is no in-device rollback.
+	nand_preflight_ubi_capacity "$kern_ubidev" "$root_ubidev" \
+		"$kernel_length" "$rootfs_length" "$rootfs_type" \
+		"$kern_ubivol" "$root_ubivol" "$data_ubivol" || return 1
+
 	# remove ubiblocks
 	[ "$kern_ubivol" ] && { nand_remove_ubiblock $kern_ubivol || return 1; }
 	[ "$root_ubivol" ] && { nand_remove_ubiblock $root_ubivol || return 1; }
 	[ "$data_ubivol" ] && { nand_remove_ubiblock $data_ubivol || return 1; }
 
-	# kill volumes; a failed removal must stop the upgrade before mkvol/write
-	if [ "$kern_ubivol" ] && ! ubirmvol /dev/$kern_ubidev -N "$CI_KERNPART"; then
-		echo "cannot remove kernel volume $CI_KERNPART"
+	# Delete in recovery-friendly order: rootfs_data first, then rootfs, and
+	# the kernel last. A true atomic swap is impossible on the merged AX6
+	# layout (2 * kernel 46 LEBs + 2 * rootfs 403 LEBs > 818 PEB); keeping the
+	# kernel until the end minimizes the window in which the device has no
+	# bootable kernel. A failed removal must stop the upgrade before
+	# mkvol/write.
+	NAND_UBI_DESTRUCTIVE_STARTED=1
+	if [ "$data_ubivol" ] && ! ubirmvol /dev/$root_ubidev -N rootfs_data; then
+		echo "cannot remove rootfs_data volume"
 		return 1
 	fi
 	if [ "$root_ubivol" ] && ! ubirmvol /dev/$root_ubidev -N "$CI_ROOTPART"; then
 		echo "cannot remove rootfs volume $CI_ROOTPART"
 		return 1
 	fi
-	if [ "$data_ubivol" ] && ! ubirmvol /dev/$root_ubidev -N rootfs_data; then
-		echo "cannot remove rootfs_data volume"
+	if [ "$kern_ubivol" ] && ! ubirmvol /dev/$kern_ubidev -N "$CI_KERNPART"; then
+		echo "cannot remove kernel volume $CI_KERNPART"
 		return 1
 	fi
 
@@ -319,6 +547,7 @@ nand_upgrade_ubinized() {
 nand_upgrade_ubifs() {
 	local ubifs_file="$1"
 	local cmd="$2"
+	local ubifs_hash=""
 
 	local ubifs_length=$( ($cmd < "$ubifs_file" | wc -c) 2> /dev/null)
 
@@ -326,6 +555,9 @@ nand_upgrade_ubifs() {
 
 	local ubidev="$( nand_find_ubi "$CI_UBIPART" )"
 	local root_ubivol="$(nand_find_volume $ubidev "$CI_ROOTPART")"
+	if [ "${CI_UBI_READBACK_HASH:-0}" = "1" ]; then
+		ubifs_hash="$( $cmd < "$ubifs_file" | nand_ubi_source_hash )"
+	fi
 	if ! $cmd < "$ubifs_file" | ubiupdatevol /dev/$root_ubivol -s "$ubifs_length" -; then
 		echo "failed to write UBIFS rootfs volume"
 		return 1
@@ -334,12 +566,14 @@ nand_upgrade_ubifs() {
 		echo "UBIFS rootfs volume verification failed"
 		return 1
 	fi
+	nand_verify_ubi_readback "$root_ubivol" "$ubifs_length" "$ubifs_hash"
 }
 
 # Write the FIT image to UBI kernel volume
 nand_upgrade_fit() {
 	local fit_file="$1"
 	local cmd="$2"
+	local fit_hash=""
 
 	local fit_length=$( ($cmd < "$fit_file" | wc -c) 2> /dev/null)
 
@@ -347,6 +581,9 @@ nand_upgrade_fit() {
 
 	local fit_ubidev="$(nand_find_ubi "$CI_UBIPART")"
 	local fit_ubivol="$(nand_find_volume $fit_ubidev "$CI_KERNPART")"
+	if [ "${CI_UBI_READBACK_HASH:-0}" = "1" ]; then
+		fit_hash="$( $cmd < "$fit_file" | nand_ubi_source_hash )"
+	fi
 	if ! $cmd < "$fit_file" | ubiupdatevol /dev/$fit_ubivol -s "$fit_length" -; then
 		echo "failed to write FIT kernel volume"
 		return 1
@@ -355,6 +592,7 @@ nand_upgrade_fit() {
 		echo "FIT kernel volume verification failed"
 		return 1
 	fi
+	nand_verify_ubi_readback "$fit_ubivol" "$fit_length" "$fit_hash"
 }
 
 # Write images in the TAR file to MTD partitions and/or UBI volumes as required
@@ -394,6 +632,16 @@ nand_upgrade_tar() {
 	local has_env=0
 	nand_upgrade_prepare_ubi "$rootfs_length" "$rootfs_type" "$ubi_kernel_length" "$has_env" || return 1
 
+	local rootfs_hash="" kern_hash=""
+	if [ "${CI_UBI_READBACK_HASH:-0}" = "1" ]; then
+		if [ -n "$rootfs_length" ]; then
+			rootfs_hash="$( $cmd < "$tar_file" | tar xOf - "$board_dir/root" | nand_ubi_source_hash )"
+		fi
+		if [ -n "$kernel_length" ] && [ -z "$kernel_mtd" ]; then
+			kern_hash="$( $cmd < "$tar_file" | tar xOf - "$board_dir/kernel" | nand_ubi_source_hash )"
+		fi
+	fi
+
 	if [ "$rootfs_length" ]; then
 		local ubidev="$( nand_find_ubi "${CI_ROOT_UBIPART:-$CI_UBIPART}" )"
 		local root_ubivol="$( nand_find_volume $ubidev "$CI_ROOTPART" )"
@@ -406,6 +654,7 @@ nand_upgrade_tar() {
 			echo "rootfs volume verification failed"
 			return 1
 		fi
+		nand_verify_ubi_readback "$root_ubivol" "$rootfs_length" "$rootfs_hash" || return 1
 	fi
 	if [ "$kernel_length" ]; then
 		if [ "$kernel_mtd" ]; then
@@ -429,6 +678,7 @@ nand_upgrade_tar() {
 				echo "kernel volume verification failed"
 				return 1
 			fi
+			nand_verify_ubi_readback "$kern_ubivol" "$kernel_length" "$kern_hash" || return 1
 		fi
 	fi
 
@@ -527,9 +777,23 @@ nand_do_upgrade_success() {
 	nand_do_upgrade_failed
 }
 
+# Print the recovery instructions for a failure that happened after the UBI
+# transaction started. There is no in-device failover on the merged AX6
+# layout, so the serial console message is the only recovery pointer.
+nand_upgrade_failure_guidance() {
+	cat <<-EOF
+	SYSUPGRADE: the kernel/rootfs volumes are incomplete; the device may not boot.
+	SYSUPGRADE: recover via the U-Boot Web page (factory.ubi) at 192.168.1.1 or UART/TFTP ubiformat.
+	SYSUPGRADE: keep this console attached and do not power off until recovery has started.
+	EOF
+}
+
 nand_do_upgrade_failed() {
 	sync
 	echo "sysupgrade failed"
+	# Only print the corruption/recovery guidance once a destructive step was
+	# attempted; a preflight failure leaves the installed system bootable.
+	[ "${NAND_UBI_DESTRUCTIVE_STARTED:-0}" -gt 0 ] && nand_upgrade_failure_guidance
 	# Should we reboot or bring up some failsafe mode instead?
 	umount -a
 	reboot -f

@@ -31,6 +31,7 @@ PKG_DRIVERS = \
 	wlcore wl12xx wl18xx
 
 PKG_CONFIG_DEPENDS:= \
+	CONFIG_NSS_FIRMWARE_VERSION_12_5 \
 	CONFIG_PACKAGE_kmod-mac80211 \
 	CONFIG_PACKAGE_CFG80211_TESTMODE \
 	CONFIG_PACKAGE_IWLWIFI_DEBUG \
@@ -280,6 +281,13 @@ C_DEFINES=
 
 ifeq ($(BUILD_VARIANT),smallbuffers)
 	C_DEFINES+= -DCONFIG_ATH10K_SMALLBUFFERS
+endif
+
+# Keep the ath11k view of the NSS wifili wire structures in sync with the
+# qca-nss-drv/qca-nss-ecm builds, which select the 12.5 layout from the same
+# firmware package symbol. The macro name is bare: no CONFIG_ prefix.
+ifdef CONFIG_NSS_FIRMWARE_VERSION_12_5
+	C_DEFINES+= -DNSS_FIRMWARE_VERSION_12_5
 endif
 
 ifdef CONFIG_ATH11K_NSS_SUPPORT
