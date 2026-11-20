@@ -35,6 +35,8 @@ spec.loader.exec_module(extract)
 
 PATCH_REL = ("package/kernel/mac80211/patches/nss/ath11k/"
              "999-957-ath11k-nss-validate-wifili-peer-stats-length.patch")
+PATCH_958_REL = ("package/kernel/mac80211/patches/nss/ath11k/"
+                 "999-958-ath11k-nss-parse-available-peer-stats.patch")
 MAC_PATCH_FILES = ["drivers/net/wireless/ath/ath11k/nss.c",
                    "drivers/net/wireless/ath/ath11k/nss.h"]
 NSS_REL = "drivers/net/wireless/ath/ath11k/nss.c"
@@ -89,6 +91,9 @@ def read_source(relative):
 makefile = read_source("package/kernel/mac80211/Makefile")
 ath_mk = read_source("package/kernel/mac80211/ath.mk")
 patch_text = read_source(PATCH_REL)
+patch_958_text = read_source(PATCH_958_REL)
+require("parse_npeers" in patch_958_text, "958 patch does not contain the bounded parser")
+require("truncated" in patch_958_text, "958 patch lacks the truncation diagnostic")
 require("\tCONFIG_NSS_FIRMWARE_VERSION_12_5 \\\n" in makefile,
         "mac80211 PKG_CONFIG_DEPENDS lacks CONFIG_NSS_FIRMWARE_VERSION_12_5")
 require(re.search(r"ifdef CONFIG_NSS_FIRMWARE_VERSION_12_5\n"
@@ -283,6 +288,9 @@ required_line = "\trequired = sizeof(*stats) + (npeers - 1) * stride;\n"
 layout_log = "ath11k_info(ab, \"nss wifili peer stats: len="
 
 mutations = [
+    ("parse-all-available",
+     "\t*parse_npeers = npeers;\n",
+     "\t*parse_npeers = available;\n"),
     ("drop-truncation-clamp",
      "\tif (*parse_npeers > available)\n\t\t*parse_npeers = available;\n",
      "\t(void)available;\n"),

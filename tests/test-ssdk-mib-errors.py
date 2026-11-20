@@ -124,6 +124,7 @@ for name in ('fal_get_mib_info', 'fal_get_rx_mib_info', 'fal_get_tx_mib_info',
              'fal_mib_counter_get', 'fal_mib_port_flush_counters'):
     prefix += 'sw_error_t\n' + function(fal, name)
 prefix += r'''
+#define SSDK_PHYSICAL_PORT1 1
 struct switch_attr { int unused; };
 struct switch_val {int port_vlan; union {char *s;} value; int len;};
 struct qca_phy_priv {unsigned device_id, mib_loop_cnt, ports; int mib_lock, reg_mutex, version;
@@ -192,7 +193,7 @@ int main(void) {
     check(val.len==123 && !val.value.s,"failed swconfig has no successful output");
     qca_ar8327_sw_mib_task(&priv);
     check(warnings==1,"periodic failure reported");
-    check(priv.mib_loop_cnt==1,"periodic failure does not stall remaining ports");
+    check(priv.mib_loop_cnt==3,"periodic sampler starts at physical port 1 and advances");
     reset(); sample.RxFcsErr=4;
     check(qca_ar8327_sw_get_port_mib(&dev,NULL,&val)==0 && val.value.s==priv.buf,"normal swconfig preserved");
     check(strstr(val.value.s,"RxJumboFcsErr") && strstr(val.value.s,"RxJumboAligenErr"),"swconfig exposes jumbo errors");

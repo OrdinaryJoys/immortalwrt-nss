@@ -411,8 +411,8 @@ static void scenario_same_layout(void)
           "compiled-layout payload accepted and logged once");
     check(peer_lookups == 2, "both peers of the compiled layout are parsed");
     if (snprintf(expected, sizeof(expected),
-                 "nss wifili peer stats: len=%u npeers=%u stride=%zu\n",
-                 (unsigned)message.len, 2u, (size_t)HOST_STRIDE) >=
+                 "nss wifili peer stats: len=%u npeers=%u parse_npeers=%u stride=%zu\n",
+                 (unsigned)message.len, 2u, 2u, (size_t)HOST_STRIDE) >=
         (int)sizeof(expected))
         expected[sizeof(expected) - 1] = '\0';
     check(strcmp(last_info, expected) == 0, "layout log line has the probe format");
@@ -518,7 +518,7 @@ static void scenario_foreign_layout(void)
     ath11k_nss_get_peer_stats(&ab, message.msg);
     check(warn_calls == 0 && info_calls == 1 && peer_lookups == 2,
           "legacy build accepts the longer 12.5 payload without a warning");
-    check(strstr(last_info, "len=428 npeers=2 stride=196") != NULL,
+    check(strstr(last_info, "len=428 npeers=2 parse_npeers=2 stride=196") != NULL,
           "legacy build probe exposes the 12.5/legacy length mismatch");
     message_drop(&message);
 }
@@ -547,6 +547,23 @@ static void scenario_truncated_multi_peer(void)
     message_drop(&message);
 }
 
+static void scenario_npeers_bound(void)
+{
+    struct host_message message;
+
+    /* Payload room for three records, but firmware reports one peer. Only
+     * the reported peer may be parsed. */
+    reset_world(true);
+    add_peer(0, 7);
+    message = message_new(HOST_PEER_COUNT_OFFSET + 3 * HOST_STRIDE);
+    message.stats->npeers = 1;
+    fill_record(record_at(&message, 0), 7, 1000);
+    ath11k_nss_get_peer_stats(&ab, message.msg);
+    check(peer_lookups == 1, "records beyond reported npeers are not parsed");
+    check(info_calls == 1, "npeers-bound accepted layout logged once");
+    message_drop(&message);
+}
+
 static void report(void)
 {
     printf("{\"wide\":%d,\"checks\":%u,\"failures\":%u,"
@@ -569,6 +586,7 @@ int main(void)
     scenario_disabled();
     scenario_same_layout();
     scenario_truncated_multi_peer();
+    scenario_npeers_bound();
     scenario_probe_after_rejection();
     scenario_foreign_layout();
     report();

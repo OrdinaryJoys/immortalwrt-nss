@@ -1,6 +1,34 @@
+From: AX6 local correctness review <local@localhost>
+Subject: [PATCH] qca-ssdk: start MIB sampling at the first physical port
+
+Port 0 is the CPU/non-physical port; HPPE maps it to GMAC index -1 and
+returns SW_OUT_OF_RANGE. Start the periodic MIB task and the MIB reset
+paths at SSDK_PHYSICAL_PORT1 and wrap back there.
+
+Upstream-Status: Pending
+
 --- a/src/ref/ref_mib.c
 +++ b/src/ref/ref_mib.c
-@@ -510,6 +510,12 @@
+@@ -69,7 +69,8 @@
+     struct qca_phy_priv *priv = qca_phy_priv_get(dev);
+ 
+     mutex_lock(&priv->mib_lock);
+-    for (i = 0; i < dev->ports; i++)
++    /* Port 0 is the CPU port and has no MIB; flushing it returns an error. */
++    for (i = SSDK_PHYSICAL_PORT1; i < dev->ports; i++)
+     {
+         if (fal_mib_port_flush_counters(priv->device_id, i) != SW_OK)
+             ret = -EIO;
+@@ -87,7 +88,7 @@
+     int ret;
+     struct qca_phy_priv *priv = qca_phy_priv_get(dev);
+ 
+-    if (val->port_vlan < 0 || val->port_vlan >= dev->ports)
++    if (val->port_vlan < SSDK_PHYSICAL_PORT1 || val->port_vlan >= dev->ports)
+         return -EINVAL;
+ 
+     mutex_lock(&priv->mib_lock);
+@@ -510,6 +511,12 @@
  	int ret;
  
  	mutex_lock(&priv->reg_mutex);
@@ -13,7 +41,7 @@
  	if ((priv->mib_loop_cnt % 2) == 0)
  		ret = _qca_ar8327_sw_capture_port_rx_counter(priv->device_id, priv->mib_loop_cnt/2);
  	else
-@@ -519,8 +525,8 @@
+@@ -519,8 +526,8 @@
  			priv->device_id, priv->mib_loop_cnt/2,
  			(priv->mib_loop_cnt % 2) ? "tx" : "rx", ret);
  

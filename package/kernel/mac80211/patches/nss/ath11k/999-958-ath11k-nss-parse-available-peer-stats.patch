@@ -1,3 +1,12 @@
+From: AX6 local correctness review <local@localhost>
+Subject: [PATCH] ath11k: nss: parse available wifili peer stats records
+
+Firmware may report npeers larger than the records actually present in
+cm.len. Parse only complete records that fit, preserve OOB bounds, and
+log both the reported and parsed peer counts.
+
+Upstream-Status: Pending
+
 --- a/drivers/net/wireless/ath/ath11k/nss.c
 +++ b/drivers/net/wireless/ath/ath11k/nss.c
 @@ -155,10 +155,10 @@
@@ -13,7 +22,7 @@
  	u32 npeers;
  
  	if (len < sizeof(stats->npeers)) {
-@@ -180,21 +180,58 @@
+@@ -180,21 +180,49 @@
  		return false;
  	}
  
@@ -33,10 +42,10 @@
 -				    len, required, npeers, stride);
 +				    "len=%u npeers=%u stride=%zu\n",
 +				    len, npeers, stride);
-+		}
-+		return false;
-+	}
-+
+ 		}
+ 		return false;
+ 	}
+ 
 +	if (((len - sizeof(stats->npeers)) % 196) == 0 &&
 +	    ((len - sizeof(stats->npeers)) % stride) != 0) {
 +		if (!ab->nss.peer_stats_len_warned) {
@@ -49,16 +58,7 @@
 +	}
 +
 +	available = (len - sizeof(stats->npeers)) / stride;
-+	if (!available) {
-+		if (!ab->nss.peer_stats_len_warned) {
-+			ab->nss.peer_stats_len_warned = true;
-+			ath11k_warn(ab, "nss wifili peer stats: no complete record: "
-+				    "len=%u npeers=%u stride=%zu\n",
-+				    len, npeers, stride);
- 		}
- 		return false;
- 	}
- 
++
 +	*parse_npeers = npeers;
 +	if (*parse_npeers > available)
 +		*parse_npeers = available;
@@ -71,13 +71,14 @@
 +
  	if (!ab->nss.peer_stats_layout_logged) {
  		ab->nss.peer_stats_layout_logged = true;
- 		ath11k_info(ab, "nss wifili peer stats: len=%u npeers=%u stride=%zu\n",
+-		ath11k_info(ab, "nss wifili peer stats: len=%u npeers=%u stride=%zu\n",
 -			    len, npeers, stride);
-+			    len, *parse_npeers, stride);
++		ath11k_info(ab, "nss wifili peer stats: len=%u npeers=%u parse_npeers=%u stride=%zu\n",
++			    len, npeers, *parse_npeers, stride);
  	}
  
  	return true;
-@@ -206,6 +243,7 @@
+@@ -206,6 +234,7 @@
  	struct nss_wifili_peer_stats *stats = &msg->msg.peer_stats.stats;
  	struct ath11k_peer *peer;
  	struct nss_wifili_peer_ctrl_stats *pstats = NULL;
@@ -85,7 +86,7 @@
  	int i, j;
  	u64 tx_packets, tx_bytes, tx_dropped;
  	u64 rx_packets, rx_bytes, rx_dropped;
-@@ -213,10 +251,10 @@
+@@ -213,10 +242,10 @@
  	if (!ab->nss.stats_enabled)
  		return;
  
