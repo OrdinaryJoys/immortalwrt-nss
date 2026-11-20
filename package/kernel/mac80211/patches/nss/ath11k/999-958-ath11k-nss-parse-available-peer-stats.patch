@@ -1,0 +1,77 @@
+--- a/drivers/net/wireless/ath/ath11k/nss.c
++++ b/drivers/net/wireless/ath/ath11k/nss.c
+@@ -155,10 +155,10 @@
+  */
+ static bool ath11k_nss_peer_stats_len_ok(struct ath11k_base *ab,
+ 					 const struct nss_wifili_peer_stats *stats,
+-					 u32 len)
++					 u32 len, u32 *parse_npeers)
+ {
+ 	size_t stride = sizeof(stats->wpcs[0]);
+-	size_t required;
++	size_t available;
+ 	u32 npeers;
+ 
+ 	if (len < sizeof(stats->npeers)) {
+@@ -180,21 +180,34 @@
+ 		return false;
+ 	}
+ 
+-	required = sizeof(*stats) + (npeers - 1) * stride;
+-	if (len < required) {
++	/* The firmware can advertise more peers than it actually puts in this
++	 * message. Parse only the records that fit in the declared payload; never
++	 * walk past cm.len. A truncated message is still useful for its complete
++	 * leading records.
++	 */
++	available = (len - sizeof(stats->npeers)) / stride;
++	if (!available) {
+ 		if (!ab->nss.peer_stats_len_warned) {
+ 			ab->nss.peer_stats_len_warned = true;
+-			ath11k_warn(ab, "nss wifili peer stats: payload too short: "
+-				    "len=%u required=%zu npeers=%u stride=%zu\n",
+-				    len, required, npeers, stride);
++			ath11k_warn(ab, "nss wifili peer stats: no complete record: "
++				    "len=%u npeers=%u stride=%zu\n",
++				    len, npeers, stride);
+ 		}
+ 		return false;
++	}
++
++	*parse_npeers = min_t(u32, npeers, available);
++	if (*parse_npeers < npeers && !ab->nss.peer_stats_len_warned) {
++		ab->nss.peer_stats_len_warned = true;
++		ath11k_warn(ab, "nss wifili peer stats: truncated: len=%u npeers=%u "
++			    "parse_npeers=%u stride=%zu\n",
++			    len, npeers, *parse_npeers, stride);
+ 	}
+ 
+ 	if (!ab->nss.peer_stats_layout_logged) {
+ 		ab->nss.peer_stats_layout_logged = true;
+ 		ath11k_info(ab, "nss wifili peer stats: len=%u npeers=%u stride=%zu\n",
+-			    len, npeers, stride);
++			    len, *parse_npeers, stride);
+ 	}
+ 
+ 	return true;
+@@ -206,6 +219,7 @@
+ 	struct nss_wifili_peer_stats *stats = &msg->msg.peer_stats.stats;
+ 	struct ath11k_peer *peer;
+ 	struct nss_wifili_peer_ctrl_stats *pstats = NULL;
++	u32 parse_npeers;
+ 	int i, j;
+ 	u64 tx_packets, tx_bytes, tx_dropped;
+ 	u64 rx_packets, rx_bytes, rx_dropped;
+@@ -213,10 +227,10 @@
+ 	if (!ab->nss.stats_enabled)
+ 		return;
+ 
+-	if (!ath11k_nss_peer_stats_len_ok(ab, stats, msg->cm.len))
++	if (!ath11k_nss_peer_stats_len_ok(ab, stats, msg->cm.len, &parse_npeers))
+ 		return;
+ 
+-	for (i = 0; i < stats->npeers; i++) {
++	for (i = 0; i < parse_npeers; i++) {
+ 		pstats = &stats->wpcs[i];
+ 
+ 		rcu_read_lock();

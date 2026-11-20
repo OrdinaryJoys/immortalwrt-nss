@@ -371,8 +371,8 @@ static void scenario_rejected(void)
     ath11k_nss_get_peer_stats(&ab, message.msg);
     check(warn_calls == 1 && info_calls == 0 && peer_lookups == 0,
           "truncated single-peer payload rejected");
-    check(strstr(last_warn, "payload too short") != NULL,
-          "truncated payload warning reports the short length");
+    check(strstr(last_warn, "no complete record") != NULL,
+          "truncated payload warning reports the missing complete record");
     message_drop(&message);
 }
 

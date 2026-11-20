@@ -1,0 +1,26 @@
+--- a/src/ref/ref_mib.c
++++ b/src/ref/ref_mib.c
+@@ -510,6 +510,12 @@
+ 	int ret;
+ 
+ 	mutex_lock(&priv->reg_mutex);
++	/* Port 0 is the CPU/non-physical port; it has no MIB and returns
++	 * SW_OUT_OF_RANGE. Start at the first physical port.
++	 */
++	if (priv->mib_loop_cnt < (2 * SSDK_PHYSICAL_PORT1))
++		priv->mib_loop_cnt = 2 * SSDK_PHYSICAL_PORT1;
++
+ 	if ((priv->mib_loop_cnt % 2) == 0)
+ 		ret = _qca_ar8327_sw_capture_port_rx_counter(priv->device_id, priv->mib_loop_cnt/2);
+ 	else
+@@ -519,8 +525,8 @@
+ 			priv->device_id, priv->mib_loop_cnt/2,
+ 			(priv->mib_loop_cnt % 2) ? "tx" : "rx", ret);
+ 
+-	if(++priv->mib_loop_cnt == (2 * (priv->ports))) {
+-		priv->mib_loop_cnt = 0;
++	if (++priv->mib_loop_cnt >= (2 * (priv->ports))) {
++		priv->mib_loop_cnt = 2 * SSDK_PHYSICAL_PORT1;
+ 	}
+ 
+ 	mutex_unlock(&priv->reg_mutex);
