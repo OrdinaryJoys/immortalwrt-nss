@@ -181,14 +181,25 @@ nand_detach_ubi() {
 nand_verify_ubi_volume() {
 	local vol="$1"
 	local expected="$2"
-	local sysfs="${UBI_SYSFS_ROOT:-/sys}/class/ubi/${vol}/data_bytes"
+	local root="${UBI_SYSFS_ROOT:-/sys}/class/ubi/${vol}"
+	local data_bytes="${root}/data_bytes"
+	local upd_marker="${root}/upd_marker"
 	[ -n "$vol" ] && [ -n "$expected" ] || return 1
-	[ -r "$sysfs" ] || {
+	[ -r "$data_bytes" ] && [ -r "$upd_marker" ] || {
 		echo "UBI verification unavailable for ${vol}"
 		return 1
 	}
-	[ "$(cat "$sysfs")" = "$expected" ] || {
-		echo "UBI volume ${vol} size mismatch: expected ${expected}, got $(cat "$sysfs")"
+	# Dynamic UBI volumes report LEB-rounded capacity, not the requested
+	# image length. Only require the written data to fit and the update
+	# transaction to be complete.
+	local actual
+	actual="$(cat "$data_bytes")"
+	[ "$actual" -ge "$expected" ] || {
+		echo "UBI volume ${vol} too small: expected >= ${expected}, got ${actual}"
+		return 1
+	}
+	[ "$(cat "$upd_marker")" = "0" ] || {
+		echo "UBI volume ${vol} update marker is not clear: $(cat "$upd_marker")"
 		return 1
 	}
 	return 0
