@@ -134,6 +134,39 @@ wait_for_nss_sysctls() {
   return 1
 }
 
+# Readiness contract after the bounded fast-path waits:
+#   0 = ready          - ath11k nss_offload=1 and the NSS RPS/N2H sysctls exist
+#   1 = transient      - the ath11k device exists but its parameter or the NSS
+#                        sysctls are not published yet (slow-boot race), so a
+#                        bounded background retry can still apply the profile
+#   2 = permanent skip - no ath11k device, or nss_offload is explicitly 0
+# A one-shot S19 start cannot wait forever; it must report the transient state
+# instead of returning success with the driver-default N2H profile left in
+# place (AX6-34).
+pbuf_readiness_state() {
+  local nss_offload
+
+  if ! ath11k_device_available; then
+    return 2
+  fi
+
+  if [ ! -r /sys/module/ath11k/parameters/nss_offload ]; then
+    return 1
+  fi
+
+  nss_offload=$(cat /sys/module/ath11k/parameters/nss_offload 2> /dev/null)
+  case "$nss_offload" in
+    1 | Y | y | yes | true | on) ;;
+    *) return 2 ;;
+  esac
+
+  if [ ! -d "/proc/sys/dev/nss/rps" ] || [ ! -d "/proc/sys/dev/nss/n2hcfg" ]; then
+    return 1
+  fi
+
+  return 0
+}
+
 get_num_cpus() {
   local num_cpus
   num_cpus=$(awk -F': ' '/^processor/ {count++} END {print count}' /proc/cpuinfo)
@@ -420,17 +453,151 @@ set_scaling_governor() {
   return 0
 }
 
+# Record this start attempt's apply outcome for the bounded retry chain. The
+# chain re-runs the init as a child process and cannot read pbuf_config_applied,
+# so PBUF_RETRY_OUTCOME_FILE carries the only proof that the profile was really
+# applied: "applied" means apply_nss_config set pbuf_config_applied=1 after the
+# profile readback matched, "skipped" means a deliberate no-op (no ath11k
+# device, nss_offload=0, or the pbuf profile is disabled/unconfigured) that a
+# retry cannot change. The helper is inert outside a retry attempt.
+pbuf_retry_outcome() {
+  [ "${PBUF_RETRY_ACTIVE:-0}" = "1" ] || return 0
+  [ -n "${PBUF_RETRY_OUTCOME_FILE:-}" ] || return 0
+
+  printf '%s\n' "$1" > "$PBUF_RETRY_OUTCOME_FILE" 2> /dev/null || {
+    logger -t "$NAME" -p user.error \
+      "NSS pbuf cannot record the retry outcome in $PBUF_RETRY_OUTCOME_FILE"
+  }
+  return 0
+}
+
+# Schedule one bounded, detached retry chain. Its attempts target cumulative
+# delays of 15 s, 45 s and 120 s after the chain starts: it sleeps 15 s, then
+# 30 s, then 75 s between attempts (15/30/75 are the inter-attempt sleeps; the
+# cumulative targets are 15/45/120). Every attempt re-runs this init's start
+# with PBUF_RETRY_ACTIVE=1 and a PBUF_RETRY_OUTCOME_FILE. Because an attempt
+# runs its own bounded readiness waits (5 s + 5 s) and sysctl readback retries,
+# an attempt can start later than its cumulative target. The chain reports
+# "profile applied" only for a child-recorded "applied" outcome, never from the
+# start exit status alone: a permanent skip also exits 0 without applying, and
+# a start that returns 0 without any outcome is unconfirmed and keeps retrying.
+# The flock guard makes a duplicate transient report a no-op while a chain is
+# already waiting, so one boot cannot accumulate retry chains. /var/lock and
+# /var/run exist from init.d/boot (START=10) before this service runs at
+# START=19.
+schedule_pbuf_retry() {
+  local lock_file=/var/lock/qca-nss-pbuf-retry.lock
+  local outcome_file=/var/run/qca-nss-pbuf-retry.outcome
+  local target delay rc outcome
+
+  [ -x /etc/init.d/qca-nss-pbuf ] || {
+    logger -t "$NAME" -p user.error \
+      "NSS pbuf retry unavailable: /etc/init.d/qca-nss-pbuf is not executable"
+    return 1
+  }
+
+  command -v flock > /dev/null 2>&1 || {
+    logger -t "$NAME" -p user.error \
+      "NSS pbuf retry unavailable: the flock applet is missing"
+    return 1
+  }
+
+  (
+    exec 9> "$lock_file" || {
+      logger -t "$NAME" -p user.error \
+        "NSS pbuf retry cannot open the lock file $lock_file"
+      exit 0
+    }
+    # Another chain is still waiting: this transient report is already covered.
+    flock -n 9 || exit 0
+
+    delay=0
+    for target in 15 45 120; do
+      sleep $((target - delay)) || exit 0
+      delay=$target
+
+      rm -f "$outcome_file"
+      PBUF_RETRY_ACTIVE=1 PBUF_RETRY_OUTCOME_FILE="$outcome_file" \
+        /etc/init.d/qca-nss-pbuf start
+      rc=$?
+      outcome=$(cat "$outcome_file" 2> /dev/null)
+      rm -f "$outcome_file"
+
+      case "$outcome" in
+        applied)
+          if [ "$rc" -eq 0 ]; then
+            logger -t "$NAME" \
+              "NSS pbuf profile applied by the bounded retry (cumulative target ${target}s)"
+          else
+            logger -t "$NAME" \
+              "NSS pbuf profile applied by the bounded retry (cumulative target ${target}s) but start returned $rc for later non-profile steps"
+          fi
+          exit 0
+          ;;
+        skipped)
+          logger -t "$NAME" -p user.notice \
+            "NSS pbuf bounded retry stopped: the profile is a permanent skip (no ath11k device, nss_offload=0 or pbuf disabled); nothing was applied"
+          exit 0
+          ;;
+      esac
+
+      if [ "$rc" -eq 0 ]; then
+        logger -t "$NAME" -p user.error \
+          "NSS pbuf start returned success without confirming a profile apply; continuing the bounded retry"
+      fi
+    done
+
+    logger -t "$NAME" -p user.error \
+      "NSS pbuf bounded retry exhausted after the 120s cumulative target; the profile apply was not confirmed"
+  ) > /dev/null 2>&1 &
+}
+
+# Called by start() when the bounded fast-path waits end in a transient state.
+# Only the initial (boot) attempt schedules the retry chain; attempts made from
+# inside the chain log the still-transient state without scheduling a new chain.
+pbuf_start_transient_failure() {
+  if [ "${PBUF_RETRY_ACTIVE:-0}" = "1" ]; then
+    logger -t "$NAME" -p user.notice \
+      "NSS pbuf readiness is still transient during the bounded retry"
+    return 0
+  fi
+
+  logger -t "$NAME" -p user.error \
+    "NSS pbuf readiness is transient; scheduling a bounded retry chain (cumulative 15/45/120s targets)"
+  schedule_pbuf_retry
+}
+
 start() {
+  local readiness
 
   pbuf_config_applied=0
-  wait_for_ath11k_nss_offload 5 || return 0
+  wait_for_ath11k_nss_offload 5 || {
+    pbuf_readiness_state
+    readiness=$?
+    case "$readiness" in
+      0) ;;
+      2) pbuf_retry_outcome skipped; return 0 ;;
+      *) pbuf_start_transient_failure; return 1 ;;
+    esac
+  }
   wait_for_nss_sysctls 5 || {
     logger -t "$NAME" -p user.notice "NSS RPS/N2H sysctls are unavailable. Skipping applying wifi nss configs"
-    return 0
+    pbuf_start_transient_failure
+    return 1
   }
 
   apply_nss_config || return 1
-  [ "$pbuf_config_applied" -eq 1 ] || return 0
+  if [ "$pbuf_config_applied" -ne 1 ]; then
+    # apply_nss_config reports compatible no-ops as success. A retry chain must
+    # not read that as an applied profile, so classify the no-op: a permanent
+    # skip stops the chain, a vanished sysctl tree keeps retrying.
+    pbuf_readiness_state
+    case "$?" in
+      2 | 0) pbuf_retry_outcome skipped; return 0 ;;
+      *) pbuf_start_transient_failure; return 1 ;;
+    esac
+  fi
+  pbuf_retry_outcome applied
 
   num_cpus=$(get_num_cpus)
   hash_bitmap="$(((1 << num_cpus) - 1))"

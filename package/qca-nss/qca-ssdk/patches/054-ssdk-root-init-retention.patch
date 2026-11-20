@@ -1,0 +1,656 @@
+Subject: [PATCH] ssdk: retain root init state and preserve the first error
+
+Replace the withdrawn bare fail-closed return with an explicit root-init
+contract. Pre-publication failures (topology, private slots/PHY metadata,
+platform MMIO/clock, platform driver, chip probe) are unwound in the serial
+order regi_exit() already uses for the same stages -- module-wide driver
+publication, PHY metadata, per-device platform rights, private slots and
+topology -- and may fail module init with an explicit errno. Post-publication
+failures (FAL/PHY, HPPE/switch and per-device producers) are retained: module
+init returns 0, only the first error is latched and logged, and the netdev
+cache is withheld so qca-nss-dp fails closed instead of binding to a
+half-initialized SSDK.
+
+FAL keeps its own first error and PHY initialization is not attempted after a
+FAL failure; the HPPE return becomes a required stage result. The platform
+driver publication is module-wide and owned exactly once. ssdk_plat_init()
+keeps its Linux errnos but its bare SW_FAIL becomes an honest -EIO. The
+stage/dev_stage context is read back for log naming and abort scoping.
+Sysfs/genl stay diagnostic-only: their failures are logged, never fatal and
+never cache-gating. Netdev notifier failure is logged as the qca-nss-dp
+netdev-cache contract violation. Work producers gain initialized guards so a
+retained partial init can be unloaded without touching unstarted timers.
+
+--- a/src/init/ssdk_init.c
++++ b/src/init/ssdk_init.c
+@@ -113,7 +113,163 @@
+ #ifdef IN_SFP_PHY
+ #include "sfp_phy.h"
+ #endif
++
++/* Root module-init context.
++ *
++ * A negative module_init result makes the kernel free the module without ever
++ * calling module_exit(). A failure may therefore only be fatal while every
++ * resource it leaves behind still has a proven inverse. The pre-publication
++ * stages (topology, private slots/PHY metadata, platform MMIO/clock, platform
++ * driver) have such inverses. From FAL/PHY initialization on, producers are
++ * published and the only safe outcome is retention: keep the module resident,
++ * preserve the first error and withhold the netdev cache so qca-nss-dp fails
++ * closed instead of binding to a half-initialized SSDK.
++ */
++enum ssdk_root_stage {
++	SSDK_ROOT_STAGE_NONE = 0,
++	SSDK_ROOT_STAGE_TOPOLOGY,
++	SSDK_ROOT_STAGE_PRIV,
++	SSDK_ROOT_STAGE_PLAT,
++	SSDK_ROOT_STAGE_DRIVER,
++	SSDK_ROOT_STAGE_CHIP,
++	SSDK_ROOT_STAGE_SDK,
++	SSDK_ROOT_STAGE_SWITCH,
++};
++
++enum ssdk_root_domain {
++	SSDK_ROOT_DOMAIN_SW = 0,
++	SSDK_ROOT_DOMAIN_LINUX,
++};
++
++struct ssdk_root_context {
++	enum ssdk_root_stage stage;
++	int first_err;
++	enum ssdk_root_stage first_stage;
++	enum ssdk_root_domain first_domain;
++	a_uint32_t first_dev_id;
++	a_uint32_t dev_initialized;
++	a_bool_t published;
++	a_bool_t no_device;
++	enum ssdk_root_stage dev_stage[SW_MAX_NR_DEV];
++};
++
++static struct ssdk_root_context ssdk_root;
++
++/* Producer idempotence flags: a retained partial init can be unloaded, so a
++ * stop function must not touch a work item whose init never ran. */
++static bool ssdk_mac_sw_sync_work_initialized[SW_MAX_NR_DEV];
++static bool ssdk_qm_err_check_work_initialized[SW_MAX_NR_DEV];
++
++#ifndef SSDK_STR
++#define SSDK_STR "ssdk"
++#endif
++
++static const char *ssdk_root_stage_name(enum ssdk_root_stage stage)
++{
++	switch (stage) {
++	case SSDK_ROOT_STAGE_NONE:
++		return "none";
++	case SSDK_ROOT_STAGE_TOPOLOGY:
++		return "topology";
++	case SSDK_ROOT_STAGE_PRIV:
++		return "priv";
++	case SSDK_ROOT_STAGE_PLAT:
++		return "plat";
++	case SSDK_ROOT_STAGE_DRIVER:
++		return "driver";
++	case SSDK_ROOT_STAGE_CHIP:
++		return "chip";
++	case SSDK_ROOT_STAGE_SDK:
++		return "sdk";
++	case SSDK_ROOT_STAGE_SWITCH:
++		return "switch";
++	default:
++		return "unknown";
++	}
++}
++
++/* A fresh init context, including the static producer state a retained load
++ * may leave behind. The stop paths read these flags, so a partial init must
++ * never inherit a stale "initialized" claim. */
++static void ssdk_root_reset(void)
++{
++	memset(&ssdk_root, 0, sizeof(ssdk_root));
++	memset(ssdk_mac_sw_sync_work_initialized, 0,
++	       sizeof(ssdk_mac_sw_sync_work_initialized));
++	memset(ssdk_qm_err_check_work_initialized, 0,
++	       sizeof(ssdk_qm_err_check_work_initialized));
++	ssdk_dev_notifier_error = 0;
++	ssdk_root.stage = SSDK_ROOT_STAGE_NONE;
++}
++
++/* Record the stage that is about to run. The abort path reads dev_stage[] to
++ * decide which devices were exposed to a stage; the logs read the module-level
++ * stage to name the retained/aborted context. */
++static void ssdk_root_stage_set(enum ssdk_root_stage stage, a_uint32_t dev_id)
++{
++	ssdk_root.stage = stage;
++	if (dev_id < SW_MAX_NR_DEV)
++		ssdk_root.dev_stage[dev_id] = stage;
++}
++
++/* Record only the first business error; later failures and cleanup errors must
++ * not overwrite the cause that explains the degraded state. */
++static void ssdk_root_latch(enum ssdk_root_stage stage, a_uint32_t dev_id,
++			    int err, enum ssdk_root_domain domain)
++{
++	if (err == 0 || ssdk_root.first_err)
++		return;
++	ssdk_root.first_err = err;
++	ssdk_root.first_stage = stage;
++	ssdk_root.first_domain = domain;
++	ssdk_root.first_dev_id = dev_id;
++}
++
++/* ssdk_plat_init() returns SW_FAIL for a mapping/region failure and explicit
++ * Linux errnos for argument/ownership rejections; only SW_FAIL needs the SSDK
++ * error domain so the abort cannot return the bare "-1". */
++static enum ssdk_root_domain ssdk_root_plat_domain(int err)
++{
++	return err == SW_FAIL ? SSDK_ROOT_DOMAIN_SW : SSDK_ROOT_DOMAIN_LINUX;
++}
++
++/* Convert the latched error into the negative errno returned by module_init.
++ * Linux-domain values are already errnos and are kept verbatim. SSDK values
++ * are mapped explicitly: SW_NOT_SUPPORTED (-19) must never be reported as a
++ * no-device error, because only chip_ver_get may mean "no device". */
++static int ssdk_root_errno(int err, enum ssdk_root_domain domain)
++{
++	int rv = 0;
+ 
++	if (err == SW_OK)
++		return 0;
++	if (domain == SSDK_ROOT_DOMAIN_LINUX) {
++		rv = err;
++	} else {
++		switch (err) {
++		case SW_NOT_SUPPORTED:
++			return -EOPNOTSUPP;
++		case SW_OUT_OF_MEM:
++			return -ENOMEM;
++		case SW_ALREADY_EXIST:
++			return -EEXIST;
++		case SW_BUSY:
++			return -EBUSY;
++		case SW_OUT_OF_RANGE:
++		case SW_BAD_VALUE:
++		case SW_BAD_PARAM:
++		case SW_BAD_PTR:
++		case SW_BAD_LEN:
++			return -EINVAL;
++		default:
++			return -EIO;
++		}
++	}
++	/* -ENODEV is reserved for chip_ver_get's "no device" sentinel: a module
++	 * init failure must never be misread as an absent switch. */
++	return rv == -ENODEV ? -EIO : rv;
++}
++
+ extern void qca_ar8327_sw_mac_polling_task(struct qca_phy_priv *priv);
+ extern void qca_ar8327_sw_mib_task(struct qca_phy_priv *priv);
+ 
+@@ -994,6 +1150,8 @@
+ 
+ 	mutex_init(&priv->qm_lock);
+ 	INIT_DELAYED_WORK(&priv->qm_dwork_polling, qm_err_check_work_task_polling);
++	if (priv->device_id < SW_MAX_NR_DEV)
++		ssdk_qm_err_check_work_initialized[priv->device_id] = true;
+ }
+ 
+ void qm_err_check_work_start(struct qca_phy_priv *priv)
+@@ -1013,8 +1171,12 @@
+ 
+ void qm_err_check_work_stop(struct qca_phy_priv *priv)
+ {
+-	if (_qm_err_work_chip_check(priv) != SW_OK)
++	if (!priv || _qm_err_work_chip_check(priv) != SW_OK)
+ 		return;
++	/* A retained partial init may be unloaded before this work was set up. */
++	if (priv->device_id >= SW_MAX_NR_DEV ||
++	    !ssdk_qm_err_check_work_initialized[priv->device_id])
++		return;
+ 
+ 	cancel_delayed_work_sync(&priv->qm_dwork_polling);
+ }
+@@ -1067,6 +1229,8 @@
+ 
+ 	INIT_DELAYED_WORK(&priv->mac_sw_sync_dwork,
+ 			qca_mac_sw_sync_work_task);
++	if (priv->device_id < SW_MAX_NR_DEV)
++		ssdk_mac_sw_sync_work_initialized[priv->device_id] = true;
+ 
+ 	return 0;
+ }
+@@ -1101,6 +1265,10 @@
+ 	{
+ 		return SW_NOT_SUPPORTED;
+ 	}
++	/* A retained partial init may be unloaded before this work was set up. */
++	if (priv->device_id >= SW_MAX_NR_DEV ||
++	    !ssdk_mac_sw_sync_work_initialized[priv->device_id])
++		return SW_NOT_SUPPORTED;
+ 	rv = _ssdk_mac_sw_sync_chip_check(priv);
+ 	SW_RTN_ON_ERROR(rv);
+ 
+@@ -1608,12 +1776,16 @@
+ {
+ 	sw_error_t rv;
+ 
+-	/* The legacy FAL-error path may continue into PHY initialization. */
++	/* The FAL first error is preserved: it is not overwritten by the always
++	 * successful PHY init, and PHY initialization is not attempted after a
++	 * FAL failure. The caller decides between rollback and retention. */
+ 	rv = sd_init_check(dev_id, cfg);
+ 	SW_RTN_ON_ERROR(rv);
+ 	rv = fal_init(dev_id, cfg);
+-	if (rv != SW_OK)
++	if (rv != SW_OK) {
+ 		SSDK_ERROR("ssdk fal init failed: %d. \r\n", rv);
++		return rv;
++	}
+ 
+ /*qca808x_end*/
+ 	if(!ssdk_is_emulation(dev_id))
+@@ -1682,24 +1854,48 @@
+ }
+ /*qca808x_end*/
+ 
+-static void ssdk_driver_register(a_uint32_t dev_id)
++static bool ssdk_driver_owned;
++
++/* Module-wide platform driver publication: register once for the devices whose
++ * register access mode needs it, and let the caller see the error. */
++static int ssdk_driver_register(a_uint32_t dev_id)
+ {
+ 	hsl_reg_mode reg_mode;
++	int rv;
+ 
+ 	reg_mode = ssdk_switch_reg_access_mode_get(dev_id);
+-	if(reg_mode == HSL_REG_LOCAL_BUS) {
+-		platform_driver_register(&ssdk_driver);
++	if (reg_mode != HSL_REG_LOCAL_BUS)
++		return 0;
++	if (ssdk_driver_owned)
++		return 0;
++	rv = platform_driver_register(&ssdk_driver);
++	if (rv) {
++		SSDK_ERROR("qca-ssdk platform driver registration failed (code: %d)\n",
++			   rv);
++		return rv;
+ 	}
++	ssdk_driver_owned = true;
++	return 0;
+ }
+ 
++/* Withdraw the module-wide publication exactly once. The abort path cannot
++ * depend on the per-device register access mode that happens to own it. */
++static void ssdk_driver_unregister_owned(void)
++{
++	if (!ssdk_driver_owned)
++		return;
++	platform_driver_unregister(&ssdk_driver);
++	ssdk_driver_owned = false;
++}
++
+ static void ssdk_driver_unregister(a_uint32_t dev_id)
+ {
+ 	hsl_reg_mode reg_mode;
+ 
+-	reg_mode= ssdk_switch_reg_access_mode_get(dev_id);
+-	if (reg_mode == HSL_REG_LOCAL_BUS) {
+-		platform_driver_unregister(&ssdk_driver);
+-	}
++	reg_mode = ssdk_switch_reg_access_mode_get(dev_id);
++	if (reg_mode != HSL_REG_LOCAL_BUS)
++		return;
++	ssdk_driver_unregister_owned();
+ }
+ /*qca808x_start*/
+ static inline a_uint32_t qca_detect_phyid(a_uint32_t dev_id)
+@@ -2009,7 +2205,10 @@
+ 		ssdk_dev_notifier_owned = false;
+ 		/* Replay rollback excludes its current failing device. */
+ 		ssdk_netdev_cache_stop();
+-		SSDK_ERROR("optional netdev notifier registration failed (code: %d)\n",
++		/* Notifier failure leaves the cache uncommitted, which is the
++		 * contracted degraded state for the hard consumer: qca-nss-dp
++		 * refuses admission when the cache is not live. */
++		SSDK_ERROR("qca-ssdk netdev cache contract violation: netdev notifier registration failed (code: %d); netdev cache not started; qca-nss-dp will refuse\n",
+ 			ssdk_dev_notifier_error);
+ 		return;
+ 	}
+@@ -2107,6 +2306,35 @@
+ 	}
+ 	kfree(prepared);
+ 	return rv;
++}
++
++/* Undo a pre-publication failure. Only stages whose inverse is proven are
++ * reachable here, and the order mirrors the serial order regi_exit() already
++ * uses for the same stages: the module-wide platform driver publication is
++ * removed first, then the PHY metadata published by ssdk_alloc_priv(), then the
++ * per-device platform MMIO/clock rights, and finally the private slots and the
++ * topology. dev_stage[] witnesses which devices were exposed to the platform
++ * stage; ssdk_plat_exit() is documented and modelled as a safe no-op for a
++ * device whose acquisition did not complete (its owner field is still NULL).
++ * FAL/PHY/switch producers were never started, so a negative module_init
++ * return leaves no module code referenced. */
++static void ssdk_root_abort_unpublished(a_uint32_t dev_num)
++{
++	a_uint32_t dev_id;
++	sw_error_t phy_rv;
++
++	ssdk_driver_unregister_owned();
++	for (dev_id = 0; dev_id < dev_num; dev_id++) {
++		phy_rv = ssdk_phy_driver_cleanup(dev_id);
++		if (phy_rv != SW_OK)
++			SSDK_ERROR("qca-%s device %u PHY metadata cleanup failed (code: %d)\n",
++				   SSDK_STR, dev_id, phy_rv);
++	}
++	for (dev_id = 0; dev_id < dev_num; dev_id++) {
++		if (ssdk_root.dev_stage[dev_id] >= SSDK_ROOT_STAGE_PLAT)
++			ssdk_plat_exit(dev_id);
++	}
++	ssdk_free_priv();
+ }
+ 
+ #ifndef SSDK_STR
+@@ -2165,20 +2393,30 @@
+ /*qca808x_start*/
+ 	int rv = 0;
+ /*qca808x_end*/
+-	/*init switch device num firstly*/
+-	rv = ssdk_switch_device_num_init();
+-	if (rv)
+-		return rv;
+ 
++	ssdk_root_reset();
++
++	/* Stage topology: the node set is the first acquisition and its helper
++	 * already unwinds a failed attempt. */
++	ssdk_root_stage_set(SSDK_ROOT_STAGE_TOPOLOGY, 0);
++	rv = ssdk_switch_device_num_init();
++	if (rv) {
++		ssdk_root_latch(SSDK_ROOT_STAGE_TOPOLOGY, 0, rv,
++				SSDK_ROOT_DOMAIN_LINUX);
++		return ssdk_root_errno(rv, SSDK_ROOT_DOMAIN_LINUX);
++	}
+ 	dev_num = ssdk_switch_device_num_get();
+ /*qca808x_start*/
++	ssdk_root_stage_set(SSDK_ROOT_STAGE_PRIV, 0);
+ 	rv = ssdk_alloc_priv(dev_num);
+ 	if (rv) {
+ /*qca808x_end*/
++		ssdk_root_latch(SSDK_ROOT_STAGE_PRIV, 0, rv,
++				SSDK_ROOT_DOMAIN_LINUX);
+ 		/* Only this invocation's topology was acquired before allocation. */
+ 		ssdk_switch_device_num_exit();
+ /*qca808x_start*/
+-		return rv;
++		return ssdk_root_errno(rv, SSDK_ROOT_DOMAIN_LINUX);
+ 	}
+ 
+ 	for (num = 0; num < dev_num; num++) {
+@@ -2190,25 +2428,65 @@
+ 			continue;
+ 		}
+ #endif
+-
++/*qca808x_start*/
+ 		/* device id is the array index */
+ 		qca_phy_priv_global[dev_id]->device_id = ssdk_device_id_get(dev_id);
+ 		qca_phy_priv_global[dev_id]->of_node = ssdk_dts_node_get(dev_id);
+ 		qca_phy_priv_global[dev_id]->ports = SSDK_PHYSICAL_PORT7;
+ /*qca808x_start*/
++		/* Pre-publication stage. Only failures whose cleanup is proven may
++		 * abort here; a later device is already post-publication. */
++		ssdk_root_stage_set(SSDK_ROOT_STAGE_PLAT, dev_id);
+ 		rv = ssdk_plat_init(&cfg, dev_id);
+-		SW_CNTU_ON_ERROR_AND_COND1_OR_GOTO_OUT(rv, -ENODEV);
++		if (rv != SW_OK) {
++			ssdk_root_latch(SSDK_ROOT_STAGE_PLAT, dev_id, rv,
++					ssdk_root_plat_domain(rv));
++			if (ssdk_root.published)
++				goto retain;
++			goto abort;
++		}
+ /*qca808x_end*/
+-		ssdk_driver_register(dev_id);
++		ssdk_root_stage_set(SSDK_ROOT_STAGE_DRIVER, dev_id);
++		rv = ssdk_driver_register(dev_id);
++		if (rv) {
++			ssdk_root_latch(SSDK_ROOT_STAGE_DRIVER, dev_id, rv,
++					SSDK_ROOT_DOMAIN_LINUX);
++			if (ssdk_root.published)
++				goto retain;
++			goto abort;
++		}
+ /*qca808x_start*/
++		ssdk_root_stage_set(SSDK_ROOT_STAGE_CHIP, dev_id);
+ 		rv = chip_ver_get(dev_id, &cfg);
+-		SW_CNTU_ON_ERROR_AND_COND1_OR_GOTO_OUT(rv, -ENODEV);
++		if (rv == -ENODEV) {
++			/* Only chip_ver_get may interpret -ENODEV as "no device":
++			 * an unsupported switch is not an initialization error. */
++			ssdk_root.no_device = A_TRUE;
++			continue;
++		}
++		if (rv != SW_OK) {
++			ssdk_root_latch(SSDK_ROOT_STAGE_CHIP, dev_id, rv,
++					SSDK_ROOT_DOMAIN_SW);
++			if (ssdk_root.published)
++				goto retain;
++			goto abort;
++		}
+ 
++		/* Publication boundary: FAL/PHY initialization starts here. From
++		 * this point a failure is retained instead of returned, because a
++		 * negative module_init result frees this module without ever
++		 * calling module_exit(), while published callbacks remain live. */
++		ssdk_root.published = A_TRUE;
++		ssdk_root_stage_set(SSDK_ROOT_STAGE_SDK, dev_id);
+ 		rv = ssdk_init(dev_id, &cfg);
+-		SW_CNTU_ON_ERROR_AND_COND1_OR_GOTO_OUT(rv, -ENODEV);
++		if (rv != SW_OK) {
++			ssdk_root_latch(SSDK_ROOT_STAGE_SDK, dev_id, rv,
++					SSDK_ROOT_DOMAIN_SW);
++			goto retain;
++		}
+ /*qca808x_end*/
++		ssdk_root_stage_set(SSDK_ROOT_STAGE_SWITCH, dev_id);
+ 
+-
+ 		switch (cfg.chip_type)
+ 		{
+ 			case CHIP_ISIS:
+@@ -2217,8 +2495,18 @@
+ 				if (qca_phy_priv_global[dev_id]->of_node) {
+ 					qca_ar8327_gpio_reset(qca_phy_priv_global[dev_id]);
+ 					rv = ssdk_switch_register(dev_id, cfg.chip_type);
+-					SW_CNTU_ON_ERROR_AND_COND1_OR_GOTO_OUT(rv, -ENODEV);
++					if (rv != SW_OK) {
++						ssdk_root_latch(SSDK_ROOT_STAGE_SWITCH, dev_id,
++								rv, SSDK_ROOT_DOMAIN_SW);
++						goto retain;
++					}
++					++ssdk_root.dev_initialized;
+ 					rv = qca_ar8327_hw_init(qca_phy_priv_global[dev_id]);
++					if (rv != SW_OK) {
++						ssdk_root_latch(SSDK_ROOT_STAGE_SWITCH, dev_id,
++								rv, SSDK_ROOT_DOMAIN_SW);
++						goto retain;
++					}
+ 					SSDK_INFO("Initializing ISISC Done!!\n");
+ 				}
+ #endif
+@@ -2227,9 +2515,18 @@
+ #if defined(MHT)
+ 				qca_phy_priv_global[dev_id]->ports = SSDK_PHYSICAL_PORT6;
+ 				rv = qca_mht_hw_init(&cfg, dev_id);
+-				SW_CNTU_ON_ERROR_AND_COND1_OR_GOTO_OUT(rv, -ENODEV);
++				if (rv != SW_OK) {
++					ssdk_root_latch(SSDK_ROOT_STAGE_SWITCH, dev_id,
++							rv, SSDK_ROOT_DOMAIN_SW);
++					goto retain;
++				}
+ 				rv = ssdk_switch_register(dev_id, cfg.chip_type);
+-				SW_CNTU_ON_ERROR_AND_COND1_OR_GOTO_OUT(rv, -ENODEV);
++				if (rv != SW_OK) {
++					ssdk_root_latch(SSDK_ROOT_STAGE_SWITCH, dev_id,
++							rv, SSDK_ROOT_DOMAIN_SW);
++					goto retain;
++				}
++				++ssdk_root.dev_initialized;
+ 				SSDK_INFO("Initializing MHT Done!!\n");
+ #endif
+ 				break;
+@@ -2242,15 +2539,32 @@
+ 					qca_phy_priv_global[dev_id]->ports = SSDK_PHYSICAL_PORT3;
+ 				qca_appe_hw_init(dev_id);
+ 				rv = ssdk_switch_register(dev_id, cfg.chip_type);
+-				SW_CNTU_ON_ERROR_AND_COND1_OR_GOTO_OUT(rv, -ENODEV);
++				if (rv != SW_OK) {
++					ssdk_root_latch(SSDK_ROOT_STAGE_SWITCH, dev_id,
++							rv, SSDK_ROOT_DOMAIN_SW);
++					goto retain;
++				}
++				++ssdk_root.dev_initialized;
+ 				SSDK_INFO("Initializing %s Done!!\n", PPE_STR);
+ #endif
+ 				break;
+ 			case CHIP_HPPE:
+ #if defined(HPPE)
+-				qca_hppe_hw_init(dev_id);
++				/* The HPPE return is a required stage result, not a
++				 * diagnostic: no switch registration follows a failure. */
++				rv = qca_hppe_hw_init(dev_id);
++				if (rv != SW_OK) {
++					ssdk_root_latch(SSDK_ROOT_STAGE_SWITCH, dev_id,
++							rv, SSDK_ROOT_DOMAIN_SW);
++					goto retain;
++				}
+ 				rv = ssdk_switch_register(dev_id, cfg.chip_type);
+-				SW_CNTU_ON_ERROR_AND_COND1_OR_GOTO_OUT(rv, -ENODEV);
++				if (rv != SW_OK) {
++					ssdk_root_latch(SSDK_ROOT_STAGE_SWITCH, dev_id,
++							rv, SSDK_ROOT_DOMAIN_SW);
++					goto retain;
++				}
++				++ssdk_root.dev_initialized;
+ 				SSDK_INFO("Initializing %s Done!!\n", PPE_STR);
+ #endif
+ 				break;
+@@ -2260,14 +2574,23 @@
+ 			case CHIP_SCOMPHY:
+ #if defined(SCOMPHY)
+ 					rv = qca_scomphy_hw_init(&cfg, dev_id);
+-					SW_CNTU_ON_ERROR_AND_COND1_OR_GOTO_OUT(rv, -ENODEV);
++					if (rv != SW_OK) {
++						ssdk_root_latch(SSDK_ROOT_STAGE_SWITCH, dev_id,
++								rv, SSDK_ROOT_DOMAIN_SW);
++						goto retain;
++					}
+ #if defined(MP)
+ 					if(cfg.phy_id == MP_GEPHY)
+ 					{
+ 						qca_phy_priv_global[dev_id]->ports =
+ 							SSDK_PHYSICAL_PORT3;
+ 						rv = ssdk_switch_register(dev_id, cfg.chip_type);
+-						SW_CNTU_ON_ERROR_AND_COND1_OR_GOTO_OUT(rv, -ENODEV);
++						if (rv != SW_OK) {
++							ssdk_root_latch(SSDK_ROOT_STAGE_SWITCH,
++									dev_id, rv, SSDK_ROOT_DOMAIN_SW);
++							goto retain;
++						}
++						++ssdk_root.dev_initialized;
+ 					}
+ #endif
+ 					SSDK_INFO("Initializing SCOMPHY Done!!\n");
+@@ -2280,32 +2603,73 @@
+ 
+ 	}
+ /*qca808x_end*/
++	goto out;
+ 
+-	ssdk_sysfs_init();
++retain:
++	/* Retention, not a fatal return: the module stays resident, so the
++	 * registered platform driver, published producers and partially built
++	 * tables remain valid. The latched first error is the single degraded
++	 * state explanation; no rollback is attempted after publication. The
++	 * netdev cache stays uncommitted and qca-nss-dp therefore fails closed. */
++	SSDK_ERROR("qca-%s module init retained in stage %s device %u (first error code: %d); module stays resident; netdev cache withheld; qca-nss-dp will refuse\n",
++		   SSDK_STR, ssdk_root_stage_name(ssdk_root.stage),
++		   ssdk_root.first_dev_id, ssdk_root.first_err);
++
++out:
++	/* Diagnostic plane only. Failures are logged, never abort and never gate
++	 * the netdev cache; regi_exit's fdb-retire path stops it once. */
++	if (ssdk_root.first_err == SW_OK) {
++		rv = ssdk_sysfs_init();
++		if (rv)
++			SSDK_ERROR("qca-%s sysfs diagnostic plane degraded (code: %d); control plane continues\n",
++				   SSDK_STR, rv);
+ #ifdef IN_NETLINK
+-	ssdk_genl_init();
++		rv = ssdk_genl_init();
++		if (rv)
++			SSDK_ERROR("qca-%s genl diagnostic plane degraded (code: %d); control plane continues\n",
++				   SSDK_STR, rv);
+ #endif
++	}
+ 
+-	if (rv == 0){
+-		/* register the notifier later should be ok */
++	/* Netdev cache admission is the contract with qca-nss-dp: commit it only
++	 * for a clean root init that admitted at least one switch device. A
++	 * retained init never reaches the commit; a notifier failure is logged by
++	 * ssdk_netdev_notifier_register() as a contract violation. */
++	if (ssdk_root.first_err == SW_OK && ssdk_root.dev_initialized > 0)
+ 		ssdk_netdev_notifier_register();
+-	}
+ /*qca808x_start*/
+ 
+-out:
+-	if (rv == 0)
+-		SSDK_INFO("qca-%s module init succeeded!\n", SSDK_STR);
+-	else {
+-		if (rv == -ENODEV) {
+-			rv = 0;
++	if (ssdk_root.first_err != SW_OK) {
++		SSDK_INFO("qca-%s module init retained: initialized devices=%u; netdev cache withheld\n",
++			  SSDK_STR, ssdk_root.dev_initialized);
++		return 0;
++	}
++	if (ssdk_root.dev_initialized == 0) {
++		if (ssdk_root.no_device)
+ 			SSDK_INFO("qca-%s module init, no device found!\n", SSDK_STR);
+-		} else {
+-			SSDK_INFO("qca-%s module init failed! (code: %d)\n", SSDK_STR, rv);
+-			ssdk_free_priv();
+-		}
++		else
++			SSDK_ERROR("qca-%s: no admitted switch device; netdev cache not started; qca-nss-dp will refuse\n",
++				   SSDK_STR);
++		return 0;
+ 	}
++	if (ssdk_dev_notifier_error)
++		SSDK_INFO("qca-%s module init succeeded; netdev cache not live; qca-nss-dp will refuse\n",
++			  SSDK_STR);
++	else
++		SSDK_INFO("qca-%s module init succeeded!\n", SSDK_STR);
+ 
+-	return rv;
++	return 0;
++
++abort:
++	/* Every acquired resource has a proven inverse at this point, so a
++	 * negative module_init return leaves no module code referenced. The
++	 * helper mirrors regi_exit's serial order and unwinds only the stages
++	 * witnessed by dev_stage[]. */
++	SSDK_ERROR("qca-%s module init aborted in stage %s device %u (first error code: %d); pre-publication resources released\n",
++		   SSDK_STR, ssdk_root_stage_name(ssdk_root.stage),
++		   ssdk_root.first_dev_id, ssdk_root.first_err);
++	ssdk_root_abort_unpublished(dev_num);
++	return ssdk_root_errno(ssdk_root.first_err, ssdk_root.first_domain);
+ }
+ 
+ static void __exit

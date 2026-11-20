@@ -98,6 +98,9 @@ seq() {
 }
 wait_for_ath11k_nss_offload() { trace offload; return "$PBUF_OFFLOAD_RC"; }
 wait_for_nss_sysctls() { trace sysctls; return "$PBUF_SYSCTLS_RC"; }
+pbuf_readiness_state() { return "$PBUF_READINESS_RC"; }
+pbuf_start_transient_failure() { trace transient; return 0; }
+pbuf_retry_outcome() { trace "outcome:$1"; return 0; }
 apply_nss_config() { trace apply; pbuf_config_applied=$PBUF_APPLIED; return "$PBUF_APPLY_RC"; }
 write_sysctl_exact() {
   [ "$1" = dev.nss.rps.hash_bitmap ] && [ "$2" = 7 ] || return 98
@@ -140,18 +143,25 @@ cases = [
     case('stats-mid-error', 'set_stats_disable', 37, fail1='stats1', writes='stats'),
     case('stats-multiple-errors', 'set_stats_disable', 37, fail1='stats0', fail2='stats2', writes='stats'),
     case('stats-real-write-error', 'set_stats_disable', 1, directory='stats1', writes='stats', real_error=True),
-    case('start-normal', 'start', writes='all'),
-    case('start-offload-skip', 'start', offload_rc=1, writes='none'),
-    case('start-sysctls-skip', 'start', sysctls_rc=1, writes='none'),
-    case('start-profile-skip', 'start', applied=0, writes='none'),
+    case('start-normal', 'start', writes='all', outcome='applied'),
+    case('start-offload-skip', 'start', offload_rc=1, writes='none', outcome='skipped'),
+    case('start-offload-transient', 'start', 1, offload_rc=1, readiness_rc=1,
+         writes='none', transient=1),
+    case('start-offload-ready-race', 'start', offload_rc=1, readiness_rc=0, writes='all',
+         outcome='applied'),
+    case('start-sysctls-skip', 'start', 1, sysctls_rc=1, writes='none', transient=1),
+    case('start-profile-skip', 'start', applied=0, readiness_rc=0, writes='none',
+         outcome='skipped'),
+    case('start-profile-sysctl-race', 'start', 1, applied=0, readiness_rc=1,
+         writes='none', transient=1),
     case('start-apply-error', 'start', 1, apply_rc=7, writes='none'),
-    case('start-rps-error', 'start', 1, rps_rc=9, writes='none'),
-    case('start-governor-error', 'start', 37, fail1='cpu1', writes='cpu01'),
-    case('start-stats-error', 'start', 37, fail1='stats1', writes='all'),
-    case('reload-governor-error', 'reload', 37, fail1='cpu1', writes='cpu01'),
-    case('restart-stats-error', 'restart', 37, fail1='stats1', writes='all'),
-    case('reload-wifi-error', 'reload', 9, wifi_rc=9, writes='all', wifi=1),
-    case('restart-normal', 'restart', writes='all', wifi=1),
+    case('start-rps-error', 'start', 1, rps_rc=9, writes='none', outcome='applied'),
+    case('start-governor-error', 'start', 37, fail1='cpu1', writes='cpu01', outcome='applied'),
+    case('start-stats-error', 'start', 37, fail1='stats1', writes='all', outcome='applied'),
+    case('reload-governor-error', 'reload', 37, fail1='cpu1', writes='cpu01', outcome='applied'),
+    case('restart-stats-error', 'restart', 37, fail1='stats1', writes='all', outcome='applied'),
+    case('reload-wifi-error', 'reload', 9, wifi_rc=9, writes='all', wifi=1, outcome='applied'),
+    case('restart-normal', 'restart', writes='all', wifi=1, outcome='applied'),
 ]
 variants = [('candidate', body, True)]
 if args.baseline:
@@ -172,7 +182,23 @@ if args.mutations:
         mutate('masked-discovery', 'stats_files=$(find /sys/kernel/debug/ath11k -name stats_disable) || return $?', 'stats_files=$(find /sys/kernel/debug/ath11k -name stats_disable)'),
         mutate('lost-first-stats-error', '[ "$rc" -ne 0 ] || rc=$write_rc', 'rc=$write_rc'),
         mutate('masked-stats-write', '  return "$rc"\n', '  return 0\n'),
-        mutate('broken-compatible-skip', 'wait_for_ath11k_nss_offload 5 || return 0', 'wait_for_ath11k_nss_offload 5 || return 1'),
+        mutate('masked-offload-transient',
+               '      2) pbuf_retry_outcome skipped; return 0 ;;\n      *) pbuf_start_transient_failure; return 1 ;;',
+               '      2) pbuf_retry_outcome skipped; return 0 ;;\n      *) return 1 ;;'),
+        mutate('masked-sysctl-transient', '    pbuf_start_transient_failure\n    return 1', '    return 1'),
+        mutate('masked-applied-outcome', '  pbuf_retry_outcome applied\n', ''),
+        mutate('masked-skipped-outcome',
+               '      2) pbuf_retry_outcome skipped; return 0 ;;\n',
+               '      2) return 0 ;;\n'),
+        mutate('skipped-recorded-as-applied',
+               '      2) pbuf_retry_outcome skipped; return 0 ;;\n',
+               '      2) pbuf_retry_outcome applied; return 0 ;;\n'),
+        mutate('profile-skip-as-applied',
+               '      2 | 0) pbuf_retry_outcome skipped; return 0 ;;\n',
+               '      2 | 0) pbuf_retry_outcome applied; return 0 ;;\n'),
+        mutate('sysctl-race-treated-as-skip',
+               '      2 | 0) pbuf_retry_outcome skipped; return 0 ;;\n',
+               '      0 | 1 | 2) pbuf_retry_outcome skipped; return 0 ;;\n'),
         mutate('stats-read-splits-paths', 'while IFS= read -r stats_file;', 'while read stats_file;'),
     ]
 records = []
@@ -212,6 +238,7 @@ for label, code, must_pass in variants:
                    PBUF_FAIL1=str(keys.get(row.get('fail1'), work / 'unused')), PBUF_FAIL_RC1='37',
                    PBUF_FAIL2=str(keys.get(row.get('fail2'), work / 'unused')), PBUF_FAIL_RC2='41',
                    PBUF_OFFLOAD_RC=str(row.get('offload_rc', 0)), PBUF_SYSCTLS_RC=str(row.get('sysctls_rc', 0)),
+                   PBUF_READINESS_RC=str(row.get('readiness_rc', 2)),
                    PBUF_APPLIED=str(row.get('applied', 1)), PBUF_APPLY_RC=str(row.get('apply_rc', 0)),
                    PBUF_RPS_RC=str(row.get('rps_rc', 0)), PBUF_WIFI_RC=str(row.get('wifi_rc', 0)))
         script = work / 'isolated.sh'
@@ -229,7 +256,14 @@ for label, code, must_pass in variants:
         if ran.stdout or (ran.stderr and not row.get('real_error')): errors.append('unexpected-output')
         trace = (work / 'trace').read_text().splitlines() if (work / 'trace').exists() else []
         if trace.count('wifi') != row.get('wifi', 0): errors.append('wifi-after-error-or-missing')
+        if trace.count('transient') != row.get('transient', 0): errors.append('transient-schedule-state')
         if label != 'baseline':
+            outcome_traces = [line for line in trace if line.startswith('outcome:')]
+            expected_outcome = row.get('outcome')
+            if expected_outcome is None:
+                if outcome_traces: errors.append('unexpected-retry-outcome')
+            elif outcome_traces != ['outcome:' + expected_outcome]:
+                errors.append('retry-outcome-state')
             writes = (work / 'writes').read_text().splitlines() if (work / 'writes').exists() else []
             paths = {'none': [], 'cpu': cpus, 'cpu02': [cpus[0], cpus[2]], 'cpu0': cpus[:1],
                      'cpu01': cpus[:2], 'stats': stats, 'all': cpus + stats}[row['writes']]
