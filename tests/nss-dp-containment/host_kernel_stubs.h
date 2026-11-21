@@ -109,6 +109,7 @@ struct nss_dp_hal_gmac_stats { unsigned host_placeholder; };
 #define netif_carrier_off(dev) ((dev)->carrier=false)
 #define netif_stop_queue(dev) ((dev)->queue_started=false)
 #define netif_start_queue(dev) ((dev)->queue_started=true)
+#define netif_tx_start_all_queues(dev) ((dev)->queue_started=true)
 #define netif_wake_queue(dev) ((dev)->queue_started=true)
 #define netif_tx_disable(dev) ((dev)->queue_started=false)
 #define netif_tx_stop_all_queues(dev) ((dev)->queue_started=false)

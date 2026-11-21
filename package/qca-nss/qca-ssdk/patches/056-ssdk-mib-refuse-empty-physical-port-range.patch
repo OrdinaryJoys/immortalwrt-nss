@@ -1,0 +1,22 @@
+From: AX6 local correctness review <local@localhost>
+Subject: [PATCH] ssdk: avoid MIB I/O when no physical port exists
+
+The sampler starts at physical port 1. A topology with ports <= 1 has
+no physical port in its exclusive range, so normalizing the cursor to
+port 1 must not cause a read outside that range. Leave state and hardware
+untouched in this case. Do not change normal polling or work ownership.
+
+Upstream-Status: Pending
+
+--- a/src/ref/ref_mib.c
++++ b/src/ref/ref_mib.c
+@@ -511,6 +511,9 @@ qca_ar8327_sw_mib_task(struct qca_phy_priv *priv)
+ {
+ 	int ret;
+ 
++	if (priv->ports <= SSDK_PHYSICAL_PORT1)
++		return;
++
+ 	mutex_lock(&priv->reg_mutex);
+ 	/* Port 0 is the CPU/non-physical port; it has no MIB and returns
+ 	 * SW_OUT_OF_RANGE. Start at the first physical port.

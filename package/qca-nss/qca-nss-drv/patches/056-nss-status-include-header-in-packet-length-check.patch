@@ -1,0 +1,25 @@
+From: AX6 local correctness review <local@localhost>
+Subject: [PATCH] nss: include the common header in received status length
+
+cm.len excludes the common header while skb->len includes all received
+bytes. Compare the full declared message against the aggregate active
+length, for both linear and assembled status frames. Header availability
+is checked before this point. Keep existing table isolation, ordinary
+dispatch, alignment and owner routing unchanged.
+
+This is not a per-type minimum-length check or a contiguous-range fix.
+Do not infer a firmware size limit, stop/drain or DMA retirement policy.
+
+Upstream-Status: Pending
+
+--- a/nss_core.c
++++ b/nss_core.c
+@@ -435,7 +435,7 @@ static void nss_core_handle_nss_status_pkt(struct nss_ctx_instance *nss_ctx,
+ 	/*
+ 	 * Validate message size
+ 	 */
+-	if (header.len > nbuf->len) {
++	if (nss_cmn_get_msg_len(&header) > nbuf->len) {
+ 		nss_warning("%px: Message %d for interface %d received with invalid length %d, expected length %d",
+ 							nss_ctx, header.type, nss_if, nbuf->len, header.len);
+ 		return;
