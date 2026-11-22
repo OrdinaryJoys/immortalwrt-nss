@@ -30,12 +30,12 @@
  	cb(nss_ctx, ncm, app_data);
 --- a/nss_wifili.c
 +++ b/nss_wifili.c
-@@ -98,7 +98,8 @@
- 	}
- 
+@@ -125,7 +125,8 @@
  	if ((nss_cmn_get_msg_len(ncm) > sizeof(struct nss_wifili_msg)) &&
--		ntm->cm.type != NSS_WIFILI_PEER_EXT_STATS_MSG) {
-+		ntm->cm.type != NSS_WIFILI_PEER_EXT_STATS_MSG &&
+ 		ntm->cm.type != NSS_WIFILI_PEER_EXT_STATS_MSG &&
+ 		ntm->cm.type != NSS_WIFILI_ASTENTRY_SYNC_MSG &&
+-		ntm->cm.type != NSS_WIFILI_MECENTRY_SYNC_MSG) {
++		ntm->cm.type != NSS_WIFILI_MECENTRY_SYNC_MSG &&
 +		ntm->cm.type != NSS_WIFILI_PEER_STATS_MSG) {
  		nss_warning("%px: Length of message is greater than required: %d", nss_ctx, nss_cmn_get_msg_len(ncm));
  		return;
