@@ -1,0 +1,56 @@
+--- a/drivers/net/wireless/ath/ath11k/nss.c
++++ b/drivers/net/wireless/ath/ath11k/nss.c
+@@ -235,6 +235,9 @@
+ 	struct ath11k_peer *peer;
+ 	struct nss_wifili_peer_ctrl_stats *pstats = NULL;
+ 	u32 parse_npeers;
++
++	pr_info_ratelimited("ath11k nss diag: peer_stats called len=%u npeers=%u\n",
++			    msg->cm.len, stats->npeers);
+ 	int i, j;
+ 	u64 tx_packets, tx_bytes, tx_dropped;
+ 	u64 rx_packets, rx_bytes, rx_dropped;
+@@ -247,6 +250,8 @@
+ 
+ 	for (i = 0; i < parse_npeers; i++) {
+ 		pstats = &stats->wpcs[i];
++		pr_info_ratelimited("ath11k nss diag: peer_stats idx=%d id=%u\n",
++				    i, pstats->peer_id);
+ 
+ 		rcu_read_lock();
+ 		spin_lock_bh(&ab->base_lock);
+@@ -254,12 +259,14 @@
+ 		peer = ath11k_peer_find_by_id(ab, pstats->peer_id);
+ 		if (!peer || !peer->sta) {
+ 			ath11k_dbg(ab, ATH11K_DBG_NSS, "nss wifili: unable to find peer %d\n", pstats->peer_id);
++			pr_info_ratelimited("ath11k nss diag: peer id=%u NOT FOUND\n", pstats->peer_id);
+ 			spin_unlock_bh(&ab->base_lock);
+ 			rcu_read_unlock();
+ 			continue;
+ 		}
+ 
+ 		if (!peer->nss.nss_stats) {
++			pr_info_ratelimited("ath11k nss diag: peer id=%u found but nss_stats NULL\n", pstats->peer_id);
+ 			spin_unlock_bh(&ab->base_lock);
+ 			rcu_read_unlock();
+ 			return;
+@@ -3609,15 +3616,19 @@
+ 
+ 	if (!ab->nss.stats_enabled)
+ 		return;
++	pr_info_ratelimited("ath11k nss diag: update_sta_stats %pM\n", sta->addr);
+ 
+ 	spin_lock_bh(&ab->base_lock);
+ 	peer = ath11k_peer_find_by_addr(ab, sta->addr);
+ 	if (!peer) {
+ 		ath11k_dbg(ab, ATH11K_DBG_NSS, "sta stats: unable to find peer %pM\n",
+ 					sta->addr);
++		pr_info_ratelimited("ath11k nss diag: update_sta_stats peer NOT FOUND %pM\n", sta->addr);
+ 		goto exit;
+ 	}
+ 
++	pr_info_ratelimited("ath11k nss diag: update_sta_stats peer id=%d stats=%p\n",
++			    peer->peer_id, peer->nss.nss_stats);
+ 	if (!peer->nss.nss_stats)
+ 		goto exit;
+ 
