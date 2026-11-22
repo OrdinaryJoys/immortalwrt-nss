@@ -95,7 +95,7 @@ return view.extend({
 		var m, s, o;
 
 		m = new form.Map('ax6_led', _('AX6 LED 定时开关'),
-			_('按周定时全部开启或关闭 AX6 的 LED。开启时间内所有选中的 LED 点亮，关闭时间内全部熄灭。'));
+			_('按周定时控制 AX6 LED：开启时间内恢复正常 LED 行为（网络灯可按流量闪烁），关闭时间内所有选中的 LED 熄灭。'));
 
 		s = m.section(form.NamedSection, 'schedule', 'schedule', _('定时设置'));
 		s.anonymous = true;
@@ -107,7 +107,7 @@ return view.extend({
 		o.rmempty = false;
 
 		o = s.option(form.ListValue, 'on_time', _('全部开启时间'),
-			_('到达该时间后，所有选中的 LED 全部点亮。'));
+			_('到达该时间后恢复正常 LED 行为，网络灯可按流量闪烁。'));
 		o.default = '07:00';
 		o.rmempty = false;
 		addTimeChoices(o);
