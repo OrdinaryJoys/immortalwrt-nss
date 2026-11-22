@@ -42,7 +42,10 @@ led_list() {
 }
 
 active_trigger() {
-	sed -ne 's/^.*\[\(.*\)\].*$/\1/p' "$LEDS_DIR/$1/trigger" 2>/dev/null
+	local t
+	t="$(sed -ne 's/^.*\[\(.*\)\].*$/\1/p' "$LEDS_DIR/$1/trigger" 2>/dev/null)"
+	[ -n "$t" ] || t="$(cat "$LEDS_DIR/$1/trigger" 2>/dev/null | tr -d '[:space:]')"
+	echo "$t"
 }
 
 capture_state() {
