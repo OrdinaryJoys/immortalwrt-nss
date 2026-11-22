@@ -31,3 +31,5 @@ Manual:
 
 When on_time > off_time the ON window crosses midnight.
 Days use 1=Monday ... 7=Sunday; empty means every day.
+
+Note: some AX6 power indicator LEDs may be hardware-always-on and not exposed as Linux LED channels; software cannot switch those off.

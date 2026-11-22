@@ -164,7 +164,6 @@ apply() {
 	else
 		desired=off
 	fi
-	[ "$(mode_now)" = "$desired" ] && return 0
 	if [ "$desired" = "on" ]; then
 		# Scheduler semantics: all configured LEDs are forced on.
 		led_force_on
