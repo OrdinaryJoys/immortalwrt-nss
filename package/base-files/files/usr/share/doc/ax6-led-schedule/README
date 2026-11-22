@@ -4,6 +4,10 @@ AX6 LED schedule
 LuCI:
   System -> LED 定时开关
 
+GUI:
+  System -> LED 定时开关
+  - 时间、星期、LED 均为选择项；blue:system 为电源/系统灯。
+
 UCI:
   uci set ax6_led.schedule.enabled=1
   uci set ax6_led.schedule.on_time=07:00
