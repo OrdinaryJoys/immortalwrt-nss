@@ -1,17 +1,29 @@
 AX6 LED schedule
 ================
-Configuration:
+
+LuCI:
+  System -> LED 定时开关
+
+UCI:
   uci set ax6_led.schedule.enabled=1
   uci set ax6_led.schedule.on_time=07:00
   uci set ax6_led.schedule.off_time=23:00
   uci set ax6_led.schedule.days='1 2 3 4 5 6 7'
+  uci set ax6_led.schedule.leds='blue:system blue:network yellow:system yellow:network'
   uci commit ax6_led
   /etc/init.d/ax6-led-schedule restart
+
+Semantics:
+  ON  window: all configured LEDs are forced ON (default-on, max brightness)
+  OFF window: all configured LEDs are forced OFF (trigger none, brightness 0)
+  Enabled=0: restore the normal LED state captured before scheduling / normal LED service
 
 Manual:
   ax6-led-schedule status
   ax6-led-schedule off
   ax6-led-schedule on
+  ax6-led-schedule restore
   ax6-led-schedule run
 
-When on_time > off_time the on-window crosses midnight.
+When on_time > off_time the ON window crosses midnight.
+Days use 1=Monday ... 7=Sunday; empty means every day.

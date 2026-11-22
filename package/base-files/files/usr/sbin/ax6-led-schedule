@@ -90,7 +90,7 @@ restore_state() {
 
 led_off() {
 	local led
-	[ "$(cat "$MODE" 2>/dev/null)" = "off" ] && return 0
+	# Save the normal LED configuration only before the first forced change.
 	capture_state
 	for led in $(led_list); do
 		[ -e "$LEDS_DIR/$led/trigger" ] || continue
@@ -99,24 +99,31 @@ led_off() {
 			echo 0 > "$LEDS_DIR/$led/brightness" 2>/dev/null || true
 	done
 	echo off > "$MODE"
-	log "LEDs off"
+	log "all LEDs off"
 }
 
-led_on() {
+led_force_on() {
 	local led max
+	for led in $(led_list); do
+		[ -e "$LEDS_DIR/$led/brightness" ] || continue
+		max="$(cat "$LEDS_DIR/$led/max_brightness" 2>/dev/null)"
+		[ -n "$max" ] && [ "$max" -gt 0 ] || max=1
+		echo default-on > "$LEDS_DIR/$led/trigger" 2>/dev/null || true
+		echo "$max" > "$LEDS_DIR/$led/brightness" 2>/dev/null || true
+	done
+	echo on > "$MODE"
+	log "all LEDs on"
+}
+
+led_restore() {
 	if [ -s "$STATE" ]; then
 		restore_state
 	else
-		for led in $(led_list); do
-			[ -e "$LEDS_DIR/$led/brightness" ] || continue
-			max="$(cat "$LEDS_DIR/$led/max_brightness" 2>/dev/null)"
-			[ -n "$max" ] && [ "$max" -gt 0 ] || max=1
-			echo default-on > "$LEDS_DIR/$led/trigger" 2>/dev/null || true
-			echo "$max" > "$LEDS_DIR/$led/brightness" 2>/dev/null || true
-		done
+		# No forced schedule session: let the normal LED service decide.
+		[ -x /etc/init.d/led ] && /etc/init.d/led start >/dev/null 2>&1 || true
 	fi
-	echo on > "$MODE"
-	log "LEDs on"
+	rm -f "$MODE"
+	log "LED state restored"
 }
 
 mode_now() { cat "$MODE" 2>/dev/null; }
@@ -148,7 +155,8 @@ apply() {
 	local enabled desired
 	enabled="$(uci_get enabled)"
 	if [ "$enabled" != "1" ]; then
-		[ "$(mode_now)" = "off" ] && led_on
+		[ "$(mode_now)" = "off" ] || [ "$(mode_now)" = "on" ] || return 0
+		led_restore
 		return 0
 	fi
 	if day_allowed && in_window; then
@@ -158,9 +166,8 @@ apply() {
 	fi
 	[ "$(mode_now)" = "$desired" ] && return 0
 	if [ "$desired" = "on" ]; then
-		# At boot, normal led service already configured the LEDs. Only
-		# restore when this daemon previously turned them off.
-		if [ "$(mode_now)" = "off" ]; then led_on; else echo on > "$MODE"; fi
+		# Scheduler semantics: all configured LEDs are forced on.
+		led_force_on
 	else
 		led_off
 	fi
@@ -183,7 +190,7 @@ status() {
 }
 
 daemon() {
-	trap 'if [ "$(mode_now)" = off ]; then led_on; fi; exit 0' INT TERM
+	trap 'led_restore; exit 0' INT TERM
 	apply
 	while :; do
 		sleep "${AX6_LED_INTERVAL:-30}"
@@ -192,13 +199,14 @@ daemon() {
 }
 
 case "$1" in
-	on) led_on ;;
+	on) led_force_on ;;
 	off) led_off ;;
+	restore) led_restore ;;
 	status) status ;;
 	run|apply) apply ;;
 	daemon) daemon ;;
 	*)
-		echo "Usage: $0 {on|off|status|run|daemon}" >&2
+		echo "Usage: $0 {on|off|restore|status|run|daemon}" >&2
 		exit 1
 		;;
 esac
