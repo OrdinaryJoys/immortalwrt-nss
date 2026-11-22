@@ -77,6 +77,11 @@ restore_state() {
 			echo "$interval" > "$LEDS_DIR/$led/interval" 2>/dev/null || true
 		[ -n "$mode" ] && [ -e "$LEDS_DIR/$led/mode" ] && \
 			echo "$mode" > "$LEDS_DIR/$led/mode" 2>/dev/null || true
+		if [ "$br" = "0" ] && [ "$trig" != "none" ] && \
+		   [ -e "$LEDS_DIR/$led/max_brightness" ]; then
+			br="$(cat "$LEDS_DIR/$led/max_brightness" 2>/dev/null)"
+			[ -n "$br" ] && [ "$br" -gt 0 ] || br=1
+		fi
 		[ -e "$LEDS_DIR/$led/brightness" ] && \
 			echo "$br" > "$LEDS_DIR/$led/brightness" 2>/dev/null || true
 	done < "$STATE"
