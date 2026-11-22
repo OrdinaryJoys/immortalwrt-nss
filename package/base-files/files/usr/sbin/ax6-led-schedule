@@ -102,6 +102,20 @@ led_off() {
 	log "all LEDs off"
 }
 
+enable_netdev_modes() {
+	local led dev
+	for led in $(led_list); do
+		[ "$(active_trigger "$led")" = "netdev" ] || continue
+		dev="$(cat "$LEDS_DIR/$led/device_name" 2>/dev/null)"
+		[ -n "$dev" ] || dev=wan
+		[ -e "$LEDS_DIR/$led/device_name" ] && echo "$dev" > "$LEDS_DIR/$led/device_name" 2>/dev/null || true
+		[ -e "$LEDS_DIR/$led/interval" ] && echo 50 > "$LEDS_DIR/$led/interval" 2>/dev/null || true
+		for m in link tx rx; do
+			[ -e "$LEDS_DIR/$led/$m" ] && echo 1 > "$LEDS_DIR/$led/$m" 2>/dev/null || true
+		done
+	done
+}
+
 led_on() {
 	# Normal mode: restore the captured LED configuration, or let the
 	# standard LED service apply the normal triggers (netdev etc.).
@@ -110,6 +124,7 @@ led_on() {
 	elif [ -x /etc/init.d/led ]; then
 		/etc/init.d/led start >/dev/null 2>&1 || true
 	fi
+	enable_netdev_modes
 	echo on > "$MODE"
 	log "normal LED behaviour restored"
 }
