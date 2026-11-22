@@ -1,0 +1,4 @@
+#!/bin/sh
+# Enable the service; scheduling itself stays disabled until configured.
+[ -x /etc/init.d/ax6-led-schedule ] && /etc/init.d/ax6-led-schedule enable
+exit 0
