@@ -1,0 +1,4 @@
+{
+	"config": "ax6_led",
+	"init": [ "ax6-led-schedule" ]
+}

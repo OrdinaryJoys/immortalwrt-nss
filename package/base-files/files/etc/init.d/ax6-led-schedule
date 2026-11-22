@@ -17,3 +17,8 @@ start_service() {
 service_triggers() {
 	procd_add_reload_trigger ax6_led
 }
+
+reload_service() {
+	stop
+	start
+}
