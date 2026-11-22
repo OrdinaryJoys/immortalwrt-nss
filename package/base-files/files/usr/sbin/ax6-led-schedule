@@ -102,26 +102,20 @@ led_off() {
 	log "all LEDs off"
 }
 
-led_force_on() {
-	local led max
-	for led in $(led_list); do
-		[ -e "$LEDS_DIR/$led/brightness" ] || continue
-		max="$(cat "$LEDS_DIR/$led/max_brightness" 2>/dev/null)"
-		[ -n "$max" ] && [ "$max" -gt 0 ] || max=1
-		echo default-on > "$LEDS_DIR/$led/trigger" 2>/dev/null || true
-		echo "$max" > "$LEDS_DIR/$led/brightness" 2>/dev/null || true
-	done
+led_on() {
+	# Normal mode: restore the captured LED configuration, or let the
+	# standard LED service apply the normal triggers (netdev etc.).
+	if [ -s "$STATE" ]; then
+		restore_state
+	elif [ -x /etc/init.d/led ]; then
+		/etc/init.d/led start >/dev/null 2>&1 || true
+	fi
 	echo on > "$MODE"
-	log "all LEDs on"
+	log "normal LED behaviour restored"
 }
 
 led_restore() {
-	if [ -s "$STATE" ]; then
-		restore_state
-	else
-		# No forced schedule session: let the normal LED service decide.
-		[ -x /etc/init.d/led ] && /etc/init.d/led start >/dev/null 2>&1 || true
-	fi
+	led_on
 	rm -f "$MODE"
 	log "LED state restored"
 }
@@ -165,8 +159,12 @@ apply() {
 		desired=off
 	fi
 	if [ "$desired" = "on" ]; then
-		# Scheduler semantics: all configured LEDs are forced on.
-		led_force_on
+		# Normal mode: restore normal triggers; network LEDs may blink.
+		if [ "$(mode_now)" = "off" ]; then
+			led_on
+		elif [ "$(mode_now)" != "on" ]; then
+			echo on > "$MODE"
+		fi
 	else
 		led_off
 	fi
@@ -198,7 +196,7 @@ daemon() {
 }
 
 case "$1" in
-	on) led_force_on ;;
+	on) led_on ;;
 	off) led_off ;;
 	restore) led_restore ;;
 	status) status ;;

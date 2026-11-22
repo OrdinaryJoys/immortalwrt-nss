@@ -18,8 +18,8 @@ UCI:
   /etc/init.d/ax6-led-schedule restart
 
 Semantics:
-  ON  window: all configured LEDs are forced ON (default-on, max brightness)
-  OFF window: all configured LEDs are forced OFF (trigger none, brightness 0)
+  ON  window: restore normal LED behaviour (netdev/network activity blinking)
+  OFF window: all configured LEDs forced OFF (trigger none, brightness 0)
   Enabled=0: restore the normal LED state captured before scheduling / normal LED service
 
 Manual:
