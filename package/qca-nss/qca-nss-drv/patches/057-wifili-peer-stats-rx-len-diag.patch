@@ -1,0 +1,11 @@
+--- a/nss_core.c
++++ b/nss_core.c
+@@ -411,6 +411,8 @@
+ 		return;
+ 	}
+ 
++	pr_info_ratelimited("nss diag2: if=%u type=%u cm_len=%u nbuf_len=%u skb_len=%u\n",
++			    nss_if, ncm->type, ncm->len, nbuf->len, nbuf->len);
+ 	cb(nss_ctx, ncm, app_data);
+ 
+ 	if (ncm->interface != nss_if) {
