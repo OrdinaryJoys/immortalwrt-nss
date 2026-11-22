@@ -1,0 +1,31 @@
+--- a/drivers/net/wireless/ath/ath11k/nss.c
++++ b/drivers/net/wireless/ath/ath11k/nss.c
+@@ -228,6 +228,19 @@
+ 	return true;
+ }
+ 
++static struct ath11k_peer *ath11k_nss_find_peer_by_hw_id(struct ath11k_base *ab,
++						       u32 hw_peer_id)
++{
++	struct ath11k_peer *peer;
++
++	list_for_each_entry(peer, &ab->peers, list) {
++		if (peer->hw_peer_id == hw_peer_id)
++			return peer;
++	}
++
++	return NULL;
++}
++
+ static void ath11k_nss_get_peer_stats(struct ath11k_base *ab,
+ 				      struct nss_wifili_msg *msg)
+ {
+@@ -252,6 +265,8 @@
+ 		spin_lock_bh(&ab->base_lock);
+ 
+ 		peer = ath11k_peer_find_by_id(ab, pstats->peer_id);
++		if (!peer)
++			peer = ath11k_nss_find_peer_by_hw_id(ab, pstats->peer_id);
+ 		if (!peer || !peer->sta) {
+ 			ath11k_dbg(ab, ATH11K_DBG_NSS, "nss wifili: unable to find peer %d\n", pstats->peer_id);
+ 			spin_unlock_bh(&ab->base_lock);
