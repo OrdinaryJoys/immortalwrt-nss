@@ -1,0 +1,11 @@
+{
+	"luci-app-ax6-led": {
+		"description": "Grant access to AX6 LED schedule configuration",
+		"read": {
+			"uci": [ "ax6_led" ]
+		},
+		"write": {
+			"uci": [ "ax6_led" ]
+		}
+	}
+}
