@@ -1,0 +1,42 @@
+--- a/nss_core.c
++++ b/nss_core.c
+@@ -20,6 +20,7 @@
+  */
+ 
+ #include "nss_core.h"
++#include "exports/nss_wifili_if.h"
+ #include <linux/module.h>
+ #include <linux/mm.h>
+ #include <linux/of.h>
+@@ -409,6 +410,19 @@
+ 	if (!cb) {
+ 		nss_warning("%px: Callback not registered for interface %d", nss_ctx, nss_if);
+ 		return;
++	}
++
++	/*
++	 * Wifili peer statistics are variable-length: the common header len
++	 * may describe only the first peer while the skb contains all peers.
++	 * Pass the actual payload length to the callback so the consumer can
++	 * parse every available record instead of truncating at one peer.
++	 */
++	if (nss_if == NSS_WIFILI_INTERNAL_INTERFACE &&
++	    ncm->type == NSS_WIFILI_PEER_STATS_MSG) {
++		uint32_t actual_len = nbuf->len - sizeof(*ncm);
++		if (actual_len > ncm->len)
++			ncm->len = actual_len;
+ 	}
+ 
+ 	cb(nss_ctx, ncm, app_data);
+--- a/nss_wifili.c
++++ b/nss_wifili.c
+@@ -98,7 +98,8 @@
+ 	}
+ 
+ 	if ((nss_cmn_get_msg_len(ncm) > sizeof(struct nss_wifili_msg)) &&
+-		ntm->cm.type != NSS_WIFILI_PEER_EXT_STATS_MSG) {
++		ntm->cm.type != NSS_WIFILI_PEER_EXT_STATS_MSG &&
++		ntm->cm.type != NSS_WIFILI_PEER_STATS_MSG) {
+ 		nss_warning("%px: Length of message is greater than required: %d", nss_ctx, nss_cmn_get_msg_len(ncm));
+ 		return;
+ 	}
