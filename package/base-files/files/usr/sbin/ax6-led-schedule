@@ -1,0 +1,204 @@
+#!/bin/sh
+# AX6 scheduled LED on/off control
+# UCI: /etc/config/ax6_led section schedule
+
+CONFIG=ax6_led
+SECTION=schedule
+LEDS_DIR=${AX6_LED_SYSFS:-/sys/class/leds}
+STATE=${AX6_LED_STATE:-/var/run/ax6-led-schedule.state}
+MODE=${AX6_LED_MODE:-/var/run/ax6-led-schedule.mode}
+TAG=ax6-led-schedule
+DEFAULT_LEDS="blue:system blue:network yellow:system yellow:network"
+DEFAULT_ON=07:00
+DEFAULT_OFF=23:00
+
+log() { logger -t "$TAG" "$*" 2>/dev/null; }
+uci_get() { uci -q get "$CONFIG.$SECTION.$1" 2>/dev/null; }
+
+to_min() {
+	local h m
+	case "$1" in
+		[0-2][0-9]:[0-5][0-9]) ;;
+		*) return 1 ;;
+	esac
+	h="${1%:*}"
+	m="${1#*:}"
+	while [ "${h#0}" != "$h" ]; do h="${h#0}"; done
+	while [ "${m#0}" != "$m" ]; do m="${m#0}"; done
+	[ -n "$h" ] || h=0
+	[ -n "$m" ] || m=0
+	echo $((h * 60 + m))
+}
+
+now_min() {
+	to_min "${AX6_LED_NOW:-$(date +%H:%M)}"
+}
+
+led_list() {
+	local l
+	l="$(uci_get leds)"
+	[ -n "$l" ] || l="$DEFAULT_LEDS"
+	echo "$l"
+}
+
+active_trigger() {
+	sed -ne 's/^.*\[\(.*\)\].*$/\1/p' "$LEDS_DIR/$1/trigger" 2>/dev/null
+}
+
+capture_state() {
+	local led trig br dev interval mode tmp
+	[ -s "$STATE" ] && return 0
+	tmp="$STATE.tmp"
+	: > "$tmp"
+	for led in $(led_list); do
+		[ -e "$LEDS_DIR/$led/brightness" ] || continue
+		trig="$(active_trigger "$led")"
+		[ -n "$trig" ] || trig=none
+		br="$(cat "$LEDS_DIR/$led/brightness" 2>/dev/null)"
+		[ -n "$br" ] || br=0
+		dev="$(cat "$LEDS_DIR/$led/device_name" 2>/dev/null)"
+		interval="$(cat "$LEDS_DIR/$led/interval" 2>/dev/null)"
+		mode="$(cat "$LEDS_DIR/$led/mode" 2>/dev/null)"
+		printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+			"$led" "$trig" "$br" "$dev" "$interval" "$mode" >> "$tmp"
+	done
+	mv "$tmp" "$STATE"
+}
+
+restore_state() {
+	local led trig br dev interval mode
+	[ -s "$STATE" ] || return 0
+	while IFS="$(printf '\t')" read -r led trig br dev interval mode; do
+		[ -e "$LEDS_DIR/$led/trigger" ] || continue
+		echo "$trig" > "$LEDS_DIR/$led/trigger" 2>/dev/null || true
+		[ -n "$dev" ] && [ -e "$LEDS_DIR/$led/device_name" ] && \
+			echo "$dev" > "$LEDS_DIR/$led/device_name" 2>/dev/null || true
+		[ -n "$interval" ] && [ -e "$LEDS_DIR/$led/interval" ] && \
+			echo "$interval" > "$LEDS_DIR/$led/interval" 2>/dev/null || true
+		[ -n "$mode" ] && [ -e "$LEDS_DIR/$led/mode" ] && \
+			echo "$mode" > "$LEDS_DIR/$led/mode" 2>/dev/null || true
+		if [ "$br" = "0" ] && [ "$trig" != "none" ] && \
+		   [ -e "$LEDS_DIR/$led/max_brightness" ]; then
+			br="$(cat "$LEDS_DIR/$led/max_brightness" 2>/dev/null)"
+			[ -n "$br" ] && [ "$br" -gt 0 ] || br=1
+		fi
+		[ -e "$LEDS_DIR/$led/brightness" ] && \
+			echo "$br" > "$LEDS_DIR/$led/brightness" 2>/dev/null || true
+	done < "$STATE"
+	rm -f "$STATE"
+}
+
+led_off() {
+	local led
+	[ "$(cat "$MODE" 2>/dev/null)" = "off" ] && return 0
+	capture_state
+	for led in $(led_list); do
+		[ -e "$LEDS_DIR/$led/trigger" ] || continue
+		echo none > "$LEDS_DIR/$led/trigger" 2>/dev/null || true
+		[ -e "$LEDS_DIR/$led/brightness" ] && \
+			echo 0 > "$LEDS_DIR/$led/brightness" 2>/dev/null || true
+	done
+	echo off > "$MODE"
+	log "LEDs off"
+}
+
+led_on() {
+	local led max
+	if [ -s "$STATE" ]; then
+		restore_state
+	else
+		for led in $(led_list); do
+			[ -e "$LEDS_DIR/$led/brightness" ] || continue
+			max="$(cat "$LEDS_DIR/$led/max_brightness" 2>/dev/null)"
+			[ -n "$max" ] && [ "$max" -gt 0 ] || max=1
+			echo default-on > "$LEDS_DIR/$led/trigger" 2>/dev/null || true
+			echo "$max" > "$LEDS_DIR/$led/brightness" 2>/dev/null || true
+		done
+	fi
+	echo on > "$MODE"
+	log "LEDs on"
+}
+
+mode_now() { cat "$MODE" 2>/dev/null; }
+
+day_allowed() {
+	local d days
+	d="${AX6_LED_DAY:-$(date +%u)}"
+	days="$(uci_get days)"
+	[ -n "$days" ] || days="1 2 3 4 5 6 7"
+	case " $days " in *" $d "*) return 0;; esac
+	return 1
+}
+
+in_window() {
+	local on off now
+	on="$(to_min "$(uci_get on_time)")" || on="$(to_min "$DEFAULT_ON")"
+	off="$(to_min "$(uci_get off_time)")" || off="$(to_min "$DEFAULT_OFF")"
+	now="$(now_min)" || return 1
+	[ "$on" -eq "$off" ] && return 0
+	if [ "$on" -lt "$off" ]; then
+		[ "$now" -ge "$on" ] && [ "$now" -lt "$off" ] && return 0
+	else
+		[ "$now" -ge "$on" ] || [ "$now" -lt "$off" ] && return 0
+	fi
+	return 1
+}
+
+apply() {
+	local enabled desired
+	enabled="$(uci_get enabled)"
+	if [ "$enabled" != "1" ]; then
+		[ "$(mode_now)" = "off" ] && led_on
+		return 0
+	fi
+	if day_allowed && in_window; then
+		desired=on
+	else
+		desired=off
+	fi
+	[ "$(mode_now)" = "$desired" ] && return 0
+	if [ "$desired" = "on" ]; then
+		# At boot, normal led service already configured the LEDs. Only
+		# restore when this daemon previously turned them off.
+		if [ "$(mode_now)" = "off" ]; then led_on; else echo on > "$MODE"; fi
+	else
+		led_off
+	fi
+}
+
+status() {
+	local led
+	echo "enabled=$(uci_get enabled)"
+	echo "on_time=$(uci_get on_time)"
+	echo "off_time=$(uci_get off_time)"
+	echo "days=$(uci_get days)"
+	echo "leds=$(led_list)"
+	echo "mode=$(mode_now)"
+	if day_allowed && in_window; then echo "window=on"; else echo "window=off"; fi
+	for led in $(led_list); do
+		[ -e "$LEDS_DIR/$led/brightness" ] || continue
+		printf '%s trigger=%s brightness=%s\n' "$led" \
+			"$(active_trigger "$led")" "$(cat "$LEDS_DIR/$led/brightness" 2>/dev/null)"
+	done
+}
+
+daemon() {
+	trap 'if [ "$(mode_now)" = off ]; then led_on; fi; exit 0' INT TERM
+	apply
+	while :; do
+		sleep "${AX6_LED_INTERVAL:-30}"
+		apply
+	done
+}
+
+case "$1" in
+	on) led_on ;;
+	off) led_off ;;
+	status) status ;;
+	run|apply) apply ;;
+	daemon) daemon ;;
+	*)
+		echo "Usage: $0 {on|off|status|run|daemon}" >&2
+		exit 1
+		;;
+esac

@@ -1,0 +1,17 @@
+AX6 LED schedule
+================
+Configuration:
+  uci set ax6_led.schedule.enabled=1
+  uci set ax6_led.schedule.on_time=07:00
+  uci set ax6_led.schedule.off_time=23:00
+  uci set ax6_led.schedule.days='1 2 3 4 5 6 7'
+  uci commit ax6_led
+  /etc/init.d/ax6-led-schedule restart
+
+Manual:
+  ax6-led-schedule status
+  ax6-led-schedule off
+  ax6-led-schedule on
+  ax6-led-schedule run
+
+When on_time > off_time the on-window crosses midnight.
