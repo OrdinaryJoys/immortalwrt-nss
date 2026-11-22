@@ -133,7 +133,7 @@ return view.extend({
 		]);
 
 		o = s.option(SpaceSeparatedMultiValue, 'leds', _('控制的 LED'),
-			_('默认全部四个 LED。blue:system 为电源/系统灯。'));
+			_('默认全部四个 LED。blue:system 为系统灯；如果电源指示灯硬件常亮，可能不在 Linux LED 可控范围内。'));
 		o.default = 'blue:system blue:network yellow:system yellow:network';
 		o.rmempty = false;
 		addChoices(o, [
