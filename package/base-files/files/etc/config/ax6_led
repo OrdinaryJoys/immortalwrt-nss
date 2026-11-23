@@ -3,7 +3,7 @@
 # on_time/off_time use 24h local time; LED is on inside [on_time, off_time).
 # If on_time > off_time, the window crosses midnight.
 config schedule 'schedule'
-	option enabled '0'
+	option enabled '1'
 	option on_time '07:00'
 	option off_time '23:00'
 	option days '1 2 3 4 5 6 7'
