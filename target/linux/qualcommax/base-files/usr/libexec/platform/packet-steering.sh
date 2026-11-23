@@ -3,8 +3,9 @@
 # NSS is loaded, regardless of the ordering of their reload callbacks.
 
 if [ -d /sys/module/qca_nss_drv ]; then
-	/usr/libexec/network/packet-steering.uc -l 0 0 || exit $?
-	# The event entry changes queues only, without IRQ changes or boot workers.
+	# set-irq-affinity owns the complete NSS queue policy. Do not clear every
+	# physical queue first: a failed/partial start_rps would otherwise leave
+	# RPS/RFS at zero and abort the ECM start transaction.
 	exec /etc/init.d/set-irq-affinity start_rps
 fi
 

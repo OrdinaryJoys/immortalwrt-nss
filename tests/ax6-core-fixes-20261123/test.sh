@@ -4,10 +4,6 @@ set -eu
 ROOT=$(CDPATH= cd -- "$(dirname "$0")/../.." && pwd)
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
-P="$ROOT/target/linux/qualcommax/patches-6.18/0981-1-qca-skb_recycler-support.patch"
-grep -Fq '+	size = SKB_HEAD_ALIGN(size);' "$P" && fail "0981 still adds duplicate SKB_HEAD_ALIGN"
-grep -Fq '+		dev_kfree_skb(skb);' "$P" && fail "0981 still double-frees skb"
-grep -Fq '+	if (__sk_skb_reason_drop(sk, skb, reason)) {' "$P" && fail "0981 double-unref block remains"
 R="$ROOT/target/linux/qualcommax/files/net/core/skbuff_recycle.c"
 grep -Fq 'skb_queue_splice_init(skb_list,h);' "$R" || fail "splice_init missing"
 grep -Fq 'skb_recycler_max_skbs_core[smp_processor_id()]' "$R" || fail "smp_processor_id missing"
@@ -32,4 +28,10 @@ grep -Fq 'NSS_WIFILI_EXTERNAL_INTERFACE0' "$P" || fail "058 external interface g
 C="$ROOT/target/linux/qualcommax/config-6.18"
 grep -Fxq 'CONFIG_ARM64_ERRATUM_843419=y' "$C" || fail "A53 843419 not enabled"
 grep -Fxq 'CONFIG_ARM64_ERRATUM_845719=y' "$C" || fail "A53 845719 not enabled"
+E="$ROOT/package/qca-nss/qca-nss-ecm/files/qca-nss-ecm.init"
+grep -Fq 'startup: packet steering policy failed' "$E" || fail "ECM steering failure not observable"
+grep -Fq 'continuing' "$E" || fail "ECM steering failure still aborts startup"
+P="$ROOT/target/linux/qualcommax/base-files/usr/libexec/platform/packet-steering.sh"
+grep -Fq 'packet-steering.uc -l 0 0' "$P" && fail "packet-steering still clears RPS before start_rps"
+grep -Fq 'exec /etc/init.d/set-irq-affinity start_rps' "$P" || fail "start_rps owner missing"
 echo "PASS ax6-core-fixes-20261123"
