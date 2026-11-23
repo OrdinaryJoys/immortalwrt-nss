@@ -272,11 +272,12 @@ start_service() {
 	ecm_start_status=0
 	load_ecm || ecm_start_status=$?
 
-	if ! disable_packet_steering; then
-		rc=$?
+	disable_packet_steering
+	rc=$?
+	if [ "$rc" -ne 0 ]; then
 		# RPS/packet-steering is an independent queue policy. A missing or
 		# not-yet-created queue must not discard the ECM service or leave
-		# dev.nss.general.redirect at 0. Keep the failure observable.
+		# dev.nss.general.redirect at 0. Keep the real failure observable.
 		logger -p daemon.err -t qca-nss-ecm \
 			"startup: packet steering policy failed (status $rc); continuing" || :
 	fi

@@ -303,8 +303,9 @@ check('reload without optional helper cannot hide steering failure', expected=7,
       offload=False, env={'STEERING_RC': '7'})
 check('non-NSS generic fallback', platform=False, require=('steering-generic',))
 check('generic failure is exposed', expected=7, platform=False, env={'GENERIC_RC': '7'})
-check('NSS generic cleanup failure is exposed', expected=9, env={'GENERIC_RC': '9'},
-      require=('offload-called',), forbid=('steering-platform',))
+check('NSS generic cleanup failure is exposed', expected=9,
+      env={'STEERING_RC': '7', 'GENERIC_RC': '9'},
+      require=('offload-called',))
 check('non-NSS platform keeps native helper', env={'NSS_LOADED': '0'},
       require=('steering-generic',), forbid=('steering-platform',))
 check('logger failure cannot replace policy failure', expected=7,
@@ -316,9 +317,11 @@ for key in ('SET_RC', 'DELETE_RC', 'COMMIT_RC'):
           env={key: '6'}, require=('steering-platform', 'offload-called'))
 for action in ('start', 'boot', 'restart'):
     check(action + ' success through actual rc.common', action, require=('procd-close',))
-    check(action + ' rejects partial startup without procd registration', action, expected=7,
-          env={'STEERING_RC': '7'}, require=('json-cleanup',), forbid=('procd-close',))
-check('start exposes UCI persistence failure', 'start', expected=6, env={'COMMIT_RC': '6'})
+    check(action + ' keeps ECM registration on steering failure', action,
+          env={'STEERING_RC': '7'}, require=('procd-close', 'packet steering policy failed'),
+          forbid=('json-cleanup',))
+check('start exposes UCI persistence failure', 'start', env={'COMMIT_RC': '6'},
+      require=('procd-close', 'packet steering policy failed (status 6)'))
 check('start without previously loaded ECM succeeds', 'start', env={'ECM_LOADED': '0'},
       require=('modprobe:ecm',))
 check('empty module dependency list is valid', 'start',
@@ -432,9 +435,9 @@ check('real procd stop returns ubus delete failure', 'stop', expected=36,
       real_procd=True, env={'UBUS_DELETE_RC': '36'})
 check('real procd restart cannot start after delete failure', 'restart', expected=36,
       real_procd=True, env={'UBUS_DELETE_RC': '36'}, forbid=('ubus:call service set', 'offload-called'))
-check('real procd failed startup never commits declaration', 'start', expected=7,
-      real_procd=True, env={'STEERING_RC': '7', 'JSON_CLEANUP_RC': '32'},
-      forbid=('ubus:call service set',))
+check('real procd steering failure continues and commits declaration', 'start',
+      real_procd=True, env={'STEERING_RC': '7'},
+      require=('ubus:call service set', 'packet steering policy failed (status 7)'))
 # Separate process, no ECM init: proving this patch did not silently change
 # every other service's framework semantics. Existing global masking remains.
 check('unrelated service keeps unmodified real framework behavior', 'start', expected=0,
