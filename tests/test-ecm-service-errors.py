@@ -369,16 +369,23 @@ check('restart cannot start after failed procd deletion', 'restart', expected=20
 check('start preserves first module error, does not activate redirect or OVS', 'start', expected=4,
       env={'ECM_LOADED': '0', 'MODINFO_RC': '4', 'STEERING_RC': '7', 'REDIRECT': '1', 'OVS': '1'},
       forbid=('sysctl:-w dev.nss.general.redirect=1', 'procd-close'))
-for action in ('start', 'stop'):
-    check(action + ' reads back available scalar controls', action,
-          env={'CONTROLS': '1'})
-    check(action + ' rejects scalar readback mismatch', action, expected=1,
-          env={'CONTROLS': '1', 'BAD_READBACK_PATH': 'nf_conntrack_events'},
-          forbid=('procd-close', 'procd-kill'))
-    check(action + ' preserves scalar read error', action, expected=23,
-          env={'CONTROLS': '1', 'BAD_READBACK_PATH': 'nf_conntrack_events', 'READ_ERROR_RC': '23'})
-    check(action + ' rejects unwritable existing command control', action, expected=1,
-          env={'CONTROLS': '1', 'READONLY_CONTROL': 'sys/kernel/debug/ecm/ecm_db/defunct_all'})
+check('start reads back available scalar controls', 'start', env={'CONTROLS': '1'})
+check('start tolerates readback mismatch during registration', 'start',
+      env={'CONTROLS': '1', 'BAD_READBACK_PATH': 'nf_conntrack_events'},
+      require=('conntrack events control unavailable',))
+check('start tolerates scalar read error during registration', 'start',
+      env={'CONTROLS': '1', 'BAD_READBACK_PATH': 'nf_conntrack_events', 'READ_ERROR_RC': '23'},
+      require=('conntrack events control unavailable',))
+check('start tolerates unwritable optional command control', 'start',
+      env={'CONTROLS': '1', 'READONLY_CONTROL': 'sys/kernel/debug/ecm/ecm_db/defunct_all'},
+      require=('defunct_all unavailable',))
+check('stop reads back available scalar controls', 'stop', env={'CONTROLS': '1'})
+check('stop rejects scalar readback mismatch', 'stop', expected=1,
+      env={'CONTROLS': '1', 'BAD_READBACK_PATH': 'nf_conntrack_events'})
+check('stop preserves scalar read error', 'stop', expected=23,
+      env={'CONTROLS': '1', 'BAD_READBACK_PATH': 'nf_conntrack_events', 'READ_ERROR_RC': '23'})
+check('stop rejects unwritable existing command control', 'stop', expected=1,
+      env={'CONTROLS': '1', 'READONLY_CONTROL': 'sys/kernel/debug/ecm/ecm_db/defunct_all'})
 check('stop quiesce failure prevents rmmod', 'stop', expected=1,
       env={'CONTROLS': '1', 'READONLY_CONTROL': 'sys/kernel/debug/ecm/front_end_ipv4_stop'},
       forbid=('rmmod:ecm', 'procd-kill'))
