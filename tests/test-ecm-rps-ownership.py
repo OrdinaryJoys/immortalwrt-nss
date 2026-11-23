@@ -76,18 +76,18 @@ esac
     for calls in [('disable_packet_steering', 'reload_service'),
                   ('reload_service', 'disable_packet_steering'),
                   ('reload_service', 'reload_service')]:
-        expected = ['generic:-l 0 0', 'rps:start_rps'] * 2 + ['rc:0']
+        expected = ['rps:start_rps'] * 2 + ['rc:0']
         expect('NSS callback ordering ' + ','.join(calls),
                run(callbacks + '\n' + '\n'.join(calls) + '\nprintf "rc:%s\\n" "$?"\n'),
                (0, '', expected))
     if platform.exists():
         call = shlex.quote(str(base / 'platform'))
         expect('NSS overrides conflicting generic steering selection', run(call + ' 2'),
-               (0, '', ['generic:-l 0 0', 'rps:start_rps']))
+               (0, '', ['rps:start_rps']))
         expect('RPS failure is propagated', run(call + ' 0', {'RPS_RC': '7'}),
-               (7, '', ['generic:-l 0 0', 'rps:start_rps']))
-        expect('generic cleanup failure is propagated', run(call + ' 0', {'GENERIC_RC': '9'}),
-               (9, '', ['generic:-l 0 0']))
+               (7, '', ['rps:start_rps', 'generic:-l 0 0']))
+        expect('generic cleanup failure is propagated', run(call + ' 0', {'RPS_RC': '7', 'GENERIC_RC': '9'}),
+               (9, '', ['rps:start_rps', 'generic:-l 0 0']))
         (base / 'nss-module').rmdir()
         for policy, flows, expected_flows in [('0', '64', '64'), ('2', '64', '64'),
                                                ('1', 'invalid', '0')]:

@@ -112,10 +112,10 @@ return "${SOURCE_RC:-0}"
     cases = [
         ('all stages succeed', {}, 0, ['rps:start_rps', 'offload-call'], []),
         ('RPS failure survives successful offload', {'RPS_RC': '7'}, 7, ['rps:start_rps', 'offload-call'], ['packet steering failed (status 7)']),
-        ('generic cleanup fails but offload still runs', {'GENERIC_RC': '9'}, 9, ['offload-call'], ['packet steering failed (status 9)']),
+        ('generic cleanup fails but offload still runs', {'RPS_RC': '7', 'GENERIC_RC': '9'}, 9, ['rps:start_rps', 'offload-call'], ['packet steering failed (status 9)']),
         ('offload failure survives success', {'OFFLOAD_RC': '11'}, 11, ['rps:start_rps', 'offload-call'], ['offload policy failed (status 11)']),
         ('both fail: first error wins, both logged', {'RPS_RC': '7', 'OFFLOAD_RC': '11'}, 7, ['rps:start_rps', 'offload-call'], ['packet steering failed (status 7)', 'offload policy failed (status 11)']),
-        ('cleanup/offload fail: first error wins', {'GENERIC_RC': '9', 'OFFLOAD_RC': '11'}, 9, ['offload-call'], ['packet steering failed (status 9)', 'offload policy failed (status 11)']),
+        ('cleanup/offload fail: first error wins', {'RPS_RC': '7', 'GENERIC_RC': '9', 'OFFLOAD_RC': '11'}, 9, ['rps:start_rps', 'offload-call'], ['packet steering failed (status 9)', 'offload policy failed (status 11)']),
         ('source failure must not call defined stale helper', {'SOURCE_RC': '13'}, 13, ['rps:start_rps'], ['offload policy failed (status 13)']),
         ('RPS and source fail', {'RPS_RC': '7', 'SOURCE_RC': '13'}, 7, ['rps:start_rps'], ['packet steering failed (status 7)', 'offload policy failed (status 13)']),
         ('logger cannot replace primary errors', {'RPS_RC': '7', 'OFFLOAD_RC': '11', 'LOGGER_RC': '55'}, 7, ['rps:start_rps', 'offload-call'], ['packet steering failed (status 7)', 'offload policy failed (status 11)']),
@@ -131,9 +131,13 @@ return "${SOURCE_RC:-0}"
         result = subprocess.run(['sh', str(base / 'rc.common'), str(base / 'ecm-init'), 'reload'], env={**env, **values}, text=True, capture_output=True, timeout=5)
         lines = trace.read_text().splitlines()
         message_lines = logs.read_text().splitlines()
-        expected = ['lock', 'generic:-l 0 0']
+        expected = ['lock']
         if 'rps:start_rps' in stages:
             expected.append('rps:start_rps')
+            if values.get('RPS_RC', '0') not in ('0', ''):
+                expected.append('generic:-l 0 0')
+        else:
+            expected.append('generic:-l 0 0')
         if not missing:
             expected.append('offload-source')
         if 'offload-call' in stages:

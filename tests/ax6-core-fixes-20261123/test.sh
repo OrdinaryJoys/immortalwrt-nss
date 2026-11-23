@@ -36,8 +36,12 @@ E="$ROOT/package/qca-nss/qca-nss-ecm/files/qca-nss-ecm.init"
 grep -Fq 'startup: packet steering policy failed' "$E" || fail "ECM steering failure not observable"
 grep -Fq 'continuing' "$E" || fail "ECM steering failure still aborts startup"
 P="$ROOT/target/linux/qualcommax/base-files/usr/libexec/platform/packet-steering.sh"
-grep -Fq 'packet-steering.uc -l 0 0' "$P" && fail "packet-steering still clears RPS before start_rps"
-grep -Fq 'exec /etc/init.d/set-irq-affinity start_rps' "$P" || fail "start_rps owner missing"
+grep -Fq '/etc/init.d/set-irq-affinity start_rps' "$P" || fail "start_rps owner missing"
+grep -Fq 'packet-steering.uc -l 0 0' "$P" || fail "RPS failure fallback missing"
+# fallback may exist, but it must not execute before start_rps
+rps_line=$(grep -n 'set-irq-affinity start_rps' "$P" | cut -d: -f1)
+gen_line=$(grep -n 'packet-steering.uc -l 0 0' "$P" | cut -d: -f1)
+[ "$rps_line" -lt "$gen_line" ] || fail "generic steering runs before start_rps"
 P="$ROOT/target/linux/qualcommax/patches-6.18/0982-ax6-skb-recycler-corrections.patch"
 [ -f "$P" ] || fail "0982 missing"
 grep -Fq -- "$(printf -- '-\tsize = SKB_HEAD_ALIGN(size);')" "$P" || fail "0982 align removal missing"
