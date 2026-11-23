@@ -8,7 +8,7 @@
  #include <linux/module.h>
  #include <linux/mm.h>
  #include <linux/of.h>
-@@ -409,6 +410,19 @@
+@@ -409,6 +410,40 @@
  	if (!cb) {
  		nss_warning("%px: Callback not registered for interface %d", nss_ctx, nss_if);
  		return;
@@ -17,26 +17,48 @@
 +	/*
 +	 * Wifili peer statistics are variable-length: the common header len
 +	 * may describe only the first peer while the skb contains all peers.
-+	 * Pass the actual payload length to the callback so the consumer can
-+	 * parse every available record instead of truncating at one peer.
++	 * Only a trusted notify from a Wifili interface may extend it, and
++	 * only after making the linear header writable. Never trust a shared
++	 * or non-linear buffer without linearizing it first.
 +	 */
-+	if (nss_if == NSS_WIFILI_INTERNAL_INTERFACE &&
-+	    ncm->type == NSS_WIFILI_PEER_STATS_MSG) {
-+		uint32_t actual_len = nbuf->len - sizeof(*ncm);
++	if ((nss_if == NSS_WIFILI_INTERNAL_INTERFACE ||
++	     nss_if == NSS_WIFILI_EXTERNAL_INTERFACE0 ||
++	     nss_if == NSS_WIFILI_EXTERNAL_INTERFACE1) &&
++	    ncm->type == NSS_WIFILI_PEER_STATS_MSG &&
++	    ncm->response == NSS_CMN_RESPONSE_NOTIFY) {
++		uint32_t actual_len;
++
++		if (skb_is_nonlinear(nbuf) && skb_linearize(nbuf)) {
++			nss_warning("%px: failed to linearize wifili peer stats", nss_ctx);
++			goto callback;
++		}
++		ncm = (struct nss_cmn_msg *)nbuf->data;
++		if (nbuf->len <= sizeof(*ncm))
++			goto callback;
++		if (skb_shared(nbuf) || skb_ensure_writable(nbuf, sizeof(*ncm))) {
++			nss_warning("%px: wifili peer stats buffer not writable", nss_ctx);
++			goto callback;
++		}
++		ncm = (struct nss_cmn_msg *)nbuf->data;
++		actual_len = nbuf->len - sizeof(*ncm);
++		if (actual_len > 0xffff)
++			actual_len = 0xffff;
 +		if (actual_len > ncm->len)
-+			ncm->len = actual_len;
++			ncm->len = (uint16_t)actual_len;
  	}
  
++callback:
  	cb(nss_ctx, ncm, app_data);
 --- a/nss_wifili.c
 +++ b/nss_wifili.c
-@@ -125,7 +125,8 @@
+@@ -125,7 +125,9 @@
  	if ((nss_cmn_get_msg_len(ncm) > sizeof(struct nss_wifili_msg)) &&
  		ntm->cm.type != NSS_WIFILI_PEER_EXT_STATS_MSG &&
  		ntm->cm.type != NSS_WIFILI_ASTENTRY_SYNC_MSG &&
 -		ntm->cm.type != NSS_WIFILI_MECENTRY_SYNC_MSG) {
 +		ntm->cm.type != NSS_WIFILI_MECENTRY_SYNC_MSG &&
-+		ntm->cm.type != NSS_WIFILI_PEER_STATS_MSG) {
++		!(ntm->cm.type == NSS_WIFILI_PEER_STATS_MSG &&
++		  ntm->cm.response == NSS_CMN_RESPONSE_NOTIFY)) {
  		nss_warning("%px: Length of message is greater than required: %d", nss_ctx, nss_cmn_get_msg_len(ncm));
  		return;
  	}

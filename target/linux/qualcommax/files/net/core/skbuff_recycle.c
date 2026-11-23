@@ -198,8 +198,8 @@ inline bool skb_recycler_consume(struct sk_buff *skb)
 	/* If we can, then it will be much faster for us to recycle this one
 	 * later than to allocate a new one from scratch.
 	 */
-	max_skbs = skb_recycler_max_skbs_core[get_cpu_index()];
 	h = &get_cpu_var(recycle_list);
+	max_skbs = skb_recycler_max_skbs_core[smp_processor_id()];
 	local_irq_save(flags);
 	/* Attempt to enqueue the CPU hot recycle list first */
 	if (likely(skb_queue_len(h) < max_skbs)) {
@@ -216,7 +216,7 @@ inline bool skb_recycler_consume(struct sk_buff *skb)
 		return true;
 	}
 #ifdef CONFIG_SKB_RECYCLER_MULTI_CPU
-	max_spare_skbs = skb_recycler_max_spare_skbs_core[get_cpu_index()];
+	max_spare_skbs = skb_recycler_max_spare_skbs_core[smp_processor_id()];
 	h = this_cpu_ptr(&recycle_spare_list);
 
 	/* The CPU hot recycle list was full; if the spare list is also full,
@@ -330,14 +330,14 @@ inline bool skb_recycler_consume_list_fast(struct sk_buff_head *skb_list)
 	local_irq_save(flags);
 	/* Attempt to enqueue the CPU hot recycle list first */
 	if (likely(skb_queue_len(h) < max_skbs)) {
-		skb_queue_splice(skb_list,h);
+		skb_queue_splice_init(skb_list,h);
 		local_irq_restore(flags);
 		preempt_enable();
 		return true;
 	}
 
 #ifdef CONFIG_SKB_RECYCLER_MULTI_CPU
-	max_spare_skbs = skb_recycler_max_spare_skbs_core[get_cpu_index()];
+	max_spare_skbs = skb_recycler_max_spare_skbs_core[smp_processor_id()];
 	h = this_cpu_ptr(&recycle_spare_list);
 
 	/* The CPU hot recycle list was full; if the spare list is also full,
@@ -413,12 +413,13 @@ static void skb_recycler_free_skb(struct sk_buff_head *list)
 static int skb_cpu_callback(unsigned int ocpu)
 {
 	unsigned long oldcpu = (unsigned long)ocpu;
+	unsigned long flags;
 
 	skb_recycler_free_skb(&per_cpu(recycle_list, oldcpu));
 #ifdef CONFIG_SKB_RECYCLER_MULTI_CPU
-	spin_lock(&glob_recycler.lock);
+	spin_lock_irqsave(&glob_recycler.lock, flags);
 	skb_recycler_free_skb(&per_cpu(recycle_spare_list, oldcpu));
-	spin_unlock(&glob_recycler.lock);
+	spin_unlock_irqrestore(&glob_recycler.lock, flags);
 #endif
 
 	return NOTIFY_DONE;
@@ -871,27 +872,27 @@ static void skb_recycler_init_procfs(void)
 		pr_err("cannot create proc net skb_recycle held\n");
 
 	if (!proc_create("flush",
-			 S_IWUGO,
+			 S_IWUSR,
 			 proc_net_skbrecycler,
 			 &proc_skb_flush_fops))
 		pr_err("cannot create proc net skb_recycle flush\n");
 
 	if (!proc_create("max_skbs",
-			 S_IRUGO | S_IWUGO,
+			 S_IRUSR | S_IWUSR,
 			 proc_net_skbrecycler,
 			 &proc_skb_max_skbs_fops))
 		pr_err("cannot create proc net skb_recycle max_skbs\n");
 
 #ifdef CONFIG_SKB_RECYCLER_MULTI_CPU
 	if (!proc_create("max_spare_skbs",
-			 S_IRUGO | S_IWUGO,
+			 S_IRUSR | S_IWUSR,
 			 proc_net_skbrecycler,
 			 &proc_skb_max_spare_skbs_fops))
 		pr_err("cannot create proc net skb_recycle max_spare_skbs\n");
 #endif
 
 	if (!proc_create("skb_recycler_enable",
-			 S_IRUGO | S_IWUGO,
+			 S_IRUSR | S_IWUSR,
 			 proc_net_skbrecycler,
 			 &proc_skb_recycle_enable_fops))
 		pr_err("cannot create proc net skb_recycle enable\n");
@@ -903,12 +904,12 @@ static void skb_recycler_init_procfs(void)
 			pr_err("cannot create cpu%d dir\n", cpu);
 			return;
 		}
-		if (!proc_create_data("max_skb", S_IRUGO | S_IWUGO,
+		if (!proc_create_data("max_skb", S_IRUSR | S_IWUSR,
 					proc_net_skbrecycler_per_cpu, &proc_skb_max_skbs_per_cpu_fops, (void *)(long)cpu))
 			pr_err("cannot create proc net skb_recycle max_skbs\n");
 
 #ifdef CONFIG_SKB_RECYCLER_MULTI_CPU
-		if (!proc_create_data("max_spare_skb", S_IRUGO | S_IWUGO,
+		if (!proc_create_data("max_spare_skb", S_IRUSR | S_IWUSR,
 					proc_net_skbrecycler_per_cpu, &proc_skb_max_spare_skbs_per_cpu_fops, (void *)(long)cpu))
 			pr_err("cannot create proc net skb_recycle max_spare_skbs\n");
 #endif
