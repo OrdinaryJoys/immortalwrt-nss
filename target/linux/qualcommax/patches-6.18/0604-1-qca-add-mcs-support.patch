@@ -556,11 +556,11 @@
 @@ -1209,6 +1439,10 @@ static int ipmr_mfc_delete(struct mr_tab
  	call_ipmr_mfc_entry_notifiers(net, FIB_EVENT_ENTRY_DEL, c, mrt->id);
  	mroute_netlink_event(mrt, c, RTM_DELROUTE);
- 	mr_cache_put(&c->_c);
 +	/* QCA ECM qca-mcs support - Start */
-+	/* Inform offload modules of the delete event */
++	/* Inform offload modules before dropping the cache reference. */
 +	ipmr_sync_entry_delete(c->mfc_origin, c->mfc_mcastgrp);
 +	/* QCA ECM qca-mcs support - End */
++	mr_cache_put(&c->_c);
  
  	return 0;
  }

@@ -4,6 +4,11 @@ set -eu
 ROOT=$(CDPATH= cd -- "$(dirname "$0")/../.." && pwd)
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
+P="$ROOT/target/linux/qualcommax/patches-6.18/0604-1-qca-add-mcs-support.patch"
+cb_line=$(grep -n 'ipmr_sync_entry_delete(c->mfc_origin' "$P" | cut -d: -f1 | head -1)
+put_line=$(grep -n 'mr_cache_put(&c->_c)' "$P" | cut -d: -f1 | tail -1)
+[ -n "$cb_line" ] && [ -n "$put_line" ] || fail "0604 callback/cache put anchors missing"
+[ "$cb_line" -lt "$put_line" ] || fail "0604 offload callback still after mr_cache_put"
 P="$ROOT/target/linux/qualcommax/patches-6.18/0982-ax6-skb-recycler-corrections.patch"
 [ -f "$P" ] || fail "0982 correction patch missing"
 grep -Fq -- "$(printf -- '-\tsize = SKB_HEAD_ALIGN(size);')" "$P" || fail "0982 does not remove duplicate align"
