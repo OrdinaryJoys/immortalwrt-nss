@@ -4,6 +4,10 @@ set -eu
 ROOT=$(CDPATH= cd -- "$(dirname "$0")/../.." && pwd)
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
+P="$ROOT/target/linux/qualcommax/patches-6.18/0982-ax6-skb-recycler-corrections.patch"
+[ -f "$P" ] || fail "0982 correction patch missing"
+grep -Fq -- "$(printf -- '-\tsize = SKB_HEAD_ALIGN(size);')" "$P" || fail "0982 does not remove duplicate align"
+grep -Fq -- "$(printf -- '-\t\tdev_kfree_skb(skb);')" "$P" || fail "0982 does not remove double free"
 R="$ROOT/target/linux/qualcommax/files/net/core/skbuff_recycle.c"
 grep -Fq 'skb_queue_splice_init(skb_list,h);' "$R" || fail "splice_init missing"
 grep -Fq 'skb_recycler_max_skbs_core[smp_processor_id()]' "$R" || fail "smp_processor_id missing"
@@ -34,4 +38,8 @@ grep -Fq 'continuing' "$E" || fail "ECM steering failure still aborts startup"
 P="$ROOT/target/linux/qualcommax/base-files/usr/libexec/platform/packet-steering.sh"
 grep -Fq 'packet-steering.uc -l 0 0' "$P" && fail "packet-steering still clears RPS before start_rps"
 grep -Fq 'exec /etc/init.d/set-irq-affinity start_rps' "$P" || fail "start_rps owner missing"
+P="$ROOT/target/linux/qualcommax/patches-6.18/0982-ax6-skb-recycler-corrections.patch"
+[ -f "$P" ] || fail "0982 missing"
+grep -Fq -- "$(printf -- '-\tsize = SKB_HEAD_ALIGN(size);')" "$P" || fail "0982 align removal missing"
+grep -Fq -- "$(printf -- '-\t\tdev_kfree_skb(skb);')" "$P" || fail "0982 double free removal missing"
 echo "PASS ax6-core-fixes-20261123"

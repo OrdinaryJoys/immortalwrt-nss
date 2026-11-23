@@ -1,0 +1,49 @@
+--- a/net/core/skbuff.c
++++ b/net/core/skbuff.c
+@@ -723,7 +723,6 @@
+ 	 * aligned memory blocks, unless SLUB/SLAB debug is enabled.
+ 	 * Both skb->head and skb_shared_info are cache line aligned.
+ 	 */
+-	size = SKB_HEAD_ALIGN(size);
+ 	data = kmalloc_reserve(&size, gfp_mask, node, &pfmemalloc);
+ 	if (unlikely(!data))
+ 		goto nodata;
+@@ -1338,13 +1337,8 @@
+ void __fix_address
+ sk_skb_reason_drop(struct sock *sk, struct sk_buff *skb, enum skb_drop_reason reason)
+ {
+-	if (__sk_skb_reason_drop(sk, skb, reason)) {
+-#if defined(CONFIG_SKB_RECYCLER)
+-		dev_kfree_skb(skb);
+-#else
++	if (__sk_skb_reason_drop(sk, skb, reason))
+ 		__kfree_skb(skb);
+-#endif
+-	}
+ }
+ EXPORT_SYMBOL(sk_skb_reason_drop);
+ 
+@@ -2461,7 +2455,6 @@
+ 	if (skb_pfmemalloc(skb))
+ 		gfp_mask |= __GFP_MEMALLOC;
+ 
+-	size = SKB_HEAD_ALIGN(size);
+ 	data = kmalloc_reserve(&size, gfp_mask, NUMA_NO_NODE, NULL);
+ 	if (!data)
+ 		goto nodata;
+@@ -7005,7 +6998,6 @@
+ 	if (skb_pfmemalloc(skb))
+ 		gfp_mask |= __GFP_MEMALLOC;
+ 
+-	size = SKB_HEAD_ALIGN(size);
+ 	data = kmalloc_reserve(&size, gfp_mask, NUMA_NO_NODE, NULL);
+ 	if (!data)
+ 		return -ENOMEM;
+@@ -7128,7 +7120,6 @@
+ 	if (skb_pfmemalloc(skb))
+ 		gfp_mask |= __GFP_MEMALLOC;
+ 
+-	size = SKB_HEAD_ALIGN(size);
+ 	data = kmalloc_reserve(&size, gfp_mask, NUMA_NO_NODE, NULL);
+ 	if (!data)
+ 		return -ENOMEM;
