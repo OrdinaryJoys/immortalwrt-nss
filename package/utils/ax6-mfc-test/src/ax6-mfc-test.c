@@ -52,7 +52,7 @@ int main(int argc, char **argv)
 		return 2;
 	}
 
-	fd = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
+	fd = socket(AF_INET, SOCK_RAW, IPPROTO_IGMP);
 	if (fd < 0) {
 		perror("socket");
 		return 2;
