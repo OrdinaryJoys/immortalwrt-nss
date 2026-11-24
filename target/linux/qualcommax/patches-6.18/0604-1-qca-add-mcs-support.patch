@@ -315,7 +315,7 @@
  
  #ifdef CONFIG_IP_MROUTE_MULTIPLE_TABLES
  #define ipmr_for_each_table(mrt, net)					\
-@@ -235,6 +241,80 @@ static int ipmr_rule_fill(struct fib_rul
+@@ -235,6 +241,98 @@ static int ipmr_rule_fill(struct fib_rul
  	return 0;
  }
  
@@ -323,7 +323,15 @@
 +/* ipmr_sync_entry_update()
 + * Call the registered offload callback to report an update to a multicast
 + * route entry. The callback receives the list of destination interfaces and
-+ * the interface count
++ * the interface count.
++ *
++ * Lifetime/RCU contract:
++ * - The helper is called with RTNL held. The mr_table, its vif_table and the
++ *   VIF devices are RCU-managed, so the VIF walk and the offload notification
++ *   run inside one RCU read-side critical section.
++ * - mrt_lock protects the vif_table contents only; it is dropped before the
++ *   offload callback, so the callback never runs with mrt_lock held.
++ * - The callback runs under rcu_read_lock() and must not sleep.
 + */
 +static void ipmr_sync_entry_update(struct mr_table *mrt,
 +				   struct mfc_cache *cache)
@@ -336,6 +344,8 @@
 +
 +	memset(dest_dev, 0, sizeof(dest_dev));
 +
++	rcu_read_lock();
++
 +	origin = cache->mfc_origin;
 +	group = cache->mfc_mcastgrp;
 +
@@ -347,11 +357,13 @@
 +		}
 +		if (dest_if_count == MAXVIFS) {
 +			spin_unlock(&mrt_lock);
++			rcu_read_unlock();
 +			return;
 +		}
 +
 +		if (!VIF_EXISTS(mrt, vifi)) {
 +			spin_unlock(&mrt_lock);
++			rcu_read_unlock();
 +			return;
 +		}
 +		dest_dev[dest_if_count] = mrt->vif_table[vifi].dev->ifindex;
@@ -359,9 +371,7 @@
 +	}
 +	spin_unlock(&mrt_lock);
 +
-+	rcu_read_lock();
 +	offload_update_cb_f = rcu_dereference(ipmr_mfc_event_offload_callback);
-+
 +	if (!offload_update_cb_f) {
 +		rcu_read_unlock();
 +		return;
@@ -374,7 +384,15 @@
 +
 +/* ipmr_sync_entry_delete()
 + * Call the registered offload callback to inform of a multicast route entry
-+ * delete event
++ * delete event.
++ *
++ * Lifetime/RCU contract:
++ * - @origin/@group are passed by value: the caller copies them out of the
++ *   cache before it drops the cache reference with mr_cache_put().
++ * - The callback pointer is read and invoked under rcu_read_lock(), pairing
++ *   with the synchronize_rcu() in ipmr_unregister_mfc_event_offload_callback()
++ *   so a callback can not go away while it is being invoked.
++ * - The callback must not sleep.
 + */
 +static void ipmr_sync_entry_delete(u32 origin, u32 group)
 +{
@@ -396,7 +414,7 @@
  static const struct fib_rules_ops __net_initconst ipmr_rules_ops_template = {
  	.family		= RTNL_FAMILY_IPMR,
  	.rule_size	= sizeof(struct ipmr_rule),
-@@ -248,6 +328,156 @@ static const struct fib_rules_ops __net_
+@@ -248,6 +346,167 @@ static const struct fib_rules_ops __net_
  	.owner		= THIS_MODULE,
  };
  
@@ -441,6 +459,10 @@
 +/* ipmr_find_mfc_entry()
 + * Returns destination interface list for a particular multicast flow, and
 + * the number of interfaces in the list
++ *
++ * Lifetime/RCU contract: the mr_table lookup, the MFC cache lookup and the
++ * vif_table walk all happen inside one RCU read-side critical section, so the
++ * table and its VIF devices can not be freed while they are being used.
 + */
 +int ipmr_find_mfc_entry(struct net *net, __be32 origin, __be32 group,
 +			u32 max_dest_cnt, u32 dest_dev[])
@@ -449,11 +471,13 @@
 +	struct mr_table *mrt;
 +	struct mfc_cache *cache;
 +
-+	mrt = ipmr_get_table(net, RT_TABLE_DEFAULT);
-+	if (!mrt)
-+		return -ENOENT;
-+
 +	rcu_read_lock();
++	mrt = __ipmr_get_table(net, RT_TABLE_DEFAULT);
++	if (!mrt) {
++		rcu_read_unlock();
++		return -ENOENT;
++	}
++
 +	cache = ipmr_cache_find(mrt, origin, group);
 +	if (!cache) {
 +		rcu_read_unlock();
@@ -495,6 +519,9 @@
 +
 +/* ipmr_mfc_stats_update()
 + * Update the MFC/VIF statistics for offloaded flows
++ *
++ * Lifetime/RCU contract: as for ipmr_find_mfc_entry(), the whole table/cache
++ * lookup and the statistics update run inside one RCU read-side section.
 + */
 +int ipmr_mfc_stats_update(struct net *net, __be32 origin, __be32 group,
 +			  u64 pkts_in, u64 bytes_in,
@@ -504,11 +531,13 @@
 +	struct mr_table *mrt;
 +	struct mfc_cache *cache;
 +
-+	mrt = ipmr_get_table(net, RT_TABLE_DEFAULT);
-+	if (!mrt)
-+		return -ENOENT;
-+
 +	rcu_read_lock();
++	mrt = __ipmr_get_table(net, RT_TABLE_DEFAULT);
++	if (!mrt) {
++		rcu_read_unlock();
++		return -ENOENT;
++	}
++
 +	cache = ipmr_cache_find(mrt, origin, group);
 +	if (!cache) {
 +		rcu_read_unlock();
@@ -553,23 +582,30 @@
  static int __net_init ipmr_rules_init(struct net *net)
  {
  	struct fib_rules_ops *ops;
-@@ -1209,6 +1439,10 @@ static int ipmr_mfc_delete(struct mr_tab
+@@ -1209,6 +1468,14 @@ static int ipmr_mfc_delete(struct mr_tab
  	call_ipmr_mfc_entry_notifiers(net, FIB_EVENT_ENTRY_DEL, c, mrt->id);
  	mroute_netlink_event(mrt, c, RTM_DELROUTE);
 +	/* QCA ECM qca-mcs support - Start */
-+	/* Inform offload modules before dropping the cache reference. */
++	/* Inform offload modules before dropping the cache reference.  The
++	 * origin/group arguments are evaluated before mr_cache_put() below, so
++	 * the callback never observes a released cache; the callback itself
++	 * runs under rcu_read_lock() in ipmr_sync_entry_delete().
++	 */
 +	ipmr_sync_entry_delete(c->mfc_origin, c->mfc_mcastgrp);
 +	/* QCA ECM qca-mcs support - End */
  	mr_cache_put(&c->_c);
  
  	return 0;
  }
-@@ -1239,6 +1473,10 @@ static int ipmr_mfc_add(struct net *net,
+@@ -1239,6 +1506,13 @@ static int ipmr_mfc_add(struct net *net,
  		call_ipmr_mfc_entry_notifiers(net, FIB_EVENT_ENTRY_REPLACE, c,
  					      mrt->id);
  		mroute_netlink_event(mrt, c, RTM_NEWROUTE);
 +		/* QCA ECM qca-mcs support - Start */
-+		/* Inform offload modules of the update event */
++		/* Inform offload modules of the update event.  The helper takes
++		 * the RCU read-side lock around the vif_table walk and the
++		 * notification, and drops mrt_lock before the callback.
++		 */
 +		ipmr_sync_entry_update(mrt, c);
 +		/* QCA ECM qca-mcs support - End */
  		return 0;

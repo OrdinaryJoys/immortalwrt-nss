@@ -319,7 +319,6 @@ inline bool skb_recycler_consume_list_fast(struct sk_buff_head *skb_list)
 #ifdef CONFIG_SKB_RECYCLER_MULTI_CPU
 	int max_spare_skbs;
 #endif
-	max_skbs = skb_recycler_max_skbs_core[get_cpu_index()];
 
 	/* Allocate the recycled skbs if the skb_recycling_enable */
 	if (unlikely(!skb_recycling_enable)) {
@@ -328,6 +327,14 @@ inline bool skb_recycler_consume_list_fast(struct sk_buff_head *skb_list)
 
 	h = &get_cpu_var(recycle_list);
 	local_irq_save(flags);
+	/*
+	 * Read the per-CPU budget only after get_cpu_var() has disabled
+	 * preemption and pinned this task to the current CPU.  Reading it
+	 * before that point allowed a migration between get_cpu_index() and
+	 * the get_cpu_var()/splice critical section, so max_skbs and the
+	 * recycle list could belong to different CPUs.
+	 */
+	max_skbs = skb_recycler_max_skbs_core[smp_processor_id()];
 	/* Attempt to enqueue the CPU hot recycle list first */
 	if (likely(skb_queue_len(h) < max_skbs)) {
 		skb_queue_splice_init(skb_list,h);

@@ -29,11 +29,25 @@ grep -Fq 'sizeof(struct nss_wifili_radio_cfg_msg)' "$P" || fail "radio_buf_cfg l
 grep -Fq '+			continue;' "$P" || fail "peer stats return not fixed"
 
 P="$ROOT/package/qca-nss/qca-nss-drv/patches/058-wifili-peer-stats-actual-length.patch"
+grep -Fq 'if (skb_shared(nbuf))' "$P" || fail "058 shared check missing"
 grep -Fq 'skb_is_nonlinear(nbuf) && skb_linearize(nbuf)' "$P" || fail "058 linearize missing"
 grep -Fq 'skb_ensure_writable(nbuf, sizeof(*ncm))' "$P" || fail "058 writable check missing"
+grep -Fq 'U16_MAX' "$P" || fail "058 U16_MAX rejection missing"
 grep -Fq 'NSS_CMN_RESPONSE_NOTIFY' "$P" || fail "058 notify gate missing"
-grep -Fq 'actual_len = 0xffff;' "$P" || fail "058 U16 clamp missing"
-grep -Fq 'NSS_WIFILI_EXTERNAL_INTERFACE0' "$P" || fail "058 external interface gate missing"
+! grep -Fq 'actual_len = 0xffff;' "$P" || fail "058 unsafe U16 clamp still present"
+! grep -Fq 'NSS_WIFILI_EXTERNAL_INTERFACE0' "$P" || fail "058 unsafe external interface gate still present"
+shared_line=$(grep -n 'if (skb_shared(nbuf))' "$P" | cut -d: -f1 | head -1)
+linear_line=$(grep -n 'skb_is_nonlinear(nbuf) && skb_linearize(nbuf)' "$P" | cut -d: -f1 | head -1)
+[ -n "$shared_line" ] && [ -n "$linear_line" ] && [ "$shared_line" -lt "$linear_line" ] || fail "058 shared check must precede linearize"
+
+P="$ROOT/package/kernel/mac80211/patches/nss/ath11k/373-ath11k-Add-retry-mechanism-for-update_rx_qu.patch"
+grep -Fq 'rx_tid->active = false;' "$P" || fail "373 ownership invalidation missing"
+grep -Fq 'elem_tid = &elem->data;' "$P" || fail "373 elem-owned tid missing"
+grep -Fq 'dma_free_noncoherent(ab->dev, rx_tid->unaligned_size' "$P" || fail "373 symmetric DMA free missing"
+! grep -Fq 'dma_unmap_single(ab->dev, rx_tid->paddr' "$P" || fail "373 asymmetric DMA unmap still present"
+
+P="$ROOT/target/linux/qualcommax/patches-6.18/0604-1-qca-add-mcs-support.patch"
+grep -Fq '__ipmr_get_table' "$P" || fail "0604 RCU table lookup missing"
 C="$ROOT/target/linux/qualcommax/config-6.18"
 grep -Fxq 'CONFIG_ARM64_ERRATUM_843419=y' "$C" || fail "A53 843419 not enabled"
 grep -Fxq 'CONFIG_ARM64_ERRATUM_845719=y' "$C" || fail "A53 845719 not enabled"

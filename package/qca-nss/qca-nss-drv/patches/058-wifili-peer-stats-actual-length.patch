@@ -1,6 +1,6 @@
 --- a/nss_core.c
 +++ b/nss_core.c
-@@ -20,6 +20,7 @@
+@@ -23,6 +23,7 @@
   */
  
  #include "nss_core.h"
@@ -8,47 +8,62 @@
  #include <linux/module.h>
  #include <linux/mm.h>
  #include <linux/of.h>
-@@ -409,6 +410,40 @@
- 	if (!cb) {
+@@ -474,7 +475,55 @@
  		nss_warning("%px: Callback not registered for interface %d", nss_ctx, nss_if);
  		return;
-+	}
+ 	}
 +
 +	/*
-+	 * Wifili peer statistics are variable-length: the common header len
-+	 * may describe only the first peer while the skb contains all peers.
-+	 * Only a trusted notify from a Wifili interface may extend it, and
-+	 * only after making the linear header writable. Never trust a shared
-+	 * or non-linear buffer without linearizing it first.
++	 * Wifili peer statistics are variable length: the common header len
++	 * may describe only the first peer while the skb carries all of them.
++	 * Only an internal Wifili notify may extend it, and only after the
++	 * buffer is proven private, linear and writable. Any doubt drops the
++	 * message instead of dispatching a length the consumer cannot trust.
 +	 */
-+	if ((nss_if == NSS_WIFILI_INTERNAL_INTERFACE ||
-+	     nss_if == NSS_WIFILI_EXTERNAL_INTERFACE0 ||
-+	     nss_if == NSS_WIFILI_EXTERNAL_INTERFACE1) &&
++	if (nss_if == NSS_WIFILI_INTERNAL_INTERFACE &&
 +	    ncm->type == NSS_WIFILI_PEER_STATS_MSG &&
 +	    ncm->response == NSS_CMN_RESPONSE_NOTIFY) {
++		unsigned int avail;
++		unsigned int contiguous;
 +		uint32_t actual_len;
+ 
++		if (skb_shared(nbuf)) {
++			nss_warning("%px: wifili peer stats buffer is shared", nss_ctx);
++			return;
++		}
 +
 +		if (skb_is_nonlinear(nbuf) && skb_linearize(nbuf)) {
 +			nss_warning("%px: failed to linearize wifili peer stats", nss_ctx);
-+			goto callback;
++			return;
 +		}
++
 +		ncm = (struct nss_cmn_msg *)nbuf->data;
-+		if (nbuf->len <= sizeof(*ncm))
-+			goto callback;
-+		if (skb_shared(nbuf) || skb_ensure_writable(nbuf, sizeof(*ncm))) {
++		contiguous = skb_headlen(nbuf);
++		avail = min_t(unsigned int, contiguous, nbuf->len);
++		if (avail <= sizeof(*ncm)) {
++			nss_warning("%px: wifili peer stats has no payload (%u bytes)", nss_ctx, avail);
++			return;
++		}
++
++		if (skb_ensure_writable(nbuf, sizeof(*ncm))) {
 +			nss_warning("%px: wifili peer stats buffer not writable", nss_ctx);
-+			goto callback;
++			return;
 +		}
++
 +		ncm = (struct nss_cmn_msg *)nbuf->data;
-+		actual_len = nbuf->len - sizeof(*ncm);
-+		if (actual_len > 0xffff)
-+			actual_len = 0xffff;
++		actual_len = avail - sizeof(*ncm);
++		if (actual_len > U16_MAX) {
++			nss_warning("%px: wifili peer stats length %u exceeds u16", nss_ctx, actual_len);
++			return;
++		}
++
 +		if (actual_len > ncm->len)
 +			ncm->len = (uint16_t)actual_len;
- 	}
- 
-+callback:
++	}
++
  	cb(nss_ctx, ncm, app_data);
+ 
+ 	if (ncm->interface != nss_if) {
 --- a/nss_wifili.c
 +++ b/nss_wifili.c
 @@ -125,7 +125,9 @@
