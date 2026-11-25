@@ -44,6 +44,7 @@ int main(int argc, char **argv)
 	struct mfcctl m;
 	int fd, i, ret = 0;
 	int one = 1;
+	int update_mode = getenv("AX6_MFC_UPDATE") != NULL;
 
 	if (cycles <= 0)
 		cycles = 1;
@@ -78,6 +79,17 @@ int main(int argc, char **argv)
 			fprintf(stderr, "cycle %d MRT_ADD_MFC: %s\n", i, strerror(errno));
 			ret = 1;
 			break;
+		}
+		if (update_mode) {
+			struct mfcctl upd = m;
+
+			upd.mfcc_ttls[0] = 2;
+			if (setsockopt(fd, IPPROTO_IP, MRT_ADD_MFC, &upd, sizeof(upd)) < 0) {
+				fprintf(stderr, "cycle %d MRT_UPDATE_MFC: %s\n", i,
+					strerror(errno));
+				ret = 1;
+				break;
+			}
 		}
 		if (setsockopt(fd, IPPROTO_IP, MRT_DEL_MFC, &m, sizeof(m)) < 0) {
 			fprintf(stderr, "cycle %d MRT_DEL_MFC: %s\n", i, strerror(errno));
