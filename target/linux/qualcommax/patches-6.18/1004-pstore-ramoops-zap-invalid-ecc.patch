@@ -10,7 +10,7 @@
 +	 * ECC header is invalid: zap it so the next boot starts with a valid
 +	 * ECC header instead of reporting the same errors forever.
 +	 */
-+	if (prz->ecc_info.ecc_size && prz->ecc_info.bad_blocks)
++	if (prz->ecc_info.ecc_size && prz->bad_blocks)
 +		zap = true;
 +
  	/* Reset missing, invalid, or single-use memory area. */
