@@ -1,0 +1,18 @@
+--- a/fs/pstore/ram_core.c
++++ b/fs/pstore/ram_core.c
+@@ -540,6 +540,15 @@
+ 		zap = true;
+ 	}
+ 
++	/*
++	 * If ECC was enabled after old, non-ECC records were written, the
++	 * persistent header can be unreadable. Do not preserve a zone whose
++	 * ECC header is invalid: zap it so the next boot starts with a valid
++	 * ECC header instead of reporting the same errors forever.
++	 */
++	if (prz->ecc_info.ecc_size && prz->ecc_info.bad_blocks)
++		zap = true;
++
+ 	/* Reset missing, invalid, or single-use memory area. */
+ 	if (zap)
+ 		persistent_ram_zap(prz);
