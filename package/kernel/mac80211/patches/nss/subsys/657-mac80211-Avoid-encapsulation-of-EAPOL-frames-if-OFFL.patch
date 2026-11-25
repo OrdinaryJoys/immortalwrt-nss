@@ -177,10 +177,11 @@ Signed-off-by: Aaradhana Sahu <quic_aarasahu@quicinc.com>
  		goto skip_offload;
  
  	key = rcu_dereference(sta->ptk[sta->ptk_idx]);
-@@ -4879,13 +4901,13 @@ netdev_tx_t ieee80211_subif_start_xmit_8
+@@ -4879,13 +4902,14 @@ netdev_tx_t ieee80211_subif_start_xmit_8
  		goto skip_offload;
  
  	if (sdata->vif.type == NL80211_IFTYPE_AP) {
++		sk_pacing_shift_update(skb->sk, sdata->local->hw.tx_sk_pacing_shift);
 -		ieee80211_8023_xmit_ap(sdata, dev, sta, key, skb);
 +		ieee80211_8023_xmit_ap(sdata, dev, sta, key, skb, info_flags, ctrl_flags, cookie);
  		goto out;

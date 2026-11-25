@@ -1,0 +1,13 @@
+--- a/drivers/net/wireless/ath/ath11k/mac.c
++++ b/drivers/net/wireless/ath/ath11k/mac.c
+@@ -7250,7 +7250,8 @@
+ 	 * Group idx 0 is not valid for VLAN
+ 	 */
+ 	arvif->free_groupidx_map[0] &= ~(1L);
+ 
+-	arvif->vlan_keyid_map = kzalloc(4096, GFP_KERNEL);
++	arvif->vlan_keyid_map = kcalloc(4096,
++				       sizeof(*arvif->vlan_keyid_map), GFP_KERNEL);
+ 	if (!arvif->vlan_keyid_map) {
+ 		ret = -ENOMEM;
+ 		goto err;

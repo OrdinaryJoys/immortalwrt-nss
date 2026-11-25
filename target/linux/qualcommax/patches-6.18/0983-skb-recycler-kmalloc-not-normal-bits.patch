@@ -1,0 +1,13 @@
+--- a/net/core/skbuff.c
++++ b/net/core/skbuff.c
+@@ -623,9 +623,9 @@
+ 	obj_size = SKB_HEAD_ALIGN(*size);
+-	if ((obj_size <= SKB_SMALL_HEAD_CACHE_SIZE &&
+-	    !(flags & KMALLOC_NOT_NORMAL_BITS)) ||
+-	    (obj_size > SZ_2K && obj_size <= SKB_DATA_CACHE_SIZE_2100)) {
++	if (!(flags & KMALLOC_NOT_NORMAL_BITS) &&
++	    (obj_size <= SKB_SMALL_HEAD_CACHE_SIZE ||
++	     (obj_size > SZ_2K && obj_size <= SKB_DATA_CACHE_SIZE_2100))) {
+ 		if (obj_size <= SKB_SMALL_HEAD_CACHE_SIZE)
+ 			skb_cache = net_hotdata.skb_small_head_cache;
+ 		else if (obj_size <= SKB_DATA_CACHE_SIZE)

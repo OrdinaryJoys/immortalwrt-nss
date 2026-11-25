@@ -47,3 +47,8 @@
 	qcom,ath11k-calibration-variant = "Redmi-AX6";
 	qcom,nss-wifili-tx-desc-count = <16384>;
 };
+
+/* Redmi AX6 / IPQ8071A: stock firmware caps NSS at 1,497.6 MHz */
+&nss0 {
+	qcom,max-frequency = <1497600000>;
+};
