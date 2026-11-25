@@ -1,0 +1,10 @@
+--- a/arch/arm64/boot/dts/qcom/ipq8074.dtsi
++++ b/arch/arm64/boot/dts/qcom/ipq8074.dtsi
+@@ -136,6 +136,7 @@
+ 			no-map;
+ 			record-size = <0x4000>;
+ 			console-size = <0x4000>;
++			ecc-size = <16>;
+ 		};
+ 	};
+ 
