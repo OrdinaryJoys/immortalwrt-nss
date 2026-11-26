@@ -52,3 +52,18 @@
 &nss0 {
 	qcom,max-frequency = <1497600000>;
 };
+
+/* AX6 has no exposed USB/PCIe/SPI peripherals. Disabling the unused
+ * controllers avoids gcc sync_state consumers that keep resetting EDMA RPS.
+ */
+&usb_0 { status = "disabled"; };
+&usb_1 { status = "disabled"; };
+&qusb_phy_0 { status = "disabled"; };
+&qusb_phy_1 { status = "disabled"; };
+&ssphy_0 { status = "disabled"; };
+&ssphy_1 { status = "disabled"; };
+&pcie_qmp0 { status = "disabled"; };
+&pcie_qmp1 { status = "disabled"; };
+&pcie0 { status = "disabled"; };
+&pcie1 { status = "disabled"; };
+&blsp1_spi1 { status = "disabled"; };
