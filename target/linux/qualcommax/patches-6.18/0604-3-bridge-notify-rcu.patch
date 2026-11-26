@@ -1,0 +1,16 @@
+--- a/net/bridge/br_private.h
++++ b/net/bridge/br_private.h
+@@ -2350,10 +2350,15 @@ struct nd_msg *br_is_nd_neigh_msg(const
+ static inline void __br_notify(int group, int type, const void *data)
+ {
+-	br_notify_hook_t *notify_hook = rcu_dereference(br_notify_hook);
++	br_notify_hook_t *notify_hook;
+ 
++	rcu_read_lock();
++	notify_hook = rcu_dereference(br_notify_hook);
+ 	if (notify_hook)
+ 		notify_hook(group, type, data);
++	rcu_read_unlock();
+ }
+ /* QCA qca-mcs support - End */
+ #endif

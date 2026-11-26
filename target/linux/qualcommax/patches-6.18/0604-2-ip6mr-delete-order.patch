@@ -1,0 +1,15 @@
+--- a/net/ipv6/ip6mr.c
++++ b/net/ipv6/ip6mr.c
+@@ -1490,10 +1490,10 @@ static int ip6mr_mfc_delete(struct mr_ta
+ 	call_ip6mr_mfc_entry_notifiers(net, FIB_EVENT_ENTRY_DEL, c, mrt->id);
+ 	mr6_netlink_event(mrt, c, RTM_DELROUTE);
+-	mr_cache_put(&c->_c);
+ 	/* QCA qca-mcs support - Start */
+ 	/* Inform offload modules of the delete event */
+ 	ip6mr_sync_entry_delete(&mc_origin, &mc_group);
+ 	/* QCA qca-mcs support - End */
++
++	mr_cache_put(&c->_c);
+ 
+ 	return 0;
+ }
