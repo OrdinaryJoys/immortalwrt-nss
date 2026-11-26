@@ -1,0 +1,21 @@
+--- a/nss_hal/ipq807x/nss_hal_pvt.c
++++ b/nss_hal/ipq807x/nss_hal_pvt.c
+@@ -164,13 +164,16 @@
+ 
+ 	nss_freq_change(&nss_top_main.nss[NSS_CORE_0], my_work->frequency, my_work->stats_enable, 0);
+ 	if (nss_top_main.nss[NSS_CORE_1].state == NSS_CORE_STATE_INITIALIZED) {
+-		nss_freq_change(&nss_top_main.nss[NSS_CORE_1], my_work->frequency, my_work->stats_enable, 0);
++		/* Core 1 has no data-plane work in AX6; stats_enable causes an
++		 * idle ~1k/s N2H control/IRQ stream. Keep frequency change but
++		 * disable per-core statistics on Core 1. */
++		nss_freq_change(&nss_top_main.nss[NSS_CORE_1], my_work->frequency, 0, 0);
+ 	}
+ 	clk_set_rate(nss_core0_clk, my_work->frequency);
+ 
+ 	nss_freq_change(&nss_top_main.nss[NSS_CORE_0], my_work->frequency, my_work->stats_enable, 1);
+ 	if (nss_top_main.nss[NSS_CORE_1].state == NSS_CORE_STATE_INITIALIZED) {
+-		nss_freq_change(&nss_top_main.nss[NSS_CORE_1], my_work->frequency, my_work->stats_enable, 1);
++		nss_freq_change(&nss_top_main.nss[NSS_CORE_1], my_work->frequency, 0, 1);
+ 	}
+ 
+ 	clk_set_rate(nss_core1_clk, my_work->frequency);
