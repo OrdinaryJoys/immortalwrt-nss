@@ -1,0 +1,31 @@
+--- a/drivers/remoteproc/qcom_q6v5_wcss.c
++++ b/drivers/remoteproc/qcom_q6v5_wcss.c
+@@ -261,11 +261,20 @@ static int q6v5_wcss_start(struct rproc *rproc)
+ 		return ret;
+ 	}
+ 
+-	if (wcss->qdss_clk)
+-		clk_prepare_enable(wcss->qdss_clk);
++	if (wcss->qdss_clk) {
++		ret = clk_prepare_enable(wcss->qdss_clk);
++		if (ret)
++			return ret;
++	}
+ 
+-	qcom_q6v5_prepare(&wcss->q6v5);
++	ret = qcom_q6v5_prepare(&wcss->q6v5);
++	if (ret) {
++		if (wcss->qdss_clk)
++			clk_disable_unprepare(wcss->qdss_clk);
++		return ret;
++	}
+ 
+ 	if (wcss->need_mem_protection) {
+ 		ret = qcom_scm_pas_auth_and_reset(WCNSS_PAS_ID);
+ 		if (ret) {
+ 			dev_err(wcss->dev, "wcss_reset failed\n");
++			qcom_q6v5_unprepare(&wcss->q6v5);
++			if (wcss->qdss_clk)
++				clk_disable_unprepare(wcss->qdss_clk);
+ 			return ret;
+ 		}
