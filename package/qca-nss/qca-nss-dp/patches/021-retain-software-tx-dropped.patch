@@ -1,0 +1,10 @@
+--- a/nss_dp_main.c
++++ b/nss_dp_main.c
+@@ -344,6 +344,8 @@ static void nss_dp_collect_stats(struct nss_dp_dev *dp_priv,
+ 	}
+ 	*stats = dp_priv->last_stats;
++	if (stats)
++		stats->tx_dropped += READ_ONCE(dp_priv->netdev->stats.tx_dropped);
+ 	spin_unlock_irqrestore(&dp_priv->stats_lock, flags);
+ }
+ 

@@ -1,0 +1,15 @@
+--- a/nss_core.c
++++ b/nss_core.c
+@@ -449,6 +449,12 @@ static void nss_core_handle_nss_status_pkt(struct nss_ctx_instance *nss_ctx,
+ 		return;
+ 	}
+ 
++	if (nss_cmn_get_msg_len(&header) > contiguous) {
++		nss_warning("%px: Message %d for interface %d exceeds contiguous extent %u",
++			    nss_ctx, header.type, nss_if, contiguous);
++		return;
++	}
++
+ 	/*
+ 	 * Check for valid interface number
+ 	 */
