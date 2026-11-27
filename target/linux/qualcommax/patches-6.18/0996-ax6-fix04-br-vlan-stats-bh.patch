@@ -1,0 +1,18 @@
+--- a/net/bridge/br_vlan.c
++++ b/net/bridge/br_vlan.c
+@@ -265,6 +265,7 @@ int br_vlan_update_stats(struct net_device *dev, u32 vid, u64 rx_bytes, u64 rx_p
+ 		return -ENOENT;
+ 	}
+ 
++	local_bh_disable();
+ 	stats = this_cpu_ptr(v->stats);
+ 	u64_stats_update_begin(&stats->syncp);
+ 	u64_stats_add(&stats->rx_bytes, rx_bytes);
+@@ -273,6 +274,7 @@ int br_vlan_update_stats(struct net_device *dev, u32 vid, u64 rx_bytes, u64 rx_p
+ 	u64_stats_add(&stats->tx_packets, tx_packets);
+ 	u64_stats_update_end(&stats->syncp);
+ 
++	local_bh_enable();
+ 	rcu_read_unlock();
+ 	return 0;
+ }

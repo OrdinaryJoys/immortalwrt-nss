@@ -1,0 +1,13 @@
+--- a/net/l2tp/l2tp_ppp.c
++++ b/net/l2tp/l2tp_ppp.c
+@@ -185,6 +185,10 @@ static int pppol2tp_get_addressing(struct ppp_channel *chan,
+ 		l2tp_session_put(session);
+ 		return err;
+ 	}
++	if (!tunnel->sock) {
++		l2tp_session_put(session);
++		return err;
++	}
+ 	isk = inet_sk(tunnel->sock);
+ 
+ 	addr->local_tunnel_id = tunnel->tunnel_id;

@@ -1,0 +1,11 @@
+--- a/net/bridge/br_fdb.c
++++ b/net/bridge/br_fdb.c
+@@ -353,7 +353,7 @@ void br_fdb_update(struct net_bridge *br, struct net_bridge_port *source,
+ 				/* QCA NSS ECM support - Start */
+ 				ether_addr_copy(fdb_event.addr, addr);
+ 				fdb_event.br = br;
+-				fdb_event.orig_dev = fdb->dst->dev;
++				fdb_event.orig_dev = fdb->dst ? fdb->dst->dev : source->dev;
+ 				fdb_event.dev = source->dev;
+ 				/* QCA NSS ECM support - End */
+ 				WRITE_ONCE(fdb->dst, source);
