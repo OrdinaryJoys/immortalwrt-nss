@@ -1,4 +1,16 @@
 # Put your custom commands here that should be executed once
 # the system init finished. By default this file does nothing.
 
+
+# AX6: OpenClash disabled by default. Remove a firewall include/cron that may
+# be restored from backup after uci-defaults, then reload once.
+if [ "$(uci -q get openclash.config.enable)" = "0" ]; then
+	if uci -q get firewall.openclash >/dev/null 2>&1; then
+		uci -q delete firewall.openclash
+		uci commit firewall
+		fw4 reload >/dev/null 2>&1
+	fi
+	sed -i '/ax6-openclash-fw-health/d' /etc/crontabs/root 2>/dev/null || true
+fi
+
 exit 0
