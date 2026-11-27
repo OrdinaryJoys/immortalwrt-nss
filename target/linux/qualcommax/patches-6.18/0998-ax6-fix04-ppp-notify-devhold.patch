@@ -1,0 +1,59 @@
+--- a/drivers/net/ppp/ppp_generic.c
++++ b/drivers/net/ppp/ppp_generic.c
+@@ -3542,6 +3542,7 @@ ppp_connect_channel(struct channel *pch,
+ 	int ppp_proto;
+ 	int version;
+ 
++	struct net_device *notify_dev = NULL;
+ 	int notify = 0;
+ 	pn = ppp_pernet(pch->chan_net);
+ 
+@@ -3576,6 +3577,10 @@ ppp_connect_channel(struct channel *pch,
+ 		else if (version == 3)
+ 			ppp->dev->priv_flags_ext |= IFF_EXT_PPP_L2TPV3;
+ 	}
++	if (ppp->dev) {
++		notify_dev = ppp->dev;
++		dev_hold(notify_dev);
++	}
+ 	notify = 1;
+ 
+  out2:
+@@ -3603,12 +3608,10 @@ ppp_connect_channel(struct channel *pch,
+  out:
+ 	mutex_unlock(&pn->all_ppp_mutex);
+ 
+-	if (notify && ppp && ppp->dev) {
+-		dev_hold(ppp->dev);
++	if (notify_dev) {
+ 		raw_notifier_call_chain(&ppp_channel_connection_notifier_list,
+-					   PPP_CHANNEL_CONNECT, ppp->dev);
+-		dev_put(ppp->dev);
++					   PPP_CHANNEL_CONNECT, notify_dev);
++		dev_put(notify_dev);
+ 	}
+ 
+ 	return ret;
+@@ -3622,13 +3629,17 @@ ppp_disconnect_channel(struct channel *pch)
+ 	struct ppp *ppp;
++	struct net_device *notify_dev = NULL;
+ 
+ 	spin_lock(&pch->upl);
+ 	ppp = rcu_replace_pointer(pch->ppp, NULL, lockdep_is_held(&pch->upl));
++	if (ppp && ppp->dev) {
++		notify_dev = ppp->dev;
++		dev_hold(notify_dev);
++	}
+ 	spin_unlock(&pch->upl);
+ 	if (ppp) {
+-		if (ppp->dev) {
+-			dev_hold(ppp->dev);
++		if (notify_dev) {
+ 			raw_notifier_call_chain(&ppp_channel_connection_notifier_list,
+-					   PPP_CHANNEL_DISCONNECT, ppp->dev);
+-			dev_put(ppp->dev);
++					   PPP_CHANNEL_DISCONNECT, notify_dev);
++			dev_put(notify_dev);
+ 		}
+ 
+ 		/* remove it from the ppp unit's list */
