@@ -1,6 +1,6 @@
 --- a/net/sched/sch_api.c
 +++ b/net/sched/sch_api.c
-@@ -2520,12 +2520,13 @@ static bool tcf_destroy(struct tcf_proto *tp, bool force)
+@@ -2520,9 +2520,10 @@ static bool tcf_destroy(struct tcf_proto *tp, bool force)
  {
 -	tp->ops->destroy(tp, force, NULL);
 +	if (tp->ops->destroy(tp, force, NULL))

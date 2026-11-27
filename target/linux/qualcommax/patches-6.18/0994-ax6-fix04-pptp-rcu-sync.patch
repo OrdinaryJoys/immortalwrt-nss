@@ -1,6 +1,6 @@
 --- a/drivers/net/ppp/pptp.c
 +++ b/drivers/net/ppp/pptp.c
-@@ -403,6 +403,7 @@ void pptp_unregister_gre_seq_offload_callback(void)
+@@ -403,4 +403,5 @@ void pptp_unregister_gre_seq_offload_callback(void)
  {
  	rcu_assign_pointer(pptp_gre_offload_xmit_cb, NULL);
 +	synchronize_rcu();

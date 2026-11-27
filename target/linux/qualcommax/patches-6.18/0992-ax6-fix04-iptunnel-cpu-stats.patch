@@ -1,6 +1,6 @@
 --- a/net/ipv6/ip6_tunnel.c
 +++ b/net/ipv6/ip6_tunnel.c
-@@ -2454,13 +2454,16 @@ void ip6_update_offload_stats(struct net_device *dev, void *ptr)
+@@ -2454,12 +2454,15 @@ void ip6_update_offload_stats(struct net_device *dev, void *ptr)
  {
 -	struct pcpu_sw_netstats *tstats = per_cpu_ptr(dev->tstats, 0);
 +	struct pcpu_sw_netstats *tstats;
@@ -19,7 +19,7 @@
  }
 --- a/net/ipv6/sit.c
 +++ b/net/ipv6/sit.c
-@@ -1734,13 +1734,16 @@ void ipip6_update_offload_stats(struct net_device *dev, void *ptr)
+@@ -1734,12 +1734,15 @@ void ipip6_update_offload_stats(struct net_device *dev, void *ptr)
  {
 -	struct pcpu_sw_netstats *tstats = per_cpu_ptr(dev->tstats, 0);
 +	struct pcpu_sw_netstats *tstats;
