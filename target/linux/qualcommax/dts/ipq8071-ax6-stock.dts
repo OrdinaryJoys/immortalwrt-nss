@@ -56,13 +56,3 @@
 	/delete-property/ nvmem-cells;
 	/delete-property/ nvmem-cell-names;
 };
-
-/*
- * The legacy Linux qcom,edma node is not the AX6 NSS-DP data plane.
- * It has no driver built and leaves the GCC reset/clock consumer unresolved,
- * producing "sync_state() pending due to 3ab00000.edma". NSS-DP owns the
- * hardware; keep the unused Linux node disabled.
- */
-&edma {
-	status = "disabled";
-};
