@@ -1,0 +1,49 @@
+#!/bin/sh
+# AX6 first-boot W0/N2/N4/LED defaults.
+# Runs after 99x platform scripts, so it can override generated defaults.
+
+# W0: LAN-only web UI, no HTTPS redirect
+uci -q delete uhttpd.main.listen_http
+uci add_list uhttpd.main.listen_http='192.168.5.1:80'
+uci add_list uhttpd.main.listen_http='[::1]:80'
+uci set uhttpd.main.redirect_https='0'
+
+# W0: Dropbear direct-interface restriction is unsafe across bridge reloads
+uci -q delete dropbear.@dropbear[0].DirectInterface
+uci -q delete dropbear.@dropbear[0]._direct
+
+# W0: DNS scope and AAAA
+uci set dhcp.@dnsmasq[0].filter_aaaa='0'
+uci -q delete dhcp.@dnsmasq[0].notinterface
+uci add_list dhcp.@dnsmasq[0].notinterface='wan'
+uci add_list dhcp.@dnsmasq[0].notinterface='wan6'
+
+# W0: keep a stable ULA (991 deliberately deletes it after IPv6 setup)
+uci set network.globals.ula_prefix='fdd0:9c:3f:1d:ea::/48'
+
+# W0: no OpenClash firewall include when OpenClash is disabled
+uci -q delete firewall.openclash
+
+# W0: software flow control remains disabled by default
+uci -q set sqm.eth1.enabled='0' 2>/dev/null || true
+[ -x /etc/init.d/sqm ] && /etc/init.d/sqm disable 2>/dev/null || true
+
+# N2: 2.4G AOT fixed ch1 HE20, avoid 40MHz OBSS startup fallback
+for dev in $(uci show wireless 2>/dev/null | sed -n 's/^wireless\.\([^.=]*\)=wifi-device$/\1/p'); do
+	[ "$(uci -q get wireless.$dev.band)" = "2g" ] || continue
+	uci set wireless.$dev.channel='1'
+	uci set wireless.$dev.htmode='HE20'
+	uci set wireless.$dev.noscan='0'
+done
+
+# LED: schedule enabled; use cron, not the old procd daemon
+uci set ax6_led.schedule.enabled='1'
+mkdir -p /etc/crontabs
+grep -q 'ax6-led-schedule run' /etc/crontabs/root 2>/dev/null || \
+	echo '* * * * * /usr/sbin/ax6-led-schedule run >/dev/null 2>&1' >> /etc/crontabs/root
+chmod 600 /etc/crontabs/root 2>/dev/null || true
+[ -x /etc/init.d/ax6-led-schedule ] && /etc/init.d/ax6-led-schedule disable 2>/dev/null || true
+[ -x /etc/init.d/cron ] && /etc/init.d/cron enable 2>/dev/null || true
+
+uci commit
+exit 0
