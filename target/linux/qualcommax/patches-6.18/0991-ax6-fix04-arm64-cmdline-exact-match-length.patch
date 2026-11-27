@@ -1,0 +1,11 @@
+--- a/drivers/of/fdt.c
++++ b/drivers/of/fdt.c
+@@ -1131,7 +1131,7 @@ int __init early_init_dt_scan_chosen(char *cmdline)
+ 		exact_match = of_get_flat_dt_prop(node, bootargs_replace_props[i][2], &l);
+ 
+ 		if (exact_match != NULL && l > 0 && exact_match[0] == 'y') {
+-			if(strncmp(cmdline, p, r_len) == 0)
++			if(strncmp(cmdline, p, f_len - 1) == 0)
+ 				s_ptr = cmdline;
+ 			else
+ 				s_ptr = NULL;

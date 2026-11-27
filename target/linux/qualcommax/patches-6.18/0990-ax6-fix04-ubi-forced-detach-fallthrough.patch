@@ -1,0 +1,9 @@
+--- a/drivers/mtd/ubi/cdev.c
++++ b/drivers/mtd/ubi/cdev.c
+@@ -1124,5 +1124,4 @@ static long ctrl_cdev_ioctl(struct file *file, unsigned int cmd,
+ 	case UBI_IOCFDET:
+ 		force = 1;
+-		/* fallthrough */
+-		break;
++		fallthrough;
+ 	case UBI_IOCDET:
