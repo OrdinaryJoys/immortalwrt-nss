@@ -45,5 +45,12 @@ chmod 600 /etc/crontabs/root 2>/dev/null || true
 [ -x /etc/init.d/ax6-led-schedule ] && /etc/init.d/ax6-led-schedule disable 2>/dev/null || true
 [ -x /etc/init.d/cron ] && /etc/init.d/cron enable 2>/dev/null || true
 
+# OpenClash is disabled by default: do not leave its firewall include or
+# health-check cron active. This is a boot-time cleanup for config restore.
+if [ "$(uci -q get openclash.config.enable)" = "0" ]; then
+	uci -q delete firewall.openclash
+	sed -i '/ax6-openclash-fw-health/d' /etc/crontabs/root 2>/dev/null || true
+fi
+
 uci commit
 exit 0
