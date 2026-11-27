@@ -1,6 +1,6 @@
 --- a/nss_dp_main.c
 +++ b/nss_dp_main.c
-@@ -344,6 +344,8 @@ static void nss_dp_collect_stats(struct nss_dp_dev *dp_priv,
+@@ -344,5 +344,7 @@ static void nss_dp_collect_stats(struct nss_dp_dev *dp_priv,
  	}
  	*stats = dp_priv->last_stats;
 +	if (stats)
