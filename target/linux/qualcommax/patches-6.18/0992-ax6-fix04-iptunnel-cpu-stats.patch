@@ -1,38 +1,24 @@
 --- a/net/ipv6/ip6_tunnel.c
 +++ b/net/ipv6/ip6_tunnel.c
-@@ -2454,12 +2454,15 @@ void ip6_update_offload_stats(struct net_device *dev, void *ptr)
- {
+@@ -2456,1 +2456,1 @@
 -	struct pcpu_sw_netstats *tstats = per_cpu_ptr(dev->tstats, 0);
 +	struct pcpu_sw_netstats *tstats;
- 	const struct pcpu_sw_netstats *offload_stats =
- 					(struct pcpu_sw_netstats *)ptr;
- 
+@@ -2461,1 +2461,3 @@
 +	local_bh_disable();
 +	tstats = this_cpu_ptr(dev->tstats);
  	u64_stats_update_begin(&tstats->syncp);
- 	u64_stats_add(&tstats->tx_packets, u64_stats_read(&offload_stats->tx_packets));
- 	u64_stats_add(&tstats->tx_bytes, u64_stats_read(&offload_stats->tx_bytes));
- 	u64_stats_add(&tstats->rx_packets, u64_stats_read(&offload_stats->rx_packets));
- 	u64_stats_add(&tstats->rx_bytes, u64_stats_read(&offload_stats->rx_bytes));
+@@ -2468,1 +2470,2 @@
  	u64_stats_update_end(&tstats->syncp);
 +	local_bh_enable();
- }
 --- a/net/ipv6/sit.c
 +++ b/net/ipv6/sit.c
-@@ -1734,12 +1734,15 @@ void ipip6_update_offload_stats(struct net_device *dev, void *ptr)
- {
+@@ -1736,1 +1736,1 @@
 -	struct pcpu_sw_netstats *tstats = per_cpu_ptr(dev->tstats, 0);
 +	struct pcpu_sw_netstats *tstats;
- 	const struct pcpu_sw_netstats *offload_stats =
- 					(struct pcpu_sw_netstats *)ptr;
- 
+@@ -1741,1 +1741,3 @@
 +	local_bh_disable();
 +	tstats = this_cpu_ptr(dev->tstats);
  	u64_stats_update_begin(&tstats->syncp);
- 	u64_stats_add(&tstats->tx_packets, u64_stats_read(&offload_stats->tx_packets));
- 	u64_stats_add(&tstats->tx_bytes, u64_stats_read(&offload_stats->tx_bytes));
- 	u64_stats_add(&tstats->rx_packets, u64_stats_read(&offload_stats->rx_packets));
- 	u64_stats_add(&tstats->rx_bytes, u64_stats_read(&offload_stats->rx_bytes));
+@@ -1748,1 +1750,2 @@
  	u64_stats_update_end(&tstats->syncp);
 +	local_bh_enable();
- }
