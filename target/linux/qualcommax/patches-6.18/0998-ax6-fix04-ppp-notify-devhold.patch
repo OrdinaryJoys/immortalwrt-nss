@@ -19,7 +19,7 @@
  	notify = 1;
  
   out2:
-@@ -3603,12 +3608,10 @@ ppp_connect_channel(struct channel *pch,
+@@ -3603,11 +3608,10 @@ ppp_connect_channel(struct channel *pch,
   out:
  	mutex_unlock(&pn->all_ppp_mutex);
  
@@ -34,7 +34,7 @@
  	}
  
  	return ret;
-@@ -3622,13 +3629,17 @@ ppp_disconnect_channel(struct channel *pch)
+@@ -3622,14 +3629,18 @@ ppp_disconnect_channel(struct channel *pch)
  	struct ppp *ppp;
 +	struct net_device *notify_dev = NULL;
  
