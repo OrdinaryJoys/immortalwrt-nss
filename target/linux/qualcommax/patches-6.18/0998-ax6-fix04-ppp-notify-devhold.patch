@@ -34,26 +34,17 @@
  	}
  
  	return ret;
-@@ -3622,14 +3629,18 @@ ppp_disconnect_channel(struct channel *pch)
+@@ -3622,11 +3622,12 @@ ppp_disconnect_channel(struct channel *pch)
  	struct ppp *ppp;
-+	struct net_device *notify_dev = NULL;
  
  	spin_lock(&pch->upl);
  	ppp = rcu_replace_pointer(pch->ppp, NULL, lockdep_is_held(&pch->upl));
-+	if (ppp && ppp->dev) {
-+		notify_dev = ppp->dev;
-+		dev_hold(notify_dev);
-+	}
++	if (ppp && ppp->dev)
++		dev_hold(ppp->dev);
  	spin_unlock(&pch->upl);
  	if (ppp) {
--		if (ppp->dev) {
+ 		if (ppp->dev) {
 -			dev_hold(ppp->dev);
-+		if (notify_dev) {
  			raw_notifier_call_chain(&ppp_channel_connection_notifier_list,
--					   PPP_CHANNEL_DISCONNECT, ppp->dev);
--			dev_put(ppp->dev);
-+					   PPP_CHANNEL_DISCONNECT, notify_dev);
-+			dev_put(notify_dev);
- 		}
- 
- 		/* remove it from the ppp unit's list */
+ 					   PPP_CHANNEL_DISCONNECT, ppp->dev);
+ 			dev_put(ppp->dev);
