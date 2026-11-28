@@ -1,6 +1,6 @@
 --- a/nss_core.c
 +++ b/nss_core.c
-@@ -449,6 +449,22 @@ static void nss_core_handle_nss_status_pkt(struct nss_ctx_instance *nss_ctx,
+@@ -449,6 +449,23 @@ static void nss_core_handle_nss_status_pkt(struct nss_ctx_instance *nss_ctx,
  		return;
  	}
  
@@ -9,10 +9,11 @@
 +	 * the first contiguous extent. 056 already bounds the declared length
 +	 * against the aggregate skb; 058 linearizes the peer-stats notify and
 +	 * remaps the message length before dispatch. Exempt only that notify
-+	 * from the contiguous-range rejection, leaving every other status
-+	 * message protected by 057.
++	 * on the internal Wifili interface, matching 058's precondition,
++	 * leaving every other status message protected by 057.
 +	 */
-+	if (!(header.type == NSS_WIFILI_PEER_STATS_MSG &&
++	if (!(nss_if == NSS_WIFILI_INTERNAL_INTERFACE &&
++	      header.type == NSS_WIFILI_PEER_STATS_MSG &&
 +	      header.response == NSS_CMN_RESPONSE_NOTIFY) &&
 +	    nss_cmn_get_msg_len(&header) > contiguous) {
 +		nss_warning("%px: Message %d for interface %d exceeds contiguous extent %u",
